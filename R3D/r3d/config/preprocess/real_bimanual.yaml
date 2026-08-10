@@ -1,0 +1,282 @@
+# Conversion + fusion config for real bimanual Franka data.
+#
+# Key paths match the ros2_ws 20 Hz processed HDF5 (one file per trajectory);
+# verified against tmp/Test_processed_20hz/0000.h5.
+#
+# This file is loaded in two places and must be identical in both:
+#   - scripts/convert_h5_to_zarr.py, at conversion time
+#   - RealMultiCamDataset, at training time (and by the inference repo on-robot)
+# See CLAUDE.md, "Gotchas": crop, scale and frame convention are part of the
+# model, so this config is part of the model too.
+
+# ---------------------------------------------------------------- transform --
+
+# Table volume in the WORLD frame, metres. This box also defines the
+# point_cloud normalizer limits, so it should be a snug fit around the
+# reachable workspace -- and changing it invalidates existing checkpoints.
+# Derived from the recording, not guessed: the world origin sits BETWEEN the two
+# robot bases (link0 at x ~ +-0.002), so the workspace is entirely in +x. The
+# table surface is at z ~ 0 (cloud z median +0.04, p5 -0.05) and the EEs work at
+# x 0.40-0.56, y +-0.34, z 0.25-0.32. Cloud mass spans x 0.34-1.09, y -0.55..0.36,
+# with almost nothing above z = 0.3.
+# CONFIRM against the physical table before the full conversion -- the upper x
+# bound is a judgement about where table ends and background begins.
+workspace:
+  - [ 0.10, 0.75]   # x_min, x_max  (forward from the robot bases)
+  - [-0.50, 0.50]   # y_min, y_max
+  - [-0.05, 0.55]   # z_min, z_max  (table at 0; generous headroom above the EEs)
+
+# Recorded clouds are already in metres (verified: depths run ~0.07-1.5 m).
+point_scale: 1.0
+# Recorded rgb is uint8 0-255 (verified). Must end up in [0, 1]: the colour
+# jitter augmentation clips to that range, so 0-255 would go solid white.
+rgb_max: 255.0
+# Points in the FUSED cloud handed to the policy. Must match shape_meta.
+#
+# The paper uses 8192 for wrist + top. Our third camera is NOT pure redundancy --
+# point clouds sample surfaces, and a third viewpoint reveals surface the other
+# two cannot see -- so 10240 buys that extra coverage.
+#
+# Do not push much past this. The encoder groups the cloud into
+# num_group(512) x group_size(32) = 16384 point-slots via FPS + kNN
+# (pointnet_extractor.py:505); a point in no center's 32-NN is never seen by the
+# transformer at all. 10240 sits at 1.6x coverage. By ~16384 a large fraction of
+# points are dropped before the encoder, so extra points cost disk and fusion
+# time and buy nothing. Raising `num_group` is the lever if you need more, at
+# proportionally more transformer tokens.
+num_points: 10240
+
+# ------------------------------------------------------------------ cameras --
+# `mount: static` -> `extrinsics` IS the camera -> base transform.
+# `mount: wrist`  -> `extrinsics` is T_link8<-cam, and `flange_pose` supplies
+#                    T_world<-link8(t). With `source: fk` that is
+#                    T_world<-link0 @ panda_fk_flange(joints), so every factor is
+#                    a measured quantity. The randomization perturbs
+#                    T_link8<-cam, the only miscalibrated factor.
+#
+# All matrices below are MEASURED values for this rig. FK was validated against
+# the recording: FK + world<-link0 + flange->ee reproduces `qpos_arm` to
+# 0.02 mm / 0.002 deg on a stationary arm.
+#
+# Clouds are stored as separate xyz/rgb datasets, allocated to a per-episode
+# maximum and ZERO-PADDED; `num_points` gives the valid count per frame and
+# slicing to it is mandatory.
+cameras:
+  - name: cam_top
+    mount: static
+    layout: xyz_rgb_split
+    xyz: /observations/pointclouds/oakd_TOP_CAMERA/xyz
+    rgb: /observations/pointclouds/oakd_TOP_CAMERA/rgb
+    num_points: /observations/pointclouds/oakd_TOP_CAMERA/num_points
+    stamps: /timestamps_ns
+    extrinsics:           # T_world<-cam, measured
+      - [ 0.027685, -0.817385,  0.575427, -0.206283]
+      - [-0.999584, -0.027326,  0.009276, -0.024304]
+      - [ 0.008143, -0.575444, -0.817801,  0.898933]
+      - [ 0.0,       0.0,       0.0,       1.0     ]
+
+  - name: cam_wrist_left
+    mount: wrist
+    layout: xyz_rgb_split
+    xyz: /observations/pointclouds/orbbec_left_wrist_view/xyz
+    rgb: /observations/pointclouds/orbbec_left_wrist_view/rgb
+    num_points: /observations/pointclouds/orbbec_left_wrist_view/num_points
+    stamps: /timestamps_ns
+    extrinsics:           # T_link8<-cam, measured
+      - [ 0.011317, -0.204198,  0.978864, -0.043806]
+      - [ 0.999936,  0.002969, -0.010941, -0.009166]
+      - [-0.000672,  0.978925,  0.204218,  0.143257]
+      - [ 0.0,       0.0,       0.0,       1.0     ]
+    flange_pose:
+      # T_world<-link0 @ FK(joints) @ T_link8<-cam -- every factor measured.
+      # Deliberately NOT the recorded EE pose: qpos_arm was generated with a
+      # simplified world<-link0 offset of (0, +-0.35, 0), which differs from the
+      # measured link0 below by 14.4 mm / 1.11 deg. Mixing that with the
+      # measured top-camera transform would misregister the fused cloud.
+      source: fk
+      joints: /observations/joint_states/position
+      joint_slice: [0, 7]
+      stamps: /timestamps_ns
+      base:               # T_world<-link0, measured
+      - [ 1.000000,  0.000000,  0.000000, -0.001954]
+      - [ 0.000000,  1.000000,  0.000000,  0.348423]
+      - [ 0.000000,  0.000000,  1.000000, -0.005906]
+      - [ 0.0,       0.0,       0.0,       1.0     ]
+
+  - name: cam_wrist_right
+    mount: wrist
+    layout: xyz_rgb_split
+    xyz: /observations/pointclouds/orbbec_right_wrist_view/xyz
+    rgb: /observations/pointclouds/orbbec_right_wrist_view/rgb
+    num_points: /observations/pointclouds/orbbec_right_wrist_view/num_points
+    stamps: /timestamps_ns
+    extrinsics:           # T_link8<-cam, measured
+      - [ 0.005245, -0.185066,  0.982712, -0.038585]
+      - [ 0.999900, -0.011916, -0.007581, -0.008549]
+      - [ 0.013113,  0.982654,  0.184985,  0.151323]
+      - [ 0.0,       0.0,       0.0,       1.0     ]
+    flange_pose:
+      # T_world<-link0 @ FK(joints) @ T_link8<-cam -- every factor measured.
+      # Deliberately NOT the recorded EE pose: qpos_arm was generated with a
+      # simplified world<-link0 offset of (0, +-0.35, 0), which differs from the
+      # measured link0 below by 14.4 mm / 1.11 deg. Mixing that with the
+      # measured top-camera transform would misregister the fused cloud.
+      source: fk
+      joints: /observations/joint_states/position
+      joint_slice: [7, 14]
+      stamps: /timestamps_ns
+      base:               # T_world<-link0, measured
+      - [ 0.999849, -0.010533, -0.013829,  0.001954]
+      - [ 0.010652,  0.999906,  0.008587, -0.348423]
+      - [ 0.013737, -0.008733,  0.999868,  0.005906]
+      - [ 0.0,       0.0,       0.0,       1.0     ]
+
+# RGB images (/observations/images/*) are deliberately NOT referenced: R3D is
+# point-cloud only and RobotwinDataset has the `img` key commented out of its
+# read. They are the bulk of the 1.1 GB file and are dropped at conversion.
+
+# Points kept per camera in the zarr, in that camera's own frame. 3 x 5120 =
+# 15360 stored gives 1.5x headroom over the 10240 fused target, so the workspace
+# crop has something to discard.
+#
+# Tune this from measurement, not guesswork: inspect_zarr.py reports what
+# fraction of the fused points actually land inside the workspace.
+points_per_camera: 5120
+
+# Optional random thin of the cropped cloud before FPS. KEEP THIS null for real
+# conversions.
+#
+# It is a CPU-debugging escape hatch, not a quality/speed trade you should take.
+# FPS exists to retain isolated and extremal points -- a point far from
+# everything else is what the max-min criterion picks first -- and random
+# thinning attacks exactly that. A thin object edge carried by ~20 raw points
+# drops to ~4 after a 5x thin and may disappear, where full-resolution FPS would
+# have preferentially kept it. Bulk surfaces are unaffected; the loss is
+# concentrated in fine detail near contacts.
+#
+# The GPU does not need it. Worst case here is N~150k, K=5120, which is K
+# sequential iterations of a parallel reduction over N -- ~0.1-0.5 s per cloud on
+# a 4090, so ~30 s to 2.5 min per 96-frame episode across three cameras. Memory
+# is trivial (150k x 3 x float32 = 1.8 MB, one cloud at a time).
+#
+# Set an integer only when forced onto CPU, where the same call takes minutes.
+max_input_points: null
+
+# The per-camera crop at conversion uses the NOMINAL extrinsics and grows the
+# workspace box by this margin (metres), so points a later perturbation would
+# pull into the workspace are not discarded now. Must comfortably exceed the
+# largest displacement the randomization can produce.
+crop_margin: 0.05
+
+# ------------------------------------------------------------------- fusion --
+fusion:
+  # "random": uniform subsample -- cheap enough for a dataloader worker.
+  # "fps":    farthest-point -- uniform density, but one pytorch3d call per
+  #           frame per sample.
+  # INFERENCE MUST USE THE SAME SETTING: cloud density is part of the input.
+  method: random
+
+# --------------------------------------------- extrinsics randomization ------
+# Drawn per camera, once per sampled window, held constant across the window's
+# frames -- a real miscalibration is static within an episode.
+# Training only; inference uses the solved extrinsics and perturbs nothing.
+#
+# Set these from the ChArUco solve's residual, not by guessing. Rotation
+# dominates: 0.3 deg at 1 m range displaces a point ~5 mm, more than the
+# translation term below.
+extrinsics_randomization:
+  enabled: true
+  # MEASURED, not guessed. At full resolution the three cameras disagree by
+  # 11-19 mm (median NN distance in the overlap region; overall 15.4 mm with the
+  # measured link0 transforms, vs 20.7 mm with the simplified ones). Part of that
+  # is depth-sensor bias and surface sampling rather than calibration -- per-point
+  # noise is already modelled by data_augmentation.pc_xyz_noise_std -- so these
+  # sit below the raw figure while still covering plausible recalibration drift.
+  # Re-run inspect_zarr.py after improving calibration and revise.
+  # The new values are based on charcuo board measurment deviation:
+  # fixed board, different pos/rot -> board poisiton deviation in robot frame measured 
+  # -> sigma obtained
+  rot_sigma_deg: 0.7 #0.5
+  trans_sigma_m: 0.004 #0.005
+  # Camera 0 (cam_top) is the static one; anchoring it pins the fused cloud's
+  # frame to the robot base, leaving pure relative misregistration.
+  anchor_first_camera: true
+
+# ------------------------------------------------------- proprioception ------
+# 48 dims per vector: left arm EE pose (7) | right arm EE pose (7)
+#                   | left hand (17)       | right hand (17)
+#
+# NOTE the arm entries are END-EFFECTOR POSES (xyz + wxyz quaternion), not joint
+# angles. `/observations/joint_states/position` holds the actual 14 joint angles
+# and is NOT used here, because the recorded ACTION is an EE-space target --
+# there are no joint-space action targets in the file. See the open questions.
+h5:
+  state:
+    data:
+      - /observations/qpos_arm/left
+      - /observations/qpos_arm/right
+      - /observations/qpos_hand/left
+      - /observations/qpos_hand/right
+    stamps: /timestamps_ns
+  action:
+    data:
+      - /actions_arm/left
+      - /actions_arm/right
+      - /actions_hand/left
+      - /actions_hand/right
+    stamps: /timestamps_ns
+  # Optional -- only needed when policy.use_target_ee is true.
+  target_ee: null
+
+# Index ranges in the 48-vector holding xyzw quaternions, i.e. the orientation
+# half of each arm's EE pose. Layout is
+#   [0:7] left arm (xyz + quat) | [7:14] right arm | [14:31] left hand | [31:48] right hand
+#
+# These are canonicalized at conversion: q and -q are the same rotation, so a
+# dataset holding both for similar poses gives the L2 diffusion loss two
+# contradictory targets and it averages them toward zero. The sign is chosen on
+# the largest-magnitude component, NOT on w -- these are flange-down poses with
+# w ~ 0 (measured -0.008 on the right arm), where a w >= 0 rule would flip on
+# noise. Flipping the sign does not change the rotation, so inference is
+# unaffected.
+quaternion_slices:
+  - [3, 7]
+  - [10, 14]
+
+sync:
+  # The processed h5 is already synchronized: one `timestamps_ns` shared by every
+  # stream, exactly 0.0500 s apart. Alignment is therefore an identity mapping;
+  # it is left in because it costs nothing and still catches a stream whose
+  # length disagrees with the timestamps.
+  reference: cam_top
+  max_dt: 0.05
+
+action:
+  # `dataset`    -> use the h5.action stream as recorded (commanded targets)
+  # `next_state` -> action[t] := state[t+frame_stride]; the tail is dropped
+  source: dataset
+
+# Take every Nth frame. The recording is 20 Hz, so 1 -> 20 Hz, 2 -> 10 Hz.
+#
+# The rate is NOT a free parameter: horizon, n_obs_steps and n_action_steps are
+# counted in FRAMES, so it sets the policy's temporal footprint.
+#   20 Hz: horizon 16 = 0.80 s predicted, n_action_steps 8 = 0.40 s open-loop
+#   10 Hz: horizon 16 = 1.60 s predicted, n_action_steps 8 = 0.80 s open-loop
+# (Diffusion Policy ran real robots at 10 Hz with these same counts.)
+#
+# Prefer changing this over rescaling horizon/n_action_steps: 16/8 are the values
+# R3D tuned -- the config still carries DP3's older `# horizon: 4` above them.
+# Always RECORD at the higher rate; decimation is possible here, interpolation is
+# not. The resulting rate is written to the zarr as meta.attrs['control_hz'] and
+# inference must match it.
+frame_stride: 1
+
+# ---------------------------------------------------------- open questions ---
+# 1. EXTRINSICS. The h5 contains no camera poses and no TF. Needed before the
+#    first real conversion: cam_top's camera->base, and per wrist the
+#    T_flange<-cam hand-eye plus the constant T_ee<-flange. Nothing else in the
+#    pipeline is blocked.
+# 2. STATE REPRESENTATION. `state` currently mirrors `action` (EE pose + hand).
+#    Swapping the arm block for /observations/joint_states/position would give
+#    joint-space proprioception against EE-space actions.
+# 3. `actions_hand/*` is bit-for-bit identical to `observations/qpos_hand/*`.

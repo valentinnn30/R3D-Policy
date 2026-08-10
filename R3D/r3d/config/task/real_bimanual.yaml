@@ -1,0 +1,86 @@
+name: ${task_name}
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [10240, 6]   # the FUSED cloud; per-camera clouds are 5120
+      type: point_cloud
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]  # joint only
+
+# No simulator in this checkout -- train.py sets this to None and every use
+# site guards on it, so we get train/val loss only and no rollout metrics.
+env_runner: null
+
+dataset:
+  _target_: r3d.dataset.real_multicam_dataset.RealMultiCamDataset
+  # train.py chdirs to the repo root, so these are relative to ~/R3D-Policy
+  zarr_path: R3D/data/real_bimanual.zarr
+  preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  # One HDF5 file == one episode, and each file holds ~5 back-to-back
+  # trajectories recorded WITHOUT a reset. They are deliberately NOT split into
+  # separate episodes: the terminal state of one trajectory is indistinguishable
+  # from the initial state of the next, so per-trajectory episodes would delete
+  # the cross-seam windows that teach "continue" and replace them with
+  # end-padded windows -- sampler.py:145 replicates the last action to fill the
+  # horizon -- that teach "hold still" at exactly that aliased state. Since the
+  # policy cannot tell terminal from initial, a stall learned at one is a stall
+  # at the other: the failure is not "it never stops", it is "it never starts".
+  # There is no termination output either way; stopping is external.
+  #
+  # The val unit is therefore the FILE. 0.02 was inherited from a config sized
+  # for hundreds of sim episodes; at 10 files it floors to 1 episode anyway
+  # (get_val_mask takes max(1, round(n * ratio)), so 0.02 and 0.1 are currently
+  # bit-identical). 0.1 states the intent and still holds out ~10% once more
+  # files are recorded.
+  val_ratio: 0.1
+  max_train_episodes: null
+
+  # Extrinsics randomization: per camera, redrawn per sampled window, constant
+  # across the window. Validation always fuses at the nominal calibration.
+  #
+  # MEASURED, not guessed. charuco_calib/flex_randomization.py recovers the true
+  # per-view camera pose from the 251-view joint calibration -- within a placement
+  # the board is fixed, so pinning it and reading the disagreement back out gives
+  # the real scatter about the deployed extrinsic: 3.15 mm / 0.48 deg per axis on
+  # the left wrist, 2.52 mm / 0.42 deg on the right. 4 mm / 0.7 deg covers both,
+  # with margin for tails heavier than Gaussian (max |dp| 15.6 mm ~ 4.9 sigma).
+  # The scatter is almost entirely WITHIN a placement, i.e. it tracks arm
+  # attitude: this is bracket flex, and no amount of recalibration removes it.
+  #
+  # Do NOT set these from inspect_zarr's inter-camera NN distance. The two wrist
+  # cameras view largely different surfaces, so that metric has no correspondence
+  # and scales with its own 5 cm search cutoff -- median/cap holds near 0.5 from a
+  # 10 mm cap to a 200 mm one. It measures the cutoff, not misregistration.
+  use_extrinsics_randomization: true
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  anchor_first_camera: true
+  fuse_method: random
+  fuse_device: cpu   # runs in dataloader workers; 'random' does not need a GPU
+
+  # Fuse (and load) only the frames the policy actually encodes: dp3.py:335
+  # slices observations to n_obs_steps, so the other `horizon - n_obs_steps`
+  # are built and thrown away. This also feeds SequenceSampler's `key_first_k`,
+  # which stops them being copied out of the replay buffer at all.
+  # `dataset_obs_steps` is declared in every policy config and was the intended
+  # plumbing for exactly this; it had no consumer until now.
+  # Requires policy.obs_as_global_cond: true, which is the default.
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  use_target_ee: ${policy.use_target_ee}

@@ -80,3 +80,11 @@ third_party/dexart-release/dexart_assets.zip
 # ---- Misc large/one-off archives ----
 *.zip
 !third_party/**/*.zip.keep  # escape hatch placeholder; remove if unused
+
+
+
+# CLAUDE files
+CLAUDE.md
+docs/pipeline_design_notes.txt
+.claude/
+
