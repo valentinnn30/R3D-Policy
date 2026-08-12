@@ -89,10 +89,14 @@ cameras:
       - [ 0.0,       0.0,       0.0,       1.0     ]
     flange_pose:
       # T_world<-link0 @ FK(joints) @ T_link8<-cam -- every factor measured.
-      # Deliberately NOT the recorded EE pose: qpos_arm was generated with a
-      # simplified world<-link0 offset of (0, +-0.35, 0), which differs from the
-      # measured link0 below by 14.4 mm / 1.11 deg. Mixing that with the
-      # measured top-camera transform would misregister the fused cloud.
+      # Deliberately NOT the recorded EE pose: that folds in the end-effector
+      # placement, whereas FK reaches the flange directly.
+      # (Historical note: this comment used to say qpos_arm carried a simplified
+      # world<-link0 of (0, +-0.35, 0). That is NO LONGER TRUE -- /paco publishes
+      # the measured transform. Verified 2026-08-11 on 50traj_v1: FK with the
+      # measured base below reproduces qpos_arm to 0.011 mm (left) / 0.007 mm
+      # (right); the simplified base is off by 6.4 / 13.9 mm. Everything shares
+      # one world frame.)
       source: fk
       joints: /observations/joint_states/position
       joint_slice: [0, 7]
@@ -117,10 +121,14 @@ cameras:
       - [ 0.0,       0.0,       0.0,       1.0     ]
     flange_pose:
       # T_world<-link0 @ FK(joints) @ T_link8<-cam -- every factor measured.
-      # Deliberately NOT the recorded EE pose: qpos_arm was generated with a
-      # simplified world<-link0 offset of (0, +-0.35, 0), which differs from the
-      # measured link0 below by 14.4 mm / 1.11 deg. Mixing that with the
-      # measured top-camera transform would misregister the fused cloud.
+      # Deliberately NOT the recorded EE pose: that folds in the end-effector
+      # placement, whereas FK reaches the flange directly.
+      # (Historical note: this comment used to say qpos_arm carried a simplified
+      # world<-link0 of (0, +-0.35, 0). That is NO LONGER TRUE -- /paco publishes
+      # the measured transform. Verified 2026-08-11 on 50traj_v1: FK with the
+      # measured base below reproduces qpos_arm to 0.011 mm (left) / 0.007 mm
+      # (right); the simplified base is off by 6.4 / 13.9 mm. Everything shares
+      # one world frame.)
       source: fk
       joints: /observations/joint_states/position
       joint_slice: [7, 14]
@@ -188,7 +196,8 @@ extrinsics_randomization:
   enabled: true
   # MEASURED, not guessed. At full resolution the three cameras disagree by
   # 11-19 mm (median NN distance in the overlap region; overall 15.4 mm with the
-  # measured link0 transforms, vs 20.7 mm with the simplified ones). Part of that
+  # measured link0 transforms; the 20.7 mm figure came from an older recording
+  # that predated /paco publishing the measured transform). Part of that
   # is depth-sensor bias and surface sampling rather than calibration -- per-point
   # noise is already modelled by data_augmentation.pc_xyz_noise_std -- so these
   # sit below the raw figure while still covering plausible recalibration drift.
@@ -206,7 +215,7 @@ extrinsics_randomization:
 # 48 dims per vector: left arm EE pose (7) | right arm EE pose (7)
 #                   | left hand (17)       | right hand (17)
 #
-# NOTE the arm entries are END-EFFECTOR POSES (xyz + wxyz quaternion), not joint
+# NOTE the arm entries are END-EFFECTOR POSES (xyz + xyzw quaternion), not joint
 # angles. `/observations/joint_states/position` holds the actual 14 joint angles
 # and is NOT used here, because the recorded ACTION is an EE-space target --
 # there are no joint-space action targets in the file. See the open questions.
@@ -279,4 +288,9 @@ frame_stride: 1
 # 2. STATE REPRESENTATION. `state` currently mirrors `action` (EE pose + hand).
 #    Swapping the arm block for /observations/joint_states/position would give
 #    joint-space proprioception against EE-space actions.
-# 3. `actions_hand/*` is bit-for-bit identical to `observations/qpos_hand/*`.
+# 3. RESOLVED 2026-08-12, was "actions_hand is bit-for-bit identical to
+#    qpos_hand". No longer true on `80traj_seperate`: 0% of samples are equal,
+#    median |action - state| is 1.19 deg on the hand and 3.68 mm on the arm
+#    (p95 14.0 deg / 13.9 mm). Action and state are distinct signals, so the
+#    action is learnable rather than a copy -- but they are CLOSE, which is what
+#    sizes agent_pos_noise_std (see r3d_robotwin2.yaml).

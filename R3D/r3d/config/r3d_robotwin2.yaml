@@ -93,17 +93,24 @@ policy:
   use_target_ee: false # remember change action.shape in {task}.yaml when enabling ee prediction
   cat_on_token: false
 
+# Values are set from measurements on OUR rig, not tuned. add_noise clips at 2*std.
 data_augmentation:
-  use_augmentation: true      # Enable data augmentation
-  pc_xyz_noise_std: 0.002
-  pc_rgb_noise_std: 0
-  agent_pos_noise_std: 0.0002  # agent_pos noise std
-  
-  # Color jitter parameters
-  use_color_jitter: true      # Enable color jitter augmentation
-  brightness_range: [-0.125, 0.125]   # Brightness range
-  contrast_range: [0.5, 1.5]          # Contrast range
-  saturation_range: [0.5, 1.5]        # Saturation range
+  use_augmentation: true
+  pc_xyz_noise_std: 0.002     # 2 mm = measured depth accuracy (+-1.3-2 mm, both wrists)
+  pc_rgb_noise_std: 0.01      # 1% of [0,1] rgb ~ 2.5/255; cameras differ in colour
+  agent_pos_noise_std: 0.002  # 2 mm / 0.002 rad. Was 0.01 -- that is ~3x the median
+                              # |action - state| (3.68 mm arm, 1.19 deg hand), i.e. it
+                              # drowned the target rather than regularising it. 2 mm is
+                              # ~half the median, enough to stop exact state->action
+                              # copying. One std spans metres, quaternion units and
+                              # radians, so keep it small.
+
+  # Colour jitter: all three cameras run auto AE/AWB, so per-camera colour drifts
+  # between episodes. This is the augmentation with the clearest grounding here.
+  use_color_jitter: true
+  brightness_range: [-0.125, 0.125]
+  contrast_range: [0.5, 1.5]
+  saturation_range: [0.5, 1.5]
 
 
 ema:

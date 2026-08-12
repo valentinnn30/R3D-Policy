@@ -18,29 +18,27 @@ env_runner: null
 dataset:
   _target_: r3d.dataset.real_multicam_dataset.RealMultiCamDataset
   # train.py chdirs to the repo root, so these are relative to ~/R3D-Policy
-  zarr_path: R3D/data/real_bimanual.zarr
+  zarr_path: R3D/data/real_bimanual_seperate80.zarr
   preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
-  # One HDF5 file == one episode, and each file holds ~5 back-to-back
-  # trajectories recorded WITHOUT a reset. They are deliberately NOT split into
-  # separate episodes: the terminal state of one trajectory is indistinguishable
-  # from the initial state of the next, so per-trajectory episodes would delete
-  # the cross-seam windows that teach "continue" and replace them with
-  # end-padded windows -- sampler.py:145 replicates the last action to fill the
-  # horizon -- that teach "hold still" at exactly that aliased state. Since the
-  # policy cannot tell terminal from initial, a stall learned at one is a stall
-  # at the other: the failure is not "it never stops", it is "it never starts".
-  # There is no termination output either way; stopping is external.
+  # One file == one episode == one trajectory, WITH a reset between takes
+  # (80traj_seperate, 2026-08-12). create_indices clamps windows inside their
+  # episode, so no cross-reset window is sampled. Nothing to split or merge.
   #
-  # The val unit is therefore the FILE. 0.02 was inherited from a config sized
-  # for hundreds of sim episodes; at 10 files it floors to 1 episode anyway
-  # (get_val_mask takes max(1, round(n * ratio)), so 0.02 and 0.1 are currently
-  # bit-identical). 0.1 states the intent and still holds out ~10% once more
-  # files are recorded.
-  val_ratio: 0.1
+  # Hinges on the reset: without one (the old ~5-per-file scheme) terminal and
+  # initial states alias, and pad_after end-padding teaches "hold still" at
+  # both -- failing as "it never starts". Measured here, start poses cluster to
+  # std 0.032 m while |start(n+1) - end(n)| = 0.29 m. No aliasing.
+  #
+  # val is a divergence tripwire, not a checkpoint selector (env_runner is
+  # sim-only; real checkpoints get picked on the robot). 4 of 80 reads cleanly
+  # -- episodes, not windows, set the noise floor -- without spending more of a
+  # small dataset. The paper's 0.02 is a copied default, identical for
+  # 1000-demo ManiSkill and 50-demo RoboTwin, and yields only 2 here.
+  val_ratio: 0.05
   max_train_episodes: null
 
   # Extrinsics randomization: per camera, redrawn per sampled window, constant

@@ -300,13 +300,20 @@ class TrainDP3Workspace:
                 t1_2 = time.time()
 
                 # step optimizer
-                if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                stepped = self.global_step % cfg.training.gradient_accumulate_every == 0
+                if stepped:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                     lr_scheduler.step()
                 t1_3 = time.time()
-                # update ema
-                if cfg.training.use_ema:
+                # update ema -- only on real optimizer steps. The optimizer steps
+                # once per `gradient_accumulate_every` batches, so stepping the EMA
+                # every batch averages in an UNCHANGED model on the accumulation
+                # sub-steps: no new information, but it still advances the EMA decay
+                # schedule, so the effective averaging window shrinks by that factor
+                # (~80 -> ~20 epochs at accum 4). Exactly equivalent to the old code
+                # when gradient_accumulate_every == 1, which is the default.
+                if cfg.training.use_ema and stepped:
                     if self.use_ddp:
                         # For DDP, update EMA with the underlying model (without DDP wrapper)
                         ema.step(self.model.module)

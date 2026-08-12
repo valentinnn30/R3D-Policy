@@ -24,7 +24,7 @@ gpu_id=${3:?missing gpu id}
 alg_name=${ALG:-r3d_robotwin2}
 # The R3D paper trains for 1000 epochs. The config's own 3001 is the outlier --
 # it is sized around `rollout_every: 200` sim evaluations we do not run.
-epochs=${EPOCHS:-1000}
+epochs=${EPOCHS:-601}
 checkpoint_every=${CHECKPOINT_EVERY:-100}
 # 256 is the paper's RoboTwin setting, which uses this same policy config, so it
 # is the tested pairing with lr 1e-4 / 1000 epochs / cosine. (They use 2048 for
@@ -39,8 +39,8 @@ checkpoint_every=${CHECKPOINT_EVERY:-100}
 # train.py scales the loss by 1/accum and steps the optimizer AND the LR
 # scheduler only on accumulation boundaries, so the effective batch and the
 # cosine schedule are preserved. BATCH_SIZE=64 GRAD_ACCUM=4 == batch 256.
-batch_size=${BATCH_SIZE:-256}
-grad_accum=${GRAD_ACCUM:-1}
+batch_size=${BATCH_SIZE:-64}
+grad_accum=${GRAD_ACCUM:-4}
 wandb_mode=${WANDB_MODE:-offline}
 save_ckpt=${SAVE_CKPT:-True}
 exp_name=${task_config}-${alg_name}-${seed}
