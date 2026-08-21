@@ -342,9 +342,24 @@ class RealMultiCamDataset(BaseDataset):
             xyz = add_noise(pc[..., :3], self.pc_xyz_noise_std, 2 * self.pc_xyz_noise_std)
             rgb = add_noise(pc[..., 3:], self.pc_rgb_noise_std, 2 * self.pc_rgb_noise_std)
             data["obs"]["point_cloud"] = np.concatenate([xyz, rgb], axis=-1)
-            data["obs"]["agent_pos"] = add_noise(
-                data["obs"]["agent_pos"], self.agent_pos_noise_std,
-                2 * self.agent_pos_noise_std)
+            # ONE draw per window, broadcast across the observation frames --
+            # NOT independent per frame, which is what add_noise() does.
+            #
+            # agent_pos is (n_obs_steps, 48) and the pair is the ONLY velocity
+            # signal the policy has. Independent noise lands on the difference
+            # too: at std 2 mm that is sqrt(2)*2 = 2.83 mm of noise per axis
+            # against a measured median inter-frame EE motion of 1.31 mm, i.e. a
+            # velocity signal-to-noise of 0.46 -- the cue was more noise than
+            # signal. Correlated noise cancels exactly in the difference, so
+            # velocity survives untouched while absolute pose keeps the same
+            # uncertainty that stops the policy copying state into action.
+            #
+            # Clipping matches add_noise(): +-2*std.
+            ap = data["obs"]["agent_pos"]
+            jitter = np.clip(
+                np.random.normal(0.0, self.agent_pos_noise_std, ap.shape[-1]),
+                -2 * self.agent_pos_noise_std, 2 * self.agent_pos_noise_std)
+            data["obs"]["agent_pos"] = ap + jitter
 
         if self.use_color_jitter:
             pc = data["obs"]["point_cloud"]

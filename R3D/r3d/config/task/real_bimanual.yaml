@@ -3,7 +3,7 @@ name: ${task_name}
 shape_meta: &shape_meta
   obs:
     point_cloud:
-      shape: [10240, 6]   # the FUSED cloud; per-camera clouds are 5120
+      shape: [8192, 6]    # FUSED cloud after the 30 mm floor cut; per-camera 1792/3840/3840
       type: point_cloud
     agent_pos:
       shape: [48]
@@ -18,7 +18,7 @@ env_runner: null
 dataset:
   _target_: r3d.dataset.real_multicam_dataset.RealMultiCamDataset
   # train.py chdirs to the repo root, so these are relative to ~/R3D-Policy
-  zarr_path: R3D/data/real_bimanual_seperate80.zarr
+  zarr_path: R3D/data/real_bimanual_floorcut105.zarr
   preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}

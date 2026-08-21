@@ -353,7 +353,13 @@ def convert_episode(path, cfg, pc_cfg, streams, cam_names, device):
                     nominal_extrinsics=(hand_eye if nominals[name] is None
                                         else nominals[name][j]),
                     cfg=pc_cfg,
-                    num_points=cfg["points_per_camera"],
+                    # per-camera budget: after the floor cut the three cameras
+                    # genuinely have different amounts left (cam_top is mostly
+                    # table, so it keeps ~3.2k while the wrists keep ~8k), and
+                    # spending more on the close wrist views buys resolution
+                    # exactly where the contact happens. Falls back to the
+                    # global scalar when a camera does not override it.
+                    num_points=int(spec.get("points", cfg["points_per_camera"])),
                     margin=cfg["crop_margin"],
                     device=device,
                     max_input_points=cfg.get("max_input_points"),

@@ -64,6 +64,28 @@ class PointCloudPreprocessConfig:
     rgb_max: float = 255.0
     num_points: int = 1024
 
+    # ------------------------------------------------------------- floor cut --
+    # Fixed table plane in the BASE frame, fitted once offline (RANSAC + least
+    # squares over 150 frames) and then held constant, exactly like the
+    # extrinsics. Points at or below `floor_margin` above it are dropped.
+    #
+    # Why a plane and not a z bound: the table is tilted 2.67 deg in this world
+    # frame, so over the 0.65 m workspace a flat z-cut is uneven by ~28 mm --
+    # it would leave floor at one end or eat the cube at the other.
+    #
+    # Why this is worth doing at all: the clouds are fused in the WORLD frame,
+    # so static geometry is not informative the way a moving-camera image
+    # background is. Worse, which PART of the floor is visible changes with arm
+    # pose (the wrist cameras ride on the arms), making it a nuisance variable
+    # correlated with proprioception. Measured: 62% of every fused cloud was
+    # table, and the policy demonstrably responded to it.
+    #
+    # STALE IF THE TABLE OR CAMERAS MOVE, same failure mode as the extrinsics.
+    # Must be byte-identical at inference or the observation silently diverges.
+    floor_normal: Optional[List[float]] = None
+    floor_offset: Optional[float] = None
+    floor_margin: float = 0.0
+
     @classmethod
     def from_yaml(cls, path: str) -> "PointCloudPreprocessConfig":
         with open(path, "r") as f:
@@ -192,6 +214,15 @@ def preprocess_camera_frame(
 
     lo, hi = cfg.bounds
     keep = np.all((xyz_base > lo - margin) & (xyz_base < hi + margin), axis=-1)
+    # Floor cut, in the BASE frame like the box test, applied to the same mask so
+    # the points that come back are still untouched camera-frame coordinates.
+    # Runs BEFORE the FPS below, which is the whole point: sampling first and
+    # cutting after would spend the per-camera budget on table and leave far too
+    # few points (measured 3520 of 15360 survive that ordering). Cutting first
+    # means the budget lands entirely on dynamic content.
+    if cfg.floor_normal is not None:
+        n = np.asarray(cfg.floor_normal, dtype=np.float64)
+        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
     kept = np.concatenate([xyz_cam[keep], rgb[keep]], axis=-1)
     kept = pad_to_min_points(kept, num_points)
 

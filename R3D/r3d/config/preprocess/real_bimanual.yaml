@@ -16,7 +16,8 @@
 # reachable workspace -- and changing it invalidates existing checkpoints.
 # Derived from the recording, not guessed: the world origin sits BETWEEN the two
 # robot bases (link0 at x ~ +-0.002), so the workspace is entirely in +x. The
-# table surface is at z ~ 0 (cloud z median +0.04, p5 -0.05) and the EEs work at
+# table surface is NOT at z = 0 -- measured, it is a plane 62 mm above the origin
+# tilted 2.67 deg (see the floor section below). The EEs work at
 # x 0.40-0.56, y +-0.34, z 0.25-0.32. Cloud mass spans x 0.34-1.09, y -0.55..0.36,
 # with almost nothing above z = 0.3.
 # CONFIRM against the physical table before the full conversion -- the upper x
@@ -33,18 +34,73 @@ point_scale: 1.0
 rgb_max: 255.0
 # Points in the FUSED cloud handed to the policy. Must match shape_meta.
 #
-# The paper uses 8192 for wrist + top. Our third camera is NOT pure redundancy --
-# point clouds sample surfaces, and a third viewpoint reveals surface the other
-# two cannot see -- so 10240 buys that extra coverage.
+# Lowered from 10240 when the floor cut landed: after the cut there simply are
+# not 10240 non-floor points to fuse. The per-camera budgets below sum to a pool
+# of 10240, and 8192 leaves headroom so fusion is always a real subsample and
+# never has to duplicate-pad when a stray point falls outside the box.
 #
-# Do not push much past this. The encoder groups the cloud into
-# num_group(512) x group_size(32) = 16384 point-slots via FPS + kNN
-# (pointnet_extractor.py:505); a point in no center's 32-NN is never seen by the
-# transformer at all. 10240 sits at 1.6x coverage. By ~16384 a large fraction of
-# points are dropped before the encoder, so extra points cost disk and fusion
-# time and buy nothing. Raising `num_group` is the lever if you need more, at
+# The encoder groups the cloud into num_group(512) x group_size(32) = 16384
+# point-slots via FPS + kNN (pointnet_extractor.py:505); a point in no center's
+# 32-NN is never seen by the transformer at all. 8192 sits at 2.0x coverage,
+# against 1.6x at the old 10240 -- and now every point is dynamic content rather
+# than 62% table. Raising `num_group` is the lever if you need more, at
 # proportionally more transformer tokens.
-num_points: 10240
+num_points: 8192
+
+# ------------------------------------------------------------------- floor --
+# Fixed table plane in the world frame. Points at or below `floor_margin` above
+# it are dropped at CONVERSION time, per camera, BEFORE the FPS below.
+#
+# Why at all: the clouds are fused in the world frame, so static geometry does
+# not carry task information the way an image background does under a moving
+# camera. Measured: 62% of every fused cloud was table -- and because the wrist
+# cameras ride on the arms, WHICH part of the floor is visible varies with arm
+# pose, making it a nuisance variable correlated with proprioception. The
+# 600-epoch policy demonstrably responded to it while ignoring the cube.
+#
+# Why a plane, not a z bound: the table is tilted 2.67 deg here, so a flat cut
+# is uneven by ~28 mm across the workspace. It is also LAYERED -- inter-camera
+# registration disagrees by 11-19 mm, so the fused "floor" is a slab several mm
+# thick, which is why 15 mm clears it where 5 mm would not.
+#
+# Fitted once by RANSAC + least squares over 150 frames. STALE IF THE TABLE OR
+# CAMERAS MOVE, exactly like the extrinsics. `r3d_preprocess.py` at inference
+# must carry the identical numbers.
+#
+# Set to 30 mm after inspecting a full episode in RViz (crop_preview_node.py):
+# 15 and 20 mm both left visible floor, because the fused floor is a LAYERED
+# slab -- inter-camera registration disagrees by 11-19 mm -- not a surface.
+#
+# Measured cost at 30 mm: 80.8% of the cloud removed; 71.3% of the cube kept in
+# the PRE-GRASP frames that matter (87.4% at 15 mm, 82.5% at 20 mm). What is
+# lost is the cube's bottom band against the table, BELOW the finger contact.
+# Some sensor noise survives; filtering that is a separate step.
+#
+# DUPLICATE PADDING IS EXPECTED HERE AND WAS ACCEPTED DELIBERATELY (2026-08-20).
+# Measured over 6 full episodes at 30 mm, per camera:
+#     cam_top          min 1252  p5 1624  p10 1788  med  2320  -> 10.4% padded
+#     cam_wrist_left   min 1753  p5 3060  p10 3891  med  7922  ->  9.6% padded
+#     cam_wrist_right  min 1466  p5 3803  p10 4314  med  8137  ->  5.8% padded
+#
+# It is not a budget-split problem: on the worst frames the WHOLE scene holds
+# only ~4500 points (1252 + 1753 + 1466), which is less than num_points, so no
+# allocation between cameras avoids it. Only lowering num_points would, and that
+# penalises the frames that matter.
+#
+# It is concentrated where it costs least. For the left wrist, by phase:
+#     0.00-0.25 median  5620 pts,  6.7% short
+#     0.25-0.50 median 16210 pts,  0.0% short
+#     0.50-0.75 median 23776 pts,  0.0% short
+#     0.75-1.00 median  4719 pts, 31.7% short   <- after place-down, arm retracting
+# Grasp and handover, the frames that matter, carry 16k-24k points and never pad.
+#
+# And it is fairly benign: the encoder's FPS picks group centres by max-min
+# distance, so coincident duplicates are never selected as separate centres.
+#
+# Do NOT "fix" this by lowering num_points without re-reading the above.
+floor_normal: [0.04167, 0.02098, 0.99891]
+floor_offset: -0.06193
+floor_margin: 0.030
 
 # ------------------------------------------------------------------ cameras --
 # `mount: static` -> `extrinsics` IS the camera -> base transform.
@@ -63,6 +119,7 @@ num_points: 10240
 # slicing to it is mandatory.
 cameras:
   - name: cam_top
+    points: 1792          # per-camera budget after the 30 mm floor cut
     mount: static
     layout: xyz_rgb_split
     xyz: /observations/pointclouds/oakd_TOP_CAMERA/xyz
@@ -76,6 +133,7 @@ cameras:
       - [ 0.0,       0.0,       0.0,       1.0     ]
 
   - name: cam_wrist_left
+    points: 3840          # per-camera budget after the 30 mm floor cut
     mount: wrist
     layout: xyz_rgb_split
     xyz: /observations/pointclouds/orbbec_left_wrist_view/xyz
@@ -108,6 +166,7 @@ cameras:
       - [ 0.0,       0.0,       0.0,       1.0     ]
 
   - name: cam_wrist_right
+    points: 3840          # per-camera budget after the 30 mm floor cut
     mount: wrist
     layout: xyz_rgb_split
     xyz: /observations/pointclouds/orbbec_right_wrist_view/xyz
@@ -174,7 +233,7 @@ max_input_points: null
 # workspace box by this margin (metres), so points a later perturbation would
 # pull into the workspace are not discarded now. Must comfortably exceed the
 # largest displacement the randomization can produce.
-crop_margin: 0.05
+crop_margin: 0.0
 
 # ------------------------------------------------------------------- fusion --
 fusion:
