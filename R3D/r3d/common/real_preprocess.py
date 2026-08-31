@@ -224,6 +224,32 @@ def preprocess_camera_frame(
         n = np.asarray(cfg.floor_normal, dtype=np.float64)
         keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
     kept = np.concatenate([xyz_cam[keep], rgb[keep]], axis=-1)
+
+    if len(kept) == 0:
+        # A camera seeing NOTHING inside the workspace is normal, not a fault.
+        # The wrist cameras ride on the arms, so when an arm lifts or turns away
+        # the box contains none of what it sees -- and the floor cut removes the
+        # table that used to be there. Measured on the 30-episode refine set:
+        # 2 of 30 episodes, always the left wrist, 8 and 94 frames.
+        #
+        # Emit points placed far OUTSIDE the workspace in world coordinates, so
+        # `fuse_cameras`' crop deletes them and this camera contributes nothing
+        # for this frame -- which is the truth. The pool is then short and the
+        # existing padding path fills it from the cameras that did see something.
+        #
+        # Returned in CAMERA frame like everything else, so the per-camera
+        # perturbation can still be applied later without special-casing.
+        # xyz_base = xyz_cam @ R.T + t  =>  xyz_cam = (xyz_base - t) @ R
+        # This mirrors what the inference builder already does (it skips an
+        # empty camera and reports it via FrameDiag.cam_short); conversion
+        # should not be stricter than inference.
+        far = (hi + 100.0) - T[:3, 3]
+        sentinel = np.tile(far @ T[:3, :3], (num_points, 1))
+        cprint(f"[real_preprocess] no points inside the workspace for this "
+               f"camera/frame; contributing nothing", "yellow")
+        return np.concatenate(
+            [sentinel, np.zeros((num_points, 3))], axis=-1).astype(np.float32)
+
     kept = pad_to_min_points(kept, num_points)
 
     # Farthest-point sampling is O(N x K), so running it on a raw 170k-point

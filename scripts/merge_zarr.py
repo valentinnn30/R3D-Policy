@@ -6,11 +6,16 @@ concatenation of every `data/` array plus an offset on the boundaries. The only
 real work is refusing to merge datasets that are not interchangeable.
 
 REFUSES unless the inputs agree on: the set of data arrays, every array's
-per-frame shape and dtype, `meta/extrinsics_cam0`, and every `meta` attribute
-(camera_names, control_hz, quaternion_order/slices, state/action layout). Those
-encode what an observation MEANS -- two zarrs built with different workspaces,
-floor cuts or point budgets would concatenate happily and train into nonsense,
-since the normalizer is derived from the config, not from the data.
+per-frame shape and dtype, `meta/extrinsics_cam0`, and every SEMANTIC `meta`
+attribute (camera_names, control_hz, quaternion_order/slices, state/action
+layout). Those encode what an observation MEANS -- two zarrs built with
+different workspaces, floor cuts or point budgets would concatenate happily and
+train into nonsense, since the normalizer is derived from the config, not from
+the data.
+
+`patch_*` and `note_*` attributes are PROVENANCE, not semantics: they are not
+required to match, and every input's are carried into the output tagged by
+source, so a repair applied to one dataset stays discoverable after merging.
 
 Copies frame-by-frame in blocks, never loading a whole array: a merged set here
 is several GB.
@@ -47,12 +52,28 @@ def check(zs, paths):
                                np.array(z["meta"]["extrinsics_cam0"])):
                 raise SystemExit("meta/extrinsics_cam0 differs -- the static camera "
                                  "moved, or one set was built with other calibration.")
+        # Only attributes that define what an OBSERVATION MEANS have to match.
+        # `patch_*` / `note_*` are provenance -- e.g. a zarr whose wrist column
+        # was repaired carries a patch note the others do not, and refusing to
+        # merge over that would be wrong: it describes history, not semantics.
         for a in sorted(set(ref["meta"].attrs) | set(z["meta"].attrs)):
+            if a.startswith(("patch_", "note_")):
+                continue
             if ref["meta"].attrs.get(a) != z["meta"].attrs.get(a):
                 raise SystemExit(f"meta attribute '{a}' differs:\n"
                                  f"  {rp}: {ref['meta'].attrs.get(a)}\n"
                                  f"  {p}: {z['meta'].attrs.get(a)}")
     return sorted(keys)
+
+
+def provenance(zs, paths):
+    """Collect every patch/note attribute across the inputs, tagged by source."""
+    out = {}
+    for z, p in zip(zs, paths):
+        for k, v in z["meta"].attrs.items():
+            if k.startswith(("patch_", "note_")):
+                out[f"{k} [{p.split('/')[-1]}]"] = v
+    return out
 
 
 def main():
@@ -98,6 +119,11 @@ def main():
         if k != "episode_ends":
             m.create_dataset(k, data=np.array(zs[0]["meta"][k]))
     for k, v in zs[0]["meta"].attrs.items():
+        if not k.startswith(("patch_", "note_")):
+            m.attrs[k] = v
+    # provenance from EVERY input, tagged by source, so a repair applied to one
+    # dataset stays discoverable after it is merged into a larger one
+    for k, v in provenance(zs, a.inputs).items():
         m.attrs[k] = v
 
     e = np.array(m["episode_ends"])
