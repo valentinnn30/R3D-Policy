@@ -16,7 +16,7 @@ from r3d.model.diffusion.diffusion_backbone import ConditionalUnet1D
 from r3d.model.diffusion.mask_generator import LowdimMaskGenerator
 from r3d.common.pytorch_util import dict_apply
 from r3d.common.model_util import print_params
-from r3d.model.vision.pointnet_extractor import DP3Encoder
+from r3d.model.vision.pointnet_extractor import DP3Encoder, MultiCamDP3Encoder
 
 class DP3(BasePolicy):
     def __init__(self,
@@ -44,6 +44,16 @@ class DP3(BasePolicy):
             transformer_config=None,
             use_target_ee=False,
             cat_on_token=False,
+            # Unfused pipeline only: patch tokens per camera. Ignored for a
+            # fused shape_meta. None -> an even split of `num_group`.
+            num_groups_per_camera=None,
+            # Unfused pipeline only. Mirrored from task.dataset so the encoder's
+            # pose handling cannot disagree with what the dataset actually
+            # writes into campose_cam*.
+            pose_source=None,
+            camera_arm_slice=None,
+            # None -> derived from pose_source (per-camera MLPs under 'proprio').
+            per_camera_pose_mlp=None,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -74,16 +84,89 @@ class DP3(BasePolicy):
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
-        obs_encoder = DP3Encoder(
-            observation_space=obs_dict,
-            img_crop_shape=crop_shape,
-            out_channel=encoder_output_dim,
-            pointcloud_encoder_cfg=pointcloud_encoder_cfg,
-            use_pc_color=use_pc_color,
-            pointnet_type=pointnet_type,
-            fps_random_config=fps_random_config,
-            cat_on_token=cat_on_token,
-        )
+        # Which encoder to build is decided by the DATA, not by a flag: a
+        # shape_meta carrying point_cloud_cam* is an unfused zarr and there is
+        # no `point_cloud` for DP3Encoder to read. Auto-detecting means the
+        # encoder cannot be set inconsistently with the dataset that feeds it.
+        self.unfused = any(k.startswith("point_cloud_cam") for k in obs_dict)
+        # Every observation key holding a cloud. One entry when fused; one per
+        # camera when not. Used by the clip / drop-colour steps below, which
+        # would otherwise KeyError on 'point_cloud' for an unfused batch.
+        self.pc_keys = sorted(
+            [k for k in obs_dict if k.startswith("point_cloud_cam")],
+            key=lambda k: int(k.replace("point_cloud_cam", ""))
+        ) if self.unfused else ["point_cloud"]
+        if self.unfused:
+            cprint("[Diffusion] unfused multi-camera observation detected -> "
+                   "MultiCamDP3Encoder (merge in feature space)", "green")
+
+            # What the camera tag is allowed to represent follows `pose_source`,
+            # which lives on the DATASET. Deriving both switches from it here,
+            # rather than exposing a second independent one, is what makes
+            # `task.dataset.pose_source=proprio` on the command line reconfigure
+            # the whole experiment. The failure it prevents is a proprio run
+            # training with a shared pose MLP -- which cannot fold in the
+            # constant flange->camera offset that A' exists to test, so the
+            # ablation would answer a different question than the one asked,
+            # and nothing would report that it had.
+            n_cams = len(self.pc_keys)
+            pose_source = "extrinsic" if pose_source is None else str(pose_source)
+            if pose_source == "extrinsic":
+                camera_has_pose = [True] * n_cams
+            elif pose_source == "none":
+                camera_has_pose = [False] * n_cams
+            elif pose_source == "proprio":
+                if camera_arm_slice is None:
+                    raise ValueError(
+                        "pose_source='proprio' needs camera_arm_slice, so the "
+                        "encoder knows which cameras carry a pose at all. Wire "
+                        "it from task.dataset.camera_arm_slice -- the dataset "
+                        "hands a camera without an arm zeros(9), and an MLP on "
+                        "a constant is parameters spent on nothing.")
+                if len(camera_arm_slice) != n_cams:
+                    raise ValueError(
+                        f"camera_arm_slice has {len(camera_arm_slice)} entries "
+                        f"for {n_cams} cameras")
+                camera_has_pose = [s is not None for s in camera_arm_slice]
+                if not any(camera_has_pose):
+                    raise ValueError(
+                        "pose_source='proprio' but no camera has an arm slice, "
+                        "so every tag would collapse to its identity embedding "
+                        "-- that is the 'none' control, not A'.")
+            else:
+                raise ValueError(
+                    f"unknown pose_source {pose_source!r} (expected "
+                    "'extrinsic', 'proprio' or 'none')")
+
+            if per_camera_pose_mlp is None:
+                per_camera_pose_mlp = pose_source == "proprio"
+            cprint(f"[Diffusion] pose_source: {pose_source} -> "
+                   f"per-camera pose MLP: {per_camera_pose_mlp}, "
+                   f"cameras with a pose: {camera_has_pose}", "green")
+
+            obs_encoder = MultiCamDP3Encoder(
+                observation_space=obs_dict,
+                out_channel=encoder_output_dim,
+                pointcloud_encoder_cfg=pointcloud_encoder_cfg,
+                use_pc_color=use_pc_color,
+                pointnet_type=pointnet_type,
+                fps_random_config=fps_random_config,
+                cat_on_token=cat_on_token,
+                num_groups_per_camera=num_groups_per_camera,
+                per_camera_pose_mlp=per_camera_pose_mlp,
+                camera_has_pose=camera_has_pose,
+            )
+        else:
+            obs_encoder = DP3Encoder(
+                observation_space=obs_dict,
+                img_crop_shape=crop_shape,
+                out_channel=encoder_output_dim,
+                pointcloud_encoder_cfg=pointcloud_encoder_cfg,
+                use_pc_color=use_pc_color,
+                pointnet_type=pointnet_type,
+                fps_random_config=fps_random_config,
+                cat_on_token=cat_on_token,
+            )
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape() # embed_dim + robot_state_embed_dim = 512
@@ -199,13 +282,25 @@ class DP3(BasePolicy):
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
 
-        # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6]
-        if 'point_cloud' in nobs:
-            nobs['point_cloud'] = torch.clamp(nobs['point_cloud'], min=-1-1e-6, max=1+1e-6)
-
-        if not self.use_pc_color:
-            nobs['point_cloud'] = nobs['point_cloud'][..., :3]
-        this_n_point_cloud = nobs['point_cloud']
+        # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
+        #
+        # DELIBERATELY SKIPPED for the unfused pipeline. Its xyz already lands
+        # inside [-1, 1] (one shared isotropic METRIC_SCALE_M; measured max
+        # |xyz| 0.93), so the clamp would be a no-op -- but only while that
+        # scale is right. If someone shrinks METRIC_SCALE_M, clamping would
+        # SILENTLY flatten the far points onto the cube faces, whereas letting
+        # them through makes the encoder's PositionEmbeddingRandom raise
+        # "Input coordinates must be normalized to [-1, 1]" and say so. A loud
+        # failure beats a silent clip, so the guard stays off here.
+        #
+        # The fused path keeps it: there the workspace box makes [-1, 1] true
+        # by construction, so the clamp only ever absorbs float error.
+        for _k in self.pc_keys:
+            if _k in nobs:
+                if not self.unfused:
+                    nobs[_k] = torch.clamp(nobs[_k], min=-1-1e-6, max=1+1e-6)
+                if not self.use_pc_color:
+                    nobs[_k] = nobs[_k][..., :3]
 
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
@@ -311,14 +406,27 @@ class DP3(BasePolicy):
         obs_dict = batch['obs']
         nobs = self.normalizer.normalize(obs_dict)
 
-        # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6]
-        if 'point_cloud' in nobs:
-            nobs['point_cloud'] = torch.clamp(nobs['point_cloud'], min=-1-1e-6, max=1+1e-6)
+        # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
+        #
+        # DELIBERATELY SKIPPED for the unfused pipeline. Its xyz already lands
+        # inside [-1, 1] (one shared isotropic METRIC_SCALE_M; measured max
+        # |xyz| 0.93), so the clamp would be a no-op -- but only while that
+        # scale is right. If someone shrinks METRIC_SCALE_M, clamping would
+        # SILENTLY flatten the far points onto the cube faces, whereas letting
+        # them through makes the encoder's PositionEmbeddingRandom raise
+        # "Input coordinates must be normalized to [-1, 1]" and say so. A loud
+        # failure beats a silent clip, so the guard stays off here.
+        #
+        # The fused path keeps it: there the workspace box makes [-1, 1] true
+        # by construction, so the clamp only ever absorbs float error.
+        for _k in self.pc_keys:
+            if _k in nobs:
+                if not self.unfused:
+                    nobs[_k] = torch.clamp(nobs[_k], min=-1-1e-6, max=1+1e-6)
+                if not self.use_pc_color:
+                    nobs[_k] = nobs[_k][..., :3]
 
         nactions = self.normalizer['action'].normalize(batch['action'])
-
-        if not self.use_pc_color:
-            nobs['point_cloud'] = nobs['point_cloud'][..., :3]
         
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]

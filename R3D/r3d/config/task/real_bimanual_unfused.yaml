@@ -1,0 +1,155 @@
+name: ${task_name}
+
+# UNFUSED variant of real_bimanual.yaml. The clouds stay in their own camera
+# frames and are merged in FEATURE space -- see MultiCamDP3Encoder. The
+# extrinsic becomes conditioning and is never applied to the points, so an
+# extrinsic error cannot deform the encoder's input.
+#
+# Same zarr as the fused run: `preprocess_camera_frame` already stores
+# per-camera clouds in camera frame, so nothing had to be re-converted.
+#
+# Run B  : this file as-is (pose_source: extrinsic).
+# Ablation A' : task.dataset.pose_source=proprio on the command line. That
+#               drops calibration entirely -- each wrist camera is tagged with
+#               its own arm's recorded EE pose, and the static top camera gets
+#               only its identity embedding, which is sufficient because its
+#               transform is a constant.
+#
+# That one override also reconfigures the ENCODER, via the policy config's
+# `pose_source` / `camera_arm_slice` / `per_camera_pose_mlp`. Under 'proprio'
+# each camera gets its OWN pose MLP, and the top camera gets none at all:
+#
+#   * Own MLP, because A' asks the network to learn the constant flange->camera
+#     mount offset. That offset is a rigid right-composition and differs per
+#     camera; a SHARED MLP sees only pose9, cannot tell the cameras apart, and
+#     the per-camera `cam_embed` it is summed with is an offset on the OUTPUT,
+#     not a transform of the input -- so `f(pose) + e_i` cannot represent
+#     `f(pose @ T_i)`. Shared would leave the decoder to disentangle the sum,
+#     i.e. would test a weaker hypothesis than the one A' is about.
+#   * No MLP for cam_top, because it rides on no arm: `_campose` hands it
+#     zeros(9), and an MLP whose input is always constant computes a constant.
+#     Its identity embedding already IS that constant.
+#
+# Run B keeps the shared MLP -- the calibrated mount is already inside its 4x4,
+# so there is nothing constant left to learn -- which also leaves its parameter
+# count unchanged against the unfused runs already done.
+
+shape_meta: &shape_meta
+  obs:
+    # The zarr STORES 1792/3840/3840 points per camera. The budget below keeps
+    # all of cam_top and subsamples the wrists so the total is 8192 -- the fused
+    # run's `num_points`, which it draws from the same 9472-point pool. Same
+    # total points AND same total tokens as run A, so the A/B isolates the
+    # architecture rather than how much surface each run got to see.
+    point_cloud_cam0:      # cam_top, statically mounted
+      shape: [1792, 6]
+      type: point_cloud
+    point_cloud_cam1:      # cam_wrist_left
+      shape: [3200, 6]
+      type: point_cloud
+    point_cloud_cam2:      # cam_wrist_right
+      shape: [3200, 6]
+      type: point_cloud
+    # [translation(3), 6D rotation(6)] per camera. What fills it is decided by
+    # the dataset's `pose_source`, so the encoder never needs to know which
+    # experiment is running.
+    campose_cam0:
+      shape: [9]
+      type: low_dim
+    campose_cam1:
+      shape: [9]
+      type: low_dim
+    campose_cam2:
+      shape: [9]
+      type: low_dim
+    # 1.0 where that camera had enough points inside the workspace to fill its
+    # FPS group centres, 0.0 otherwise. A wrist camera looking away from the
+    # table is normal (measured 2 of 30 episodes); its tokens are replaced by a
+    # learned `absent` embedding rather than left degenerate.
+    cam_valid:
+      shape: [3]
+      type: low_dim
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+env_runner: null
+
+# Patch tokens per camera: 112 + 200 + 200 = 512, identical to the fused run's
+# single `num_group: 512`. Read by BOTH the dataset (which must not hand a
+# camera fewer points than it has groups) and the encoder (via oc.select in the
+# policy config), so the two cannot drift apart.
+num_groups_per_camera: [112, 200, 200]
+
+dataset:
+  _target_: r3d.dataset.real_multicam_dataset.RealMultiCamUnfusedDataset
+  zarr_path: R3D/data/real_bimanual_mixed150.zarr
+  preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  points_per_camera_encoder: [1792, 3200, 3200]
+  num_groups_per_camera: ${task.num_groups_per_camera}
+
+  # extrinsic -> Run B; proprio -> Ablation A'; none -> identity embeddings only.
+  pose_source: extrinsic
+
+  # Which slice of the 48-dim `agent_pos` holds the EE pose of the arm each
+  # camera rides on: [x, y, z, qx, qy, qz, qw]. null for a static camera.
+  #
+  # These happen to be the same numbers as the preprocess yaml's `joint_slice`,
+  # but they are NOT the same thing -- that one indexes the 14 joint angles,
+  # this one indexes `agent_pos`. Only used when pose_source is 'proprio'.
+  camera_arm_slice: [null, [0, 7], [7, 14]]
+
+  # OFF as of 2026-09-04. Measured on the FUSED run (approach 1), which is the
+  # case with the STRONGEST argument for randomising -- there an extrinsic error
+  # genuinely deforms the merged cloud -- and it still lost: the policy was
+  # already robust to the ghosting, and was not robust to the randomisation.
+  # Grasp precision was the casualty. The argument that previously pinned it on
+  # here, that run B must face the same augmentation as the fused 60% baseline
+  # or the A/B is not an A/B, died with that baseline.
+  #
+  # It was never only a tag perturbation, which is the reason it also comes off
+  # for Ablation A'. `deltas[i]` composes into the T that `select_camera_frame`
+  # uses to decide which points survive the workspace box and the floor cut, so
+  # under `pose_source: proprio` -- where `_campose` ignores T entirely and
+  # reads the EE pose out of agent_pos -- it still jittered the crop boundary
+  # and the floor plane. Any A' run launched with only a `pose_source` override
+  # inherited that.
+  #
+  # Not re-measured on the unfused run, and the mechanism there is different
+  # anyway: tag noise plus crop jitter, with no cloud deformation, because the
+  # clouds are never merged. The distortion randomisation defends against does
+  # not exist in an unfused observation.
+  #
+  # The sigmas below stay. They are a measured property of the bracket flex
+  # (derivation in real_bimanual.yaml), not a tuning knob, so turning this back
+  # on must never mean re-deriving them.
+  use_extrinsics_randomization: false
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  anchor_first_camera: true
+
+  # `fuse_method` / `fuse_device` are inherited but unused -- nothing is fused.
+  # select_camera_frame always draws uniformly, matching fuse_method "random".
+  fuse_method: random
+  fuse_device: cpu
+
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  use_target_ee: ${policy.use_target_ee}

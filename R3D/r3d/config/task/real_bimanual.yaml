@@ -18,7 +18,7 @@ env_runner: null
 dataset:
   _target_: r3d.dataset.real_multicam_dataset.RealMultiCamDataset
   # train.py chdirs to the repo root, so these are relative to ~/R3D-Policy
-  zarr_path: R3D/data/real_bimanual_floorcut135.zarr
+  zarr_path: R3D/data/real_bimanual_mixed150.zarr
   preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}

@@ -67,6 +67,23 @@ policy:
   use_pc_color: true
   pointnet_type: "uni3d"
 
+  # Patch tokens per camera, UNFUSED pipeline only. Pulled from the task config
+  # so the encoder and the dataset read one value, not two that can drift.
+  # oc.select yields null for every fused task, where DP3 ignores it.
+  num_groups_per_camera: ${oc.select:task.num_groups_per_camera,null}
+
+  # Also mirrored from the dataset, and for the same reason: these decide what
+  # the camera tag can represent, and the dataset decides what goes INTO the
+  # tag. Overriding `task.dataset.pose_source` on the command line therefore
+  # reconfigures both halves at once -- there is no second switch to forget.
+  # `per_camera_pose_mlp: null` means "derive from pose_source": one MLP per
+  # camera under 'proprio', where the constant flange->camera offset has to be
+  # learned, and the shared MLP otherwise. Set it explicitly only to ablate the
+  # choice itself.
+  pose_source: ${oc.select:task.dataset.pose_source,null}
+  camera_arm_slice: ${oc.select:task.dataset.camera_arm_slice,null}
+  per_camera_pose_mlp: null
+
 
   pointcloud_encoder_cfg:
     pc_model: "eva02_tiny_patch14_224"

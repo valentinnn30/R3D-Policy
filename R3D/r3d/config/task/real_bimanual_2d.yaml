@@ -1,0 +1,141 @@
+name: ${task_name}
+
+# 2D IMAGE baseline. The counterpart of real_bimanual_unfused.yaml (approach 2),
+# built to differ from it in the ENCODER and nothing else.
+#
+# Design brief: ~/ros2_ws/tmp/dinov2_2d_baseline_design.md
+#
+# Runs, all reachable by one command-line override:
+#   2D-N  (headline) : this file as-is           -> pose_source: none
+#   2D-A' (ablation) : task.dataset.pose_source=proprio
+#   2D-B  (ablation) : task.dataset.pose_source=extrinsic
+#
+# `none` is the DEFAULT, and the reason is worth stating because it is NOT what
+# "mirror approach 2" naively implies.
+#
+# In 3D the pose tag is load-bearing: patch centres arrive in camera frame, so
+# without it the encoder cannot relate one camera's geometry to another's, and
+# the same transform also decides the workspace crop. Neither holds here. There
+# is no crop, and pixels carry no coordinates to place.
+#
+# What is left is redundancy, and it is total. `agent_pos` already holds both
+# arms' EE poses at [0:7] and [7:14]. The extrinsic tag is
+# T_world<-link0 @ FK(joints) @ T_link8<-cam, and FK reproduces qpos_arm to
+# 0.011 mm while link8->EE is a constant [130, 0, 70] mm. So the extrinsic tag,
+# the proprio tag and the state vector are the SAME information; the three
+# pose_source values differ only in ROUTING -- whether that information also
+# gets written into each camera's token block -- and in parameterisation.
+#
+# So copying `extrinsic` from Run B would copy the string without the role it
+# plays there. The faithful 2D counterpart is the minimal one, with the tags as
+# additive experiments on top:
+#
+#   2D-N  : does the encoder work with the pose only in the global state token?
+#   2D-A' : does writing the EE pose into each camera's block help?
+#   2D-B  : does the calibrated camera pose beat the raw EE pose? In 2D these
+#           differ by a constant per-camera mount transform which a per-camera
+#           MLP absorbs exactly, so 2D-B agreeing with 2D-A' IS the
+#           calibration-free result, not a null finding.
+
+shape_meta: &shape_meta
+  obs:
+    # 322 x 182 = 23 x 13 patches of 14 px = 299 patch tokens per camera, 897
+    # in total against the 3D run's 512. Matching the count exactly would mean
+    # discarding field of view, which is a worse distortion than the count.
+    #
+    # Channels-first: the dataset transposes the stored (T, H, W, 3) uint8 to
+    # (T, 3, H, W) float in [0, 1].
+    image_cam0:            # cam_top, statically mounted
+      shape: [3, 182, 322]
+      type: rgb
+    image_cam1:            # cam_wrist_left
+      shape: [3, 182, 322]
+      type: rgb
+    image_cam2:            # cam_wrist_right
+      shape: [3, 182, 322]
+      type: rgb
+    # [translation(3), 6D rotation(6)] per camera, exactly as the 3D run. What
+    # fills it is decided by the dataset's `pose_source`.
+    campose_cam0:
+      shape: [9]
+      type: low_dim
+    campose_cam1:
+      shape: [9]
+      type: low_dim
+    campose_cam2:
+      shape: [9]
+      type: low_dim
+    # All ones here -- a camera always produces pixels, so the 3D path's
+    # "this wrist saw nothing" case has no image counterpart. The key stays so
+    # the token layout matches the 3D encoder exactly; the `absent` embedding is
+    # simply never exercised.
+    cam_valid:
+      shape: [3]
+      type: low_dim
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+env_runner: null
+
+dataset:
+  _target_: r3d.dataset.real_image_dataset.RealMultiCamImageDataset
+  # 150 episodes / 53999 frames: 30 YELLOW + 30 BLUE + RED 61-90 + 60 YBR.
+  # Verified byte-identical in `state`, `action` and `episode_ends` to the 3D
+  # R3D/data/real_bimanual_mixed150.zarr -- same episodes, same order, so frame
+  # i is the same instant in both and the two runs see one collection.
+  zarr_path: R3D/data/real_bimanual_2d_mixed150.zarr
+  preprocess_config: R3D/r3d/config/preprocess/real_bimanual_2d.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  # none -> 2D-N (headline); proprio -> 2D-A'; extrinsic -> 2D-B.
+  pose_source: none
+
+  # Which slice of the 48-dim `agent_pos` holds the EE pose of the arm each
+  # camera rides on: [x, y, z, qx, qy, qz, qw]. null for a static camera.
+  # Only read when pose_source is 'proprio'. Same numbers, same meaning, as the
+  # unfused 3D task config.
+  camera_arm_slice: [null, [0, 7], [7, 14]]
+
+  n_obs_steps: ${dataset_obs_steps}
+
+  # Deliberately the SAME augmentation block the 3D runs read, calling the SAME
+  # `apply_color_jitter` and `add_noise`. Matching the ranges by sharing the
+  # config is what makes the photometric and state noise identical between the
+  # two experiments rather than two numbers that happen to agree today.
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+
+  # Per-pixel Gaussian noise, the image counterpart of the 3D path's per-point
+  # colour noise -- and pointed at THE SAME KEY, so the two cannot drift to
+  # different values. Both act on [0, 1] rgb, so 0.01 means "1% ~ 2.5/255" on
+  # either side. Without it the 2D run would see photometrically cleaner colour
+  # than the 3D run, which biases the comparison the two runs exist to make.
+  rgb_pixel_noise_std: ${data_augmentation.pc_rgb_noise_std}
+
+  # Random translation in pixels: reflect-pad, then crop back to 322x182.
+  #
+  # NOT the random crop the original Diffusion Policy uses. The stored
+  # resolution is exactly patch-aligned, so cropping to something smaller would
+  # break divisibility by the ViT's 14 px patch and change the token count.
+  # Padding first keeps both exact. 8 px is ~2.5% of the width, comparable to
+  # DP's 240->216 crop in relative terms.
+  image_shift_px: ${data_augmentation.image_shift_px}
+
+  use_target_ee: ${policy.use_target_ee}
+
+  # NOTE: there is no extrinsics randomization here, by design and not by
+  # omission. It was ablated on the fused policy and OFF won (2026-09-04); it is
+  # off for the unfused runs too. Nothing in this pipeline would consume it
+  # anyway -- there is no crop for a perturbed transform to move.

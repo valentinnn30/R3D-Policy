@@ -43,6 +43,15 @@ batch_size=${BATCH_SIZE:-64}
 grad_accum=${GRAD_ACCUM:-4}
 wandb_mode=${WANDB_MODE:-offline}
 save_ckpt=${SAVE_CKPT:-True}
+# Any 4th and later argument is passed straight to hydra, e.g.
+#   ... real_bimanual_unfused 42 0 task.dataset.pose_source=proprio
+# Without this, such an override is SILENTLY DROPPED and you get the
+# un-overridden run under the right-looking name.
+#
+# `run_dir` is derived from `exp_name`, which carries the seed -- so two
+# variants of the same task config must differ in seed, or the second will
+# overwrite the first one's checkpoints.
+extra_args=("${@:4}")
 exp_name=${task_config}-${alg_name}-${seed}
 
 # The ros2_ws stack exports a PYTHONPATH pointing at ros_env's python3.12
@@ -94,7 +103,9 @@ common_args=(
 
 if [ $USE_DDP = true ]; then
     torchrun --nproc_per_node="${num_gpus}" --master_port=12358 \
-        train.py "${common_args[@]}" training.device="cuda" training.use_ddp=true
+        train.py "${common_args[@]}" training.device="cuda" training.use_ddp=true \
+        "${extra_args[@]}"
 else
-    python train.py "${common_args[@]}" training.device="cuda:0" training.use_ddp=false
+    python train.py "${common_args[@]}" training.device="cuda:0" \
+        training.use_ddp=false "${extra_args[@]}"
 fi

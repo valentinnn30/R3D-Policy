@@ -1,0 +1,34 @@
+# Conversion config for the 2D image baseline.
+#
+# INHERITS the point-cloud config and overrides nothing that is measured. The
+# camera extrinsics, the FK bases, the joint slices, the state/action layout,
+# the sync policy, the frame stride and the quaternion canonicalisation all come
+# from `real_bimanual.yaml`, because two copies of a calibration is two things
+# to update and one to forget. This file adds only what is 2D-specific: which
+# HDF5 dataset holds each camera's pixels.
+#
+# Consumed by:
+#   - scripts/convert_2d_h5_to_zarr.py, at conversion time
+#   - RealMultiCamImageDataset, at training time (for the mount geometry)
+#
+# Camera ORDER is positional and must match the inherited `cameras` list:
+# image_cam0 is cameras[0] (cam_top), and so on. The dataset checks the counts
+# agree but cannot check the order, so do not reorder one without the other.
+
+inherit: R3D/r3d/config/preprocess/real_bimanual.yaml
+
+# Written by `syncronize_data_2d.py` at 322x182 -- 23 x 13 patches of 14 px.
+# The resolution is DINOv2-patch-aligned on purpose. Do not resize here: the raw
+# h5 keeps the JPEG bytes verbatim, so re-running the 2D sync is the way to
+# change resolution, and it re-derives the intrinsics to match.
+images:
+  cam_top:         /observations/images/oakd_TOP_CAMERA/color
+  cam_wrist_left:  /observations/images/orbbec_left_wrist_view/color
+  cam_wrist_right: /observations/images/orbbec_right_wrist_view/color
+
+# The wrist camera pose is composed at TRAINING time as
+#   T_world<-link0 @ panda_fk_flange(joints[slice]) @ T_link8<-cam
+# so the joint angles travel with the data and the two measured constants stay
+# in config. This is the same expression the 3D converter evaluates; the
+# difference is only where it is evaluated. See RealMultiCamImageDataset.
+joint_states: /observations/joint_states/position

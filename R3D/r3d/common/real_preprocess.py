@@ -338,6 +338,113 @@ def workspace_limits(cfg: PointCloudPreprocessConfig):
     )
 
 
+def r6d_from_matrix(R) -> np.ndarray:
+    """First two COLUMNS of a rotation matrix -- the continuous 6D encoding.
+
+    Not a quaternion: every parameterisation of SO(3) in <=4 dimensions is
+    discontinuous as a map on the manifold, which is hard for an MLP to embed
+    smoothly. (Same family of problem as the action space's quaternion
+    double-cover, handled there by sign canonicalization.)
+    """
+    return np.asarray(R, dtype=np.float64)[:3, :2].T.reshape(-1)
+
+
+def matrix_from_quat_xyzw(q) -> np.ndarray:
+    """Rotation matrix from an xyzw quaternion. Pure numpy, no scipy.
+
+    scipy is present in the training env but this module is imported by the
+    ROS inference node too, and a hard scipy dependency there would be a new
+    one. The quaternion order is xyzw -- see CLAUDE.md; the wrong order still
+    yields an orthonormal matrix, so this is not self-checking.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    if not np.isfinite(n) or n < 1e-8:
+        # Silently returning NaN here would put NaN in the policy's
+        # conditioning and produce a garbage action with no error anywhere,
+        # which is the whole class of bug this module exists to prevent.
+        raise ValueError(
+            f"degenerate quaternion {q!r} (norm {n}); a zero or non-finite "
+            "quaternion is not a rotation. An all-zero agent_pos is the usual "
+            "cause -- check the proprioception actually arrived.")
+    q = q / n
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def pose9_from_matrix(T) -> np.ndarray:
+    """(9,) = translation (3) + 6D rotation (6), from a 4x4."""
+    T = np.asarray(T, dtype=np.float64)
+    return np.concatenate([T[:3, 3], r6d_from_matrix(T[:3, :3])])
+
+
+def pose9_from_pos_quat(pos, quat_xyzw) -> np.ndarray:
+    """(9,) from a recorded EE pose: [x, y, z] + [qx, qy, qz, qw]."""
+    return np.concatenate([
+        np.asarray(pos, dtype=np.float64),
+        r6d_from_matrix(matrix_from_quat_xyzw(quat_xyzw)),
+    ])
+
+
+def select_camera_frame(
+    cloud_cam: np.ndarray,
+    extrinsics: np.ndarray,
+    cfg: PointCloudPreprocessConfig,
+    num_points: int,
+    num_groups: int,
+    rng=None,
+) -> Tuple[np.ndarray, bool]:
+    """Sample-time per-camera reduction. Returns ``((num_points, 6), valid)``.
+
+    The UNFUSED counterpart of `fuse_cameras`, shared by the dataset and the
+    robot for the same reason: crop and draw have to be bit-identical between
+    training and inference.
+
+    Same crop and same uniform draw as `fuse_cameras`, but the points come back
+    in CAMERA frame and each camera stays separate. `extrinsics` is the
+    transform actually in force for this frame -- nominal at inference, nominal
+    composed with the perturbation during training -- and it is used ONLY to
+    decide which points lie inside the workspace. The coordinates returned are
+    the untouched camera-frame ones, which is the entire point of the unfused
+    pipeline: an extrinsic error must not be able to move the encoder's input.
+
+    `valid` is False when fewer than `num_groups` points survive the crop.
+    Below that the encoder's FPS cannot pick that many distinct group centres,
+    so every token for this camera would be degenerate. That is exactly the
+    case `preprocess_camera_frame` writes sentinel points for -- a wrist camera
+    looking away from the table, measured at 2 of 30 episodes. The caller
+    replaces the camera's tokens with a learned `absent` embedding.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    cloud = np.asarray(cloud_cam, dtype=np.float64)
+    T = np.asarray(extrinsics, dtype=np.float64)
+
+    xyz_base = cloud[:, :3] @ T[:3, :3].T + T[:3, 3]
+    lo, hi = cfg.bounds
+    keep = np.all((xyz_base > lo) & (xyz_base < hi), axis=-1)
+    if cfg.floor_normal is not None:
+        n = np.asarray(cfg.floor_normal, dtype=np.float64)
+        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
+
+    kept = cloud[keep]
+    if len(kept) == 0:
+        # Emit zeros, NOT sentinels. `preprocess_camera_frame` places sentinels
+        # far outside the box because it relies on `fuse_cameras`' crop to
+        # delete them; there is no fused crop here, so a sentinel would reach
+        # the encoder as real far-away geometry. Zeros are masked out by
+        # `valid` and are never transformed anywhere.
+        return np.zeros((num_points, 6), dtype=np.float32), False
+
+    valid = bool(len(kept) >= num_groups)
+    kept = pad_to_min_points(kept, num_points)
+    idx = rng.choice(len(kept), size=num_points, replace=False)
+    return kept[idx].astype(np.float32), valid
+
+
 # ------------------------------------------------------- Franka Panda FK ----
 #
 # Needed to place a wrist camera: its extrinsic is given relative to link 8, so

@@ -1,0 +1,213 @@
+# 2D image baseline. Everything outside `policy.*` is copied unchanged from
+# r3d_robotwin2.yaml, which is what the point-cloud runs use -- horizon, the
+# observation and action step counts, the scheduler, the optimiser, EMA and the
+# training loop are all part of what is HELD FIXED for the comparison.
+#
+# Design brief: ~/ros2_ws/tmp/dinov2_2d_baseline_design.md
+#
+# Two deviations from that file, both forced and both deliberate:
+#   * dataloader batch_size 64 rather than 256 -- 3 cameras x 2 observation
+#     steps means 6 ViT forward passes per sample. 64 is also what
+#     train_real_bimanual.sh already uses for the real-robot runs.
+#   * num_epochs 1000 rather than the config's 3001, matching the paper and
+#     what the real-robot script overrides it to.
+
+defaults:
+  - task: real_bimanual_2d
+
+name: train_r3d_2d
+
+task_name: null
+shape_meta: ${task.shape_meta}
+exp_name: "r3d_2d"
+setting: null
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: r3d.policy.dp3_image.DP3Image
+  condition_type: one_way_transformer
+  use_down_condition: true
+  use_mid_condition: true
+  use_up_condition: true
+
+  diffusion_step_embed_dim: 128
+  down_dims:
+  - 512
+  - 1024
+  - 2048
+  encoder_output_dim: 256
+  horizon: ${horizon}
+  kernel_size: 5
+  n_action_steps: ${n_action_steps}
+  n_groups: 8
+  n_obs_steps: ${n_obs_steps}
+
+  transformer_config:
+    depth: 4
+    embedding_dim: 256
+    num_heads: 8
+    mlp_dim: 2048
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: sample
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  # Mirrored from the dataset, exactly as the unfused 3D policy does it, so
+  # `task.dataset.pose_source=proprio` on the command line reconfigures BOTH
+  # halves at once and there is no second switch to forget.
+  pose_source: ${task.dataset.pose_source}
+  camera_arm_slice: ${task.dataset.camera_arm_slice}
+  # null -> derived from pose_source: one MLP per camera under 'proprio', where
+  # the constant flange->camera mount is what the ablation asks the network to
+  # learn; shared otherwise, where the calibrated mount is already in the pose.
+  per_camera_pose_mlp: null
+
+  image_encoder_cfg:
+    # ViT-S/14 with registers. Registers are not optional here: this consumes
+    # PATCH tokens, and the high-norm artifact tokens they fix live in exactly
+    # that set. Scaling up is this one string -> vit_large_patch14_reg4_dinov2,
+    # to be done alongside a stronger point trunk rather than on its own.
+    model_name: "vit_small_patch14_reg4_dinov2.lvd142m"
+    pretrained: true
+    # FROZEN. This isolates whether the DINOv2 feature space carries the task
+    # from whether a dataset of this size can finetune a ViT -- and it makes the
+    # 2D policy the model with FEWER trainable parameters, which is a better
+    # position to argue from than a 4x larger encoder.
+    freeze: true
+    # Stochastic depth is meaningless on a frozen trunk (it is forced to eval
+    # mode regardless). Kept explicit so unfreezing is a two-line change.
+    drop_path_rate: 0.0
+
+  use_target_ee: false
+  # false, matching the point-cloud runs exactly. The agent_pos feature is
+  # broadcast onto every image token's FEATURE axis rather than contributed as
+  # an extra token, so the conditioning width is
+  # encoder_output_dim + state_dim = 512 and the token count stays equal to the
+  # positional encoding's length.
+  #
+  # Do not flip this without also setting diffusion_step_embed_dim to
+  # encoder_output_dim: under cat_on_token the timestep becomes a TOKEN and is
+  # concatenated along the token axis, so its width must equal the conditioning
+  # width (diffusion_backbone.py:656).
+  cat_on_token: false
+
+# Same block the point-cloud runs read, so the shared augmentation is shared by
+# construction. The pc_* entries are inherited and unused here; nothing in the
+# image dataset reads them.
+data_augmentation:
+  use_augmentation: true
+  pc_xyz_noise_std: 0.002
+  pc_rgb_noise_std: 0.01
+  agent_pos_noise_std: 0.002
+
+  use_color_jitter: true
+  brightness_range: [-0.125, 0.125]
+  contrast_range: [0.5, 1.5]
+  saturation_range: [0.5, 1.5]
+
+  # 2D only: random translation via reflect-pad and crop back. See the task
+  # config for why this is not DP's random crop.
+  image_shift_px: 8
+
+ema:
+  _target_: r3d.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 1000
+  gradient_accumulate_every: 1
+  use_ema: True
+  use_bfloat16: True
+  rollout_every: 200
+  checkpoint_every: 200
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  use_ddp: false
+  local_rank: 0
+
+logging:
+  group: ${task_name}
+  id: null
+  mode: online
+  name: ${exp_name}
+  project: r3d
+  resume: true
+  tags:
+  - r3d
+  - 2d
+  - dinov2
+
+checkpoint:
+  save_ckpt: False
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 1
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

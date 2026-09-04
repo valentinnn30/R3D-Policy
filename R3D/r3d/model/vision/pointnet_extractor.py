@@ -485,7 +485,8 @@ class KNNGrouper(nn.Module):
         self.fps_random_config = fps_random_config or {}
         cprint(f"[Group] FPS randomness config: {fps_random_config}", "cyan")
 
-    def forward(self, xyz: torch.Tensor, features: torch.Tensor, use_fps=True):
+    def forward(self, xyz: torch.Tensor, features: torch.Tensor, use_fps=True,
+                num_groups=None):
         """
         Args:
             xyz: [B, N, 3]. Input point clouds.
@@ -501,8 +502,15 @@ class KNNGrouper(nn.Module):
             }
         """
         batch_size, num_points, _ = xyz.shape
+        # `num_groups` overrides the constructed default for this call only.
+        # Nothing downstream has a weight whose shape depends on it -- the patch
+        # encoder is a shared PointNet applied per group, the positional embed
+        # runs per centre, and the ViT is sequence-length agnostic (this code
+        # bypasses timm's own fixed positional table). So the unfused pipeline
+        # can give each camera a different token budget for free.
+        G = self.num_groups if num_groups is None else int(num_groups)
         with torch.no_grad():
-            centers = fps(xyz, self.num_groups, **self.fps_random_config) # B G 3
+            centers = fps(xyz, G, **self.fps_random_config) # B G 3
             _, knn_idx = knn_points(centers, xyz, self.group_size)  # [B, G, K]
 
         batch_offset = torch.arange(batch_size, device=xyz.device) * num_points
@@ -510,7 +518,7 @@ class KNNGrouper(nn.Module):
         knn_idx_flat = (knn_idx + batch_offset).reshape(-1)  # [B * G * K]
 
         nbr_xyz = xyz.reshape(-1, 3)[knn_idx_flat]
-        nbr_xyz = nbr_xyz.reshape(batch_size, self.num_groups, self.group_size, 3)
+        nbr_xyz = nbr_xyz.reshape(batch_size, G, self.group_size, 3)
         nbr_xyz = nbr_xyz - centers.unsqueeze(2)  # [B, G, K, 3]
         # NOTE: Follow PointNext to normalize the relative position
         if self.radius is not None:
@@ -518,7 +526,7 @@ class KNNGrouper(nn.Module):
 
         nbr_feats = features.reshape(-1, features.shape[-1])[knn_idx_flat]
         nbr_feats = nbr_feats.reshape(
-            batch_size, self.num_groups, self.group_size, features.shape[-1]
+            batch_size, G, self.group_size, features.shape[-1]
         )
 
         group_feats = torch.cat([nbr_xyz, nbr_feats], dim=-1)
@@ -583,8 +591,9 @@ class PatchEmbed(nn.Module):
         self.patch_encoder = PatchEncoder(in_channels, out_channels, [128, 512])
         self.fps_random_config = fps_random_config or {}
 
-    def forward(self, coords: torch.Tensor, features: torch.Tensor):
-        patches = self.grouper(coords, features)
+    def forward(self, coords: torch.Tensor, features: torch.Tensor,
+                num_groups=None):
+        patches = self.grouper(coords, features, num_groups=num_groups)
         patch_features = patches["features"]  # [B, L, K, C_in]
         x = self.patch_encoder(patch_features)
         patches["embeddings"] = x
@@ -756,7 +765,7 @@ class Uni3DPointcloudEncoder(nn.Module):
 
         cprint(f"[Uni3DPointcloudEncoder] Pretrained weights loaded: {load_weight_path}", "red")
 
-    def forward(self, pcd, eval):
+    def forward(self, pcd, eval, num_groups=None):
         # Apply point cloud dropout (data augmentation)
         if not eval:
             pcd = random_point_dropout(pcd, max_dropout_ratio=0.8)
@@ -764,7 +773,7 @@ class Uni3DPointcloudEncoder(nn.Module):
         pts = pcd[..., :3].contiguous()
         colors = pcd[..., 3:].contiguous()
         # Group points into patches and get embeddings
-        patches = self.patch_embed(pts, colors)
+        patches = self.patch_embed(pts, colors, num_groups=num_groups)
         if isinstance(patches, list):
             patch_embed = patches[-1]["embeddings"]
             centers = patches[-1]["centers"]
@@ -816,3 +825,308 @@ class Uni3DPointcloudEncoder(nn.Module):
             return x, pc_pe
         else:
             return x
+
+# =============================================================================
+# Unfused multi-camera encoder -- merge in FEATURE space, not in point space
+# =============================================================================
+
+
+class CameraPoseEmbedding(nn.Module):
+    """Tags a camera's tokens with where that camera is, and which one it is.
+
+    Without this, a patch at (0.1, 0.0, 0.5) in the left wrist camera and one at
+    (0.1, 0.0, 0.5) in the top camera are indistinguishable, because each
+    camera's geometry arrives in its own frame.
+
+    Two separate signals, deliberately not merged into one MLP input:
+
+    * `cam_embed` -- identity. Lets the model learn per-camera noise and
+      reliability characteristics, and (under pose_source='proprio') is the
+      whole of a static camera's pose information, since that transform is a
+      constant.
+    * `pose_mlp` -- the 9-vector [translation(3), 6D rotation(6)]. 6D rather
+      than a quaternion because every parameterisation of SO(3) in <=4
+      dimensions is discontinuous, which is hard to embed smoothly.
+
+    `absent` replaces a camera's tokens entirely when it contributed nothing
+    this frame (a wrist camera looking away from the table). Added rather than
+    masking the attention, which would mean threading a key-padding mask
+    through OneWayTransformer -- worth doing later if empty cameras turn out to
+    matter, but they are measured at 2 of 30 episodes.
+
+    `per_camera_mlp` gives each camera its OWN pose MLP instead of one shared
+    across all of them, and it is not cosmetic -- it decides what the tag can
+    represent:
+
+    * Shared: the MLP sees only `pose9` and cannot know which camera sent it,
+      so it computes one function for all. The per-camera freedom is then just
+      `cam_embed`, a constant OFFSET ON THE OUTPUT. Composing a rigid transform
+      is not an addition in embedding space, so `f(pose) + e_i` cannot equal
+      `f(pose @ T_i)`; the decoder has to disentangle the sum instead.
+    * Per camera: the tag becomes a genuinely per-camera FUNCTION of pose, so a
+      constant right-composition -- the unknown flange->camera mount -- folds
+      into the learned weights.
+
+    That distinction is the whole content of Ablation A' (`pose_source:
+    proprio`), which tags each wrist camera with its ARM's recorded EE pose and
+    asks the network to learn the constant mount offset itself. With a shared
+    MLP that ablation is testing a hypothesis the architecture cannot cleanly
+    express. Run B (`extrinsic`) does not need it -- the calibrated mount is
+    already inside the 4x4 -- and keeps the shared MLP so its parameter count
+    is unchanged against the runs already done.
+
+    `has_pose` marks the cameras whose `pose9` actually carries information. A
+    camera without one gets NO pose MLP at all, only its identity embedding.
+    That is the static top camera under `proprio`: it rides on no arm, the
+    dataset hands it `zeros(9)`, and pushing a constant through an MLP to
+    obtain a constant is a way to spend parameters on nothing. Under
+    `pose_source: none` no camera has a pose and the module degenerates to
+    identity embeddings, which is exactly what that control means.
+    """
+
+    def __init__(self, n_cams: int, embed_dim: int, pose_dim: int = 9,
+                 per_camera_mlp: bool = False, has_pose=None):
+        super().__init__()
+        if has_pose is None:
+            has_pose = [True] * n_cams
+        if len(has_pose) != n_cams:
+            raise ValueError(
+                f"has_pose has {len(has_pose)} entries for {n_cams} cameras")
+        self.has_pose = [bool(v) for v in has_pose]
+        self.per_camera_mlp = bool(per_camera_mlp)
+        self.cam_embed = nn.Embedding(n_cams, embed_dim)
+
+        def _mlp():
+            return nn.Sequential(
+                nn.Linear(pose_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+
+        # A ModuleDict keyed by camera index rather than a ModuleList, because
+        # the cameras without a pose get no module at all -- a ModuleList would
+        # need a placeholder, and a placeholder is how a silently-unused MLP
+        # ends up in the state dict.
+        if self.per_camera_mlp:
+            self.pose_mlps = nn.ModuleDict(
+                {str(i): _mlp() for i in range(n_cams) if self.has_pose[i]})
+            self.pose_mlp = None
+        else:
+            self.pose_mlps = None
+            self.pose_mlp = _mlp() if any(self.has_pose) else None
+        self.absent = nn.Parameter(torch.zeros(embed_dim))
+
+    def _mlp_for(self, cam_index: int):
+        """The pose MLP for this camera, or None when it carries no pose."""
+        if not self.has_pose[cam_index]:
+            return None
+        return self.pose_mlps[str(cam_index)] if self.per_camera_mlp else self.pose_mlp
+
+    def forward(self, tokens, cam_index, pose9, valid):
+        """tokens [B, T, D]; pose9 [B, 9]; valid [B] float 0/1 -> [B, T, D]."""
+        idx = torch.full((tokens.shape[0],), cam_index,
+                         dtype=torch.long, device=tokens.device)
+        tag = self.cam_embed(idx)                             # [B, D]
+        mlp = self._mlp_for(cam_index)
+        if mlp is not None:
+            tag = tag + mlp(pose9)
+        out = tokens + tag.unsqueeze(1)
+        keep = valid.reshape(-1, 1, 1).to(out.dtype)
+        return keep * out + (1.0 - keep) * self.absent.view(1, 1, -1)
+
+
+class MultiCamDP3Encoder(nn.Module):
+    """Per-camera clouds -> one concatenated token sequence.
+
+    The fused `DP3Encoder` takes a single world-frame `point_cloud`. This one
+    takes `point_cloud_cam0..N` in their own camera frames, runs the SAME
+    encoder over each (shared weights -- no new encoder parameters, and the
+    pretrained Uni3D init stays intact), tags each block with its camera pose
+    and identity, and concatenates along the token axis.
+
+    That concatenation is free because the conditioning path is attention over
+    an order-free token set: `dp3.py` reshapes to
+    [B, n_obs_steps * num_tokens, D] and the UNet cross-attends into it. The
+    diffusion head needs no change at all.
+
+    Only `feature_mode='pointsam'` (extract_global_feature False) is supported:
+    a per-camera *global* vector would defeat the point of the exercise, which
+    is to let attention weight individual patches across cameras.
+    """
+
+    def __init__(self,
+                 observation_space: Dict,
+                 out_channel=256,
+                 state_mlp_size=(64, 64), state_mlp_activation_fn=nn.ReLU,
+                 pointcloud_encoder_cfg=None,
+                 use_pc_color=False,
+                 pointnet_type='uni3d_pretrained',
+                 fps_random_config=None,
+                 cat_on_token=True,
+                 num_groups_per_camera=None,
+                 per_camera_pose_mlp=False,
+                 camera_has_pose=None,
+                 ):
+        super().__init__()
+        state_mlp_size = (64, pointcloud_encoder_cfg['embed_dim'])
+
+        self.point_cloud_keys = sorted(
+            [k for k in observation_space if k.startswith("point_cloud_cam")],
+            key=lambda k: int(k.replace("point_cloud_cam", "")))
+        if not self.point_cloud_keys:
+            raise RuntimeError(
+                "MultiCamDP3Encoder found no point_cloud_cam* keys in shape_meta. "
+                "A fused zarr wants DP3Encoder instead.")
+        self.n_cams = len(self.point_cloud_keys)
+        self.campose_keys = [
+            k.replace("point_cloud_", "campose_") for k in self.point_cloud_keys]
+
+        missing = [k for k in self.campose_keys if k not in observation_space]
+        if missing:
+            raise RuntimeError(
+                f"shape_meta is missing {missing}. Every camera needs its pose "
+                "vector; the dataset emits one per camera whatever pose_source "
+                "is set to (zeros for 'none').")
+        if "cam_valid" not in observation_space:
+            raise RuntimeError(
+                "shape_meta is missing 'cam_valid'. Without it a camera that saw "
+                "nothing this frame is indistinguishable from one that did, and "
+                "its degenerate tokens reach the conditioning.")
+
+        # campose_* and cam_valid are consumed HERE, not as their own token
+        # blocks -- leaving them in low_dim_keys would give the conditioning
+        # four extra tokens and break dp3.py's `num_patches = num_tokens - 1`.
+        consumed = set(self.point_cloud_keys) | set(self.campose_keys) | {"cam_valid"}
+        self.low_dim_keys = [k for k in observation_space if k not in consumed]
+        if len(self.low_dim_keys) != 1:
+            raise RuntimeError(
+                f"expected exactly one low-dim key (agent_pos), got "
+                f"{self.low_dim_keys}. dp3.py computes num_patches as "
+                "num_tokens - 1 under cat_on_token, so a second one would "
+                "silently misalign pc_pe against the tokens.")
+        self.low_dim_shapes = {k: observation_space[k] for k in self.low_dim_keys}
+
+        self.use_pc_color = use_pc_color
+        self.pointnet_type = pointnet_type
+        self.cat_on_token = cat_on_token
+
+        feature_mode = pointcloud_encoder_cfg.get('feature_mode', None)
+        if feature_mode == 'pointsam':
+            self.pc_encoder_extract_global_feature = False
+        else:
+            raise NotImplementedError(
+                "MultiCamDP3Encoder needs feature_mode='pointsam' (per-patch "
+                f"tokens); got {feature_mode!r}. A per-camera global vector "
+                "cannot be attended into patch-wise.")
+
+        self.fps_random_config = fps_random_config or {
+            'use_random': True, 'random_start': True,
+            'random_noise_scale': 0, 'shuffle_output': True,
+        }
+
+        if num_groups_per_camera is None:
+            num_groups_per_camera = [
+                pointcloud_encoder_cfg.get('num_group', 512) // self.n_cams
+            ] * self.n_cams
+        if len(num_groups_per_camera) != self.n_cams:
+            raise ValueError(
+                f"num_groups_per_camera has {len(num_groups_per_camera)} entries "
+                f"for {self.n_cams} cameras")
+        self.num_groups_per_camera = [int(g) for g in num_groups_per_camera]
+
+        if pointnet_type not in ("uni3d", "uni3d_pretrained"):
+            raise NotImplementedError(
+                f"MultiCamDP3Encoder supports the uni3d encoders only, got "
+                f"{pointnet_type!r}")
+        uni3d_config = {
+            'pc_model': 'eva02_large_patch14_448',
+            'pc_feat_dim': 1024,
+            'embed_dim': out_channel,
+            'group_size': 32,
+            'num_group': 512,
+            'patch_dropout': 0.5,
+            'drop_path_rate': 0.2,
+            'pretrained_pc': None,
+            'pc_encoder_dim': 512,
+            'use_pretrained_weights': pointnet_type == "uni3d_pretrained",
+            'pretrained_weights_path':
+                'Uni3D_large/model.pt' if pointnet_type == "uni3d_pretrained" else None,
+        }
+        if pointcloud_encoder_cfg:
+            uni3d_config.update(pointcloud_encoder_cfg)
+        uni3d_config['fps_random_config'] = self.fps_random_config
+        self.extractor = Uni3DPointcloudEncoder(**uni3d_config)
+        pc_output_dim = uni3d_config['embed_dim']
+
+        # Which cameras carry a meaningful pose, and whether each gets its own
+        # MLP. Both are decided by `pose_source` upstream in dp3.py, not set
+        # here, so the encoder still never needs to know which experiment is
+        # running -- it only needs the consequences.
+        if camera_has_pose is not None and len(camera_has_pose) != self.n_cams:
+            raise ValueError(
+                f"camera_has_pose has {len(camera_has_pose)} entries for "
+                f"{self.n_cams} cameras")
+        self.pose_embed = CameraPoseEmbedding(
+            self.n_cams, pc_output_dim,
+            per_camera_mlp=per_camera_pose_mlp,
+            has_pose=camera_has_pose)
+
+        output_dim = state_mlp_size[-1]
+        net_arch = state_mlp_size[:-1] if len(state_mlp_size) > 1 else []
+        self.low_dim_mlps = nn.ModuleDict()
+        for key in self.low_dim_keys:
+            shape = self.low_dim_shapes[key]
+            if len(shape) != 1:
+                raise RuntimeError(f"Low-dimensional obs '{key}' must be rank-1, got {shape}")
+            self.low_dim_mlps[key] = nn.Sequential(
+                *create_mlp(shape[0], output_dim, net_arch, state_mlp_activation_fn))
+
+        self.n_output_channels = pc_output_dim if cat_on_token else \
+            pc_output_dim + output_dim * len(self.low_dim_keys)
+
+        cprint(f"[MultiCamDP3Encoder] cameras: {self.point_cloud_keys}", "yellow")
+        cprint(f"[MultiCamDP3Encoder] groups per camera: {self.num_groups_per_camera} "
+               f"(total {sum(self.num_groups_per_camera)} patch tokens)", "yellow")
+        cprint(f"[MultiCamDP3Encoder] pose MLP: "
+               f"{'one per camera' if per_camera_pose_mlp else 'shared'}; "
+               f"cameras carrying a pose: {self.pose_embed.has_pose}", "yellow")
+        cprint(f"[MultiCamDP3Encoder] low-dim keys: {self.low_dim_keys}", "yellow")
+        cprint(f"[MultiCamDP3Encoder] Final output dim: {self.n_output_channels}", "yellow")
+
+    def forward(self, observations: Dict, eval=False):
+        cam_valid = observations["cam_valid"]
+
+        feats, pes = [], []
+        for i, key in enumerate(self.point_cloud_keys):
+            points = observations[key]
+            assert points.ndim == 3, f"{key}: expected [B, N, C], got {points.shape}"
+            if points.shape[-1] == 3:
+                points = torch.cat([points, torch.zeros_like(points)], dim=-1)
+            elif points.shape[-1] > 6:
+                points = points[..., :6]
+
+            tokens, pe = self.extractor(
+                points, eval, num_groups=self.num_groups_per_camera[i])
+            tokens = self.pose_embed(
+                tokens, i, observations[self.campose_keys[i]], cam_valid[..., i])
+            feats.append(tokens)
+            pes.append(pe)
+
+        pn_feat = torch.cat(feats, dim=1)   # [B, sum(G_i), D]
+        pc_pe = torch.cat(pes, dim=1)       # [B, sum(G_i), D_pe]
+
+        low_dim_features = []
+        for key in self.low_dim_keys:
+            low_dim_feat = self.low_dim_mlps[key](observations[key])
+            if self.cat_on_token:
+                low_dim_feat = low_dim_feat.unsqueeze(1)
+            else:
+                low_dim_feat = low_dim_feat.unsqueeze(1).expand(-1, pn_feat.shape[1], -1)
+            low_dim_features.append(low_dim_feat)
+
+        features = [pn_feat] + low_dim_features
+        final_feat = torch.cat(features, dim=-2 if self.cat_on_token else -1)
+        return final_feat, pc_pe
+
+    def output_shape(self):
+        return self.n_output_channels
