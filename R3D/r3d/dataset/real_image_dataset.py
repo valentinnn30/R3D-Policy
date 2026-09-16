@@ -106,6 +106,39 @@ def load_preprocess_geometry(preprocess_config):
     return cams, cfg
 
 
+def campose_for_camera(cam, pose_source, arm_slice, joints_t, agent_pos_t):
+    """The 9-vector pose tag for ONE camera at ONE frame.
+
+    Module-level and shared with the on-robot inference builder
+    (`ros2_ws/.../experiments/r3d_image_preprocess.py`) for the same reason the
+    3D path shares `select_camera_frame`: what each camera's tokens were tagged
+    with during training is not something a second implementation may
+    re-derive. A mismatch here does not raise -- it quietly feeds the policy a
+    conditioning vector it never saw.
+
+    `arm_slice` is this camera's entry of `camera_arm_slice` (None for a camera
+    that rides on no arm); it is read only under pose_source 'proprio'.
+    """
+    if pose_source == "none":
+        return np.zeros(9, dtype=np.float64)
+
+    if pose_source == "proprio":
+        if arm_slice is None:
+            # Static camera: rides on no arm, so its pose is a constant and
+            # the identity embedding already stands in for it.
+            return np.zeros(9, dtype=np.float64)
+        a, b = arm_slice
+        arm = np.asarray(agent_pos_t[a:b], dtype=np.float64)
+        return pose9_from_pos_quat(arm[:3], arm[3:7])
+
+    # extrinsic
+    if cam["mount"] != "wrist":
+        return pose9_from_matrix(cam["extrinsics"])
+    lo, hi = cam["joint_slice"]
+    T = cam["base"] @ panda_fk_flange(joints_t[lo:hi]) @ cam["extrinsics"]
+    return pose9_from_matrix(T)
+
+
 class RealMultiCamImageDataset(BaseDataset):
 
     def __init__(self,
@@ -261,26 +294,10 @@ class RealMultiCamImageDataset(BaseDataset):
 
     def _campose(self, i, joints_t, agent_pos_t):
         """The 9-vector for camera `i` at one frame."""
-        cam = self.cams[i]
-        if self.pose_source == "none":
-            return np.zeros(9, dtype=np.float64)
-
-        if self.pose_source == "proprio":
-            sl = self.camera_arm_slice[i]
-            if sl is None:
-                # Static camera: rides on no arm, so its pose is a constant and
-                # the identity embedding already stands in for it.
-                return np.zeros(9, dtype=np.float64)
-            a, b = sl
-            arm = np.asarray(agent_pos_t[a:b], dtype=np.float64)
-            return pose9_from_pos_quat(arm[:3], arm[3:7])
-
-        # extrinsic
-        if cam["mount"] != "wrist":
-            return pose9_from_matrix(cam["extrinsics"])
-        lo, hi = cam["joint_slice"]
-        T = cam["base"] @ panda_fk_flange(joints_t[lo:hi]) @ cam["extrinsics"]
-        return pose9_from_matrix(T)
+        return campose_for_camera(
+            self.cams[i], self.pose_source,
+            None if self.camera_arm_slice is None else self.camera_arm_slice[i],
+            joints_t, agent_pos_t)
 
     # -- sampling -----------------------------------------------------------
 

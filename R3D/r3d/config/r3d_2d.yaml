@@ -87,13 +87,31 @@ policy:
     # to be done alongside a stronger point trunk rather than on its own.
     model_name: "vit_small_patch14_reg4_dinov2.lvd142m"
     pretrained: true
-    # FROZEN. This isolates whether the DINOv2 feature space carries the task
-    # from whether a dataset of this size can finetune a ViT -- and it makes the
-    # 2D policy the model with FEWER trainable parameters, which is a better
-    # position to argue from than a 4x larger encoder.
+    # FROZEN by default. This isolates whether the DINOv2 feature space carries
+    # the task from whether a dataset of this size can finetune a ViT.
+    #
+    # Note what the default costs, measured on the 600-epoch run: the trainable
+    # visual pathway is out_proj + cam_embed = 0.099 M parameters against the
+    # 3D encoder's fully fine-tuned 6.087 M, and the resulting policy barely
+    # uses its images -- swapping in a random other frame's pixels costs it
+    # 1.25x EE error, where the same test costs the 3D policy 1.96x. So this is
+    # a linear probe on a frozen feature space, NOT an encoder-for-encoder
+    # comparison. Run 2D-U below for the parameter-matched version.
     freeze: true
-    # Stochastic depth is meaningless on a frozen trunk (it is forced to eval
-    # mode regardless). Kept explicit so unfreezing is a two-line change.
+    # Unfreeze the last N transformer blocks (+ the final norm), leaving the
+    # rest frozen. Only read when `freeze: false`; null -> all-or-nothing.
+    #
+    # There is no in-repo precedent for a PARTIAL unfreeze -- the 3D run trains
+    # its whole pretrained Uni3D trunk -- so this exists purely to match that
+    # trunk's TRAINABLE capacity. Uni3D's transformer is 5.502 M parameters;
+    # for ViT-S/14 the last 3 blocks + norm are 5.326 M, against 3.551 M at 2
+    # blocks and 7.102 M at 4. N=3 is therefore the match, not a round number.
+    train_last_n_blocks: null
+    # Stochastic depth. 0.0 is correct ONLY while the trunk is frozen (it is
+    # forced to eval mode regardless). When unfreezing, use 0.2 -- the value
+    # the Uni3D trunk runs at, passed to the identical timm `drop_path_rate`
+    # argument (pointnet_extractor.py:697), so the two trunks are regularised
+    # the same way. DinoV2Tokenizer disables it on the blocks left frozen.
     drop_path_rate: 0.0
 
   use_target_ee: false

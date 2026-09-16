@@ -184,7 +184,7 @@ def preprocess_camera_frame(
     nominal_extrinsics: np.ndarray,
     cfg: PointCloudPreprocessConfig,
     num_points: int,
-    margin: float = 0.05,
+    margin: float = 0.0,
     device: str = "cuda",
     rgb_already_normalized: bool = False,
     max_input_points: Optional[int] = None,
@@ -198,6 +198,17 @@ def preprocess_camera_frame(
     Only the crop uses the base frame; the points that come back are untouched
     camera-frame coordinates, because the perturbation has to be applied to
     them later as an extrinsic.
+
+    `margin` DEFAULTS TO 0 because extrinsics randomization is off (2026-09-04),
+    and the margin only ever existed to leave headroom for it: with no
+    perturbation, nothing will later pull an outside point in, so a margin just
+    spends the FPS budget on a shell that the sample-time crop then deletes.
+    The default was 0.05 while randomization was live. Both real callers pass
+    `cfg["crop_margin"]` explicitly -- which has been 0.0 since 2026-08-21, so
+    every zarr now in use was built with no margin -- and this default only
+    decides what an ad-hoc caller gets. Re-enabling randomization means setting
+    `crop_margin` in the preprocess yaml AND re-converting; it must comfortably
+    exceed the largest displacement the randomization can produce.
     """
     points = np.asarray(points, dtype=np.float64)
     assert points.ndim == 2 and points.shape[1] >= 6, (
@@ -390,6 +401,34 @@ def pose9_from_pos_quat(pos, quat_xyzw) -> np.ndarray:
     ])
 
 
+def crop_camera_frame(
+    cloud_cam: np.ndarray,
+    extrinsics: np.ndarray,
+    cfg: PointCloudPreprocessConfig,
+) -> np.ndarray:
+    """The crop half of `select_camera_frame`, without the draw.
+
+    Split out so the robot can crop exactly as training does and still choose a
+    different SAMPLER. The crop is the part that must never drift between the
+    two -- it decides which points exist -- whereas how the surviving points are
+    thinned to the encoder budget is already allowed to differ, exactly as it
+    does on the fused path (voxel at inference, FPS at conversion).
+
+    `extrinsics` is used ONLY to decide what lies inside the workspace; the
+    coordinates returned are the untouched camera-frame ones.
+    """
+    cloud = np.asarray(cloud_cam, dtype=np.float64)
+    T = np.asarray(extrinsics, dtype=np.float64)
+
+    xyz_base = cloud[:, :3] @ T[:3, :3].T + T[:3, 3]
+    lo, hi = cfg.bounds
+    keep = np.all((xyz_base > lo) & (xyz_base < hi), axis=-1)
+    if cfg.floor_normal is not None:
+        n = np.asarray(cfg.floor_normal, dtype=np.float64)
+        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
+    return cloud[keep]
+
+
 def select_camera_frame(
     cloud_cam: np.ndarray,
     extrinsics: np.ndarray,
@@ -420,17 +459,7 @@ def select_camera_frame(
     replaces the camera's tokens with a learned `absent` embedding.
     """
     rng = np.random.default_rng() if rng is None else rng
-    cloud = np.asarray(cloud_cam, dtype=np.float64)
-    T = np.asarray(extrinsics, dtype=np.float64)
-
-    xyz_base = cloud[:, :3] @ T[:3, :3].T + T[:3, 3]
-    lo, hi = cfg.bounds
-    keep = np.all((xyz_base > lo) & (xyz_base < hi), axis=-1)
-    if cfg.floor_normal is not None:
-        n = np.asarray(cfg.floor_normal, dtype=np.float64)
-        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
-
-    kept = cloud[keep]
+    kept = crop_camera_frame(cloud_cam, extrinsics, cfg)
     if len(kept) == 0:
         # Emit zeros, NOT sentinels. `preprocess_camera_frame` places sentinels
         # far outside the box because it relies on `fuse_cameras`' crop to

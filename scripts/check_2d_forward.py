@@ -74,8 +74,32 @@ def main():
     n_img_tokens = enc.tokens_per_camera * enc.n_cams
     print(f"\ntokens          : {enc.grid_h} x {enc.grid_w} = "
           f"{enc.tokens_per_camera} per camera, {n_img_tokens} total")
-    assert enc.extractor.backbone.training is False, \
-        "frozen trunk is in train mode -- stochastic depth would make it non-deterministic"
+    tk = enc.extractor
+    if tk.freeze:
+        assert tk.backbone.training is False, \
+            "frozen trunk is in train mode -- stochastic depth would make it non-deterministic"
+    elif tk.train_last_n_blocks is not None:
+        # Partial unfreeze: the trunk MUST be in train mode (that is what makes
+        # stochastic depth active on the blocks being trained), but the blocks
+        # left frozen must stay deterministic -- otherwise the run injects
+        # noise into features no gradient ever reaches.
+        n = tk.train_last_n_blocks
+        assert tk.backbone.training is True, \
+            "partially unfrozen trunk is in eval mode -- drop_path would never fire"
+        frozen_blocks = tk.backbone.blocks[:-n]
+        bad = [i for i, b in enumerate(frozen_blocks)
+               if not (isinstance(b.drop_path1, torch.nn.Identity)
+                       and isinstance(b.drop_path2, torch.nn.Identity))]
+        assert not bad, f"frozen blocks {bad} still have stochastic depth active"
+        assert not any(p.requires_grad for b in frozen_blocks for p in b.parameters()), \
+            "a block below the unfrozen window still requires grad"
+        assert all(p.requires_grad for b in tk.backbone.blocks[-n:]
+                   for p in b.parameters()), \
+            "a block inside the unfrozen window does not require grad"
+        n_tr = sum(p.numel() for p in tk.backbone.parameters() if p.requires_grad)
+        print(f"partial unfreeze : last {n}/{len(tk.backbone.blocks)} blocks + norm, "
+              f"{n_tr/1e6:.3f}M trainable in trunk "
+              f"(Uni3D transformer, the match target: 5.502M)")
 
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch, shuffle=False, num_workers=0)
@@ -113,10 +137,16 @@ def main():
     n_frozen = sum(named[n].numel() for n in frozen)
     print(f"\nparameters      : {n_train/1e6:.2f}M trainable, {n_frozen/1e6:.2f}M frozen")
     print(f"trainable w/o grad      : {len(no_grad)}")
-    print(f"BACKBONE params w/ grad : {len(backbone_with_grad)}  (must be 0 when frozen)")
+    n_bb_expected = 0 if policy.obs_encoder.extractor.freeze else len(
+        [n for n in named if "extractor.backbone" in n and named[n].requires_grad])
+    print(f"BACKBONE params w/ grad : {len(backbone_with_grad)}  "
+          f"(expected {n_bb_expected})")
+    assert len(backbone_with_grad) == n_bb_expected, \
+        "backbone gradient flow does not match the freeze configuration"
     print(f"pose_embed params       : {len(pose_params)}, of which no grad: "
           f"{len(pose_no_grad)} {pose_no_grad}")
-    assert not backbone_with_grad, "frozen backbone received gradients"
+    assert not pose_no_grad, "the camera tag received no gradient -- it is the " \
+        "only per-view parameter, so it is the one thing that can go silently unused"
 
     with torch.no_grad():
         out = policy.predict_action(batch["obs"])

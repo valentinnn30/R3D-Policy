@@ -94,6 +94,7 @@ class DinoV2Tokenizer(nn.Module):
                  out_channel: int = 256,
                  pretrained: bool = True,
                  freeze: bool = True,
+                 train_last_n_blocks: int = None,
                  drop_path_rate: float = 0.0):
         super().__init__()
         # dynamic_img_size lets the pretrained position embedding be
@@ -112,10 +113,41 @@ class DinoV2Tokenizer(nn.Module):
         self.patch_size = int(patch[0] if isinstance(patch, (tuple, list)) else patch)
 
         self.freeze = bool(freeze)
+        self.train_last_n_blocks = (
+            None if (self.freeze or train_last_n_blocks is None)
+            else int(train_last_n_blocks))
         if self.freeze:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
             self.backbone.eval()
+        elif self.train_last_n_blocks is not None:
+            # PARTIAL unfreeze. The 3D run trains its whole (pretrained) Uni3D
+            # trunk, so there is no in-repo precedent for this -- it exists to
+            # make the TRAINABLE encoder capacity match that trunk. Uni3D's
+            # transformer is 5.502 M parameters; the last 3 blocks of
+            # ViT-S/14 plus the final norm are 5.326 M, the closest available
+            # match (2 blocks: 3.551 M, 4 blocks: 7.102 M).
+            n = self.train_last_n_blocks
+            blocks = self.backbone.blocks
+            if not 0 < n <= len(blocks):
+                raise ValueError(
+                    f"train_last_n_blocks must be in 1..{len(blocks)} for "
+                    f"{model_name}, got {n}")
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+            for blk in blocks[-n:]:
+                for p in blk.parameters():
+                    p.requires_grad_(True)
+            for p in self.backbone.norm.parameters():
+                p.requires_grad_(True)
+            # Stochastic depth only where we train. `freeze=False` puts the
+            # whole trunk in train mode, which would make the FROZEN blocks
+            # stochastic too -- noise in features no gradient ever reaches, and
+            # with no counterpart in the 3D run where every block is trainable.
+            # Identity here keeps them bit-identical to the frozen run.
+            for blk in blocks[:-n]:
+                blk.drop_path1 = nn.Identity()
+                blk.drop_path2 = nn.Identity()
 
         self.out_proj = nn.Linear(self.embed_dim, out_channel)
 
@@ -124,9 +156,18 @@ class DinoV2Tokenizer(nn.Module):
         self.register_buffer(
             "pixel_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1), persistent=False)
 
+        if self.freeze:
+            _mode = "FROZEN"
+        elif self.train_last_n_blocks is not None:
+            _mode = (f"last {self.train_last_n_blocks}/{len(self.backbone.blocks)} "
+                     "blocks + norm trainable")
+        else:
+            _mode = "fully trainable"
+        _bb_tr = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         cprint(f"[DinoV2Tokenizer] {model_name}: embed_dim {self.embed_dim}, "
                f"patch {self.patch_size}, prefix tokens {self.num_prefix_tokens}, "
-               f"{'FROZEN' if self.freeze else 'trainable'}", "yellow")
+               f"{_mode} ({_bb_tr/1e6:.3f}M trainable in trunk), "
+               f"drop_path_rate {drop_path_rate}", "yellow")
 
     def train(self, mode: bool = True):
         """Keep a frozen trunk in eval mode whatever the parent does.

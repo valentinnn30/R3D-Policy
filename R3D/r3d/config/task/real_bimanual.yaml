@@ -57,7 +57,7 @@ dataset:
   # cameras view largely different surfaces, so that metric has no correspondence
   # and scales with its own 5 cm search cutoff -- median/cap holds near 0.5 from a
   # 10 mm cap to a 200 mm one. It measures the cutoff, not misregistration.
-  use_extrinsics_randomization: true
+  use_extrinsics_randomization: false
   extrinsics_rot_sigma_deg: 0.7
   extrinsics_trans_sigma_m: 0.004
   anchor_first_camera: true
