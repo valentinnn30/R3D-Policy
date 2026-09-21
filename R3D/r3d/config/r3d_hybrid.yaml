@@ -1,0 +1,231 @@
+# Hybrid 2D/3D policy -- some cameras as point clouds, the rest as images.
+#
+# Plan: ~/ros2_ws/hybrid_2d3d_ablations_plan.txt
+#
+# Everything outside `policy.*` is identical in r3d_robotwin2.yaml (the 3D runs)
+# and r3d_2d.yaml (the 2D runs) and is copied unchanged, except the dataloader
+# batch 64 and 1000 epochs, which r3d_2d.yaml already uses and which
+# train_real_bimanual.sh overrides for every real run anyway.
+#
+# `policy.*` is the UNION of the two: the Uni3D block from r3d_robotwin2.yaml
+# and the DINOv2 block from r3d_2d.yaml, each with the values the non-hybrid
+# runs use, so each camera block is encoded exactly as in its source run.
+#
+# Task configs:
+#   real_bimanual_hybrid_top3d         H1   : top 3D unfused, wrists 2D
+#   real_bimanual_hybrid_wrist3d       H2-U : wrists 3D unfused, top 2D
+#   real_bimanual_hybrid_wrist3d_fused H2-F : wrists 3D fused, top 2D
+
+defaults:
+  - task: real_bimanual_hybrid_top3d
+
+name: train_r3d_hybrid
+
+task_name: null
+shape_meta: ${task.shape_meta}
+exp_name: "r3d_hybrid"
+setting: null
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: r3d.policy.dp3_hybrid.DP3Hybrid
+  condition_type: one_way_transformer
+  use_down_condition: true
+  use_mid_condition: true
+  use_up_condition: true
+
+  diffusion_step_embed_dim: 128
+  down_dims:
+  - 512
+  - 1024
+  - 2048
+  # Both trunks emit this width, and their tokens + PEs share one sequence.
+  # Must equal pointcloud_encoder_cfg.embed_dim (asserted).
+  encoder_output_dim: 256
+  horizon: ${horizon}
+  kernel_size: 5
+  n_action_steps: ${n_action_steps}
+  n_groups: 8
+  n_obs_steps: ${n_obs_steps}
+
+  transformer_config:
+    depth: 4
+    embedding_dim: 256
+    num_heads: 8
+    mlp_dim: 2048
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: sample
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  # Block layout and pose tags, mirrored from the DATASET so one command-line
+  # override reconfigures both halves -- the pattern both non-hybrid policies
+  # already use for pose_source. `pose_source_3d` tags the point-cloud blocks,
+  # `pose_source_2d` the image blocks; each is resolved per block with the
+  # existing rule (r3d/common/hybrid_layout.py).
+  cameras_3d: ${task.dataset.cameras_3d}
+  cameras_2d: ${task.dataset.cameras_2d}
+  fuse_3d: ${task.dataset.fuse_3d}
+  num_groups_per_camera: ${oc.select:task.num_groups_per_camera,null}
+  fused_num_groups: ${oc.select:task.dataset.fused_num_groups,null}
+  pose_source_3d: ${task.dataset.pose_source_3d}
+  pose_source_2d: ${task.dataset.pose_source_2d}
+  camera_arm_slice: ${task.dataset.camera_arm_slice}
+
+  # ---- 3D blocks: exactly r3d_robotwin2.yaml -------------------------------
+  use_pc_color: true
+  pointnet_type: "uni3d"
+  pointcloud_encoder_cfg:
+    pc_model: "eva02_tiny_patch14_224"
+    pc_feat_dim: 192
+    embed_dim: 256
+    group_size: 32
+    num_group: 512
+    patch_dropout: 0
+    drop_path_rate: 0.2
+    pretrained_pc: null
+    pc_encoder_dim: 512
+    use_pretrained_weights: true
+    pretrained_weights_path: R3D/pretrain_weight
+    normalization_type: "layer_norm"
+    feature_mode: "pointsam"
+  fps_random_config:
+    use_random: true
+    random_start: true
+    random_noise_scale: 0
+    shuffle_output: true
+
+  # ---- 2D blocks: exactly r3d_2d.yaml --------------------------------------
+  # Frozen vs unfrozen stays a FLAG, decided after the ablations. The default is
+  # the 2D baseline's (frozen). 2D-U, the parameter-matched partial unfreeze:
+  #   policy.image_encoder_cfg.freeze=false
+  #   policy.image_encoder_cfg.train_last_n_blocks=3
+  #   policy.image_encoder_cfg.drop_path_rate=0.2
+  image_encoder_cfg:
+    model_name: "vit_small_patch14_reg4_dinov2.lvd142m"
+    pretrained: true
+    freeze: true
+    train_last_n_blocks: null
+    drop_path_rate: 0.0
+
+  use_target_ee: false
+  # false, matching every non-hybrid run: agent_pos is broadcast onto the
+  # FEATURE axis, conditioning width = encoder_output_dim + 256 = 512.
+  cat_on_token: false
+
+# The union of both blocks (identical values; image_shift_px is 2D-only, the
+# pc_xyz noise 3D-only).
+data_augmentation:
+  use_augmentation: true
+  pc_xyz_noise_std: 0.002
+  pc_rgb_noise_std: 0.01
+  agent_pos_noise_std: 0.002
+
+  use_color_jitter: true
+  brightness_range: [-0.125, 0.125]
+  contrast_range: [0.5, 1.5]
+  saturation_range: [0.5, 1.5]
+
+  image_shift_px: 8
+
+ema:
+  _target_: r3d.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 1000
+  gradient_accumulate_every: 1
+  use_ema: True
+  use_bfloat16: True
+  rollout_every: 200
+  checkpoint_every: 200
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  use_ddp: false
+  local_rank: 0
+
+logging:
+  group: ${task_name}
+  id: null
+  mode: online
+  name: ${exp_name}
+  project: r3d
+  resume: true
+  tags:
+  - r3d
+  - hybrid
+
+checkpoint:
+  save_ckpt: False
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 1
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

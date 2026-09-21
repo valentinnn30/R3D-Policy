@@ -1,0 +1,100 @@
+name: ${task_name}
+
+# H2-F -- both wrists FUSED into one world-frame point cloud, cam_top as 2D.
+#
+# Plan: ~/ros2_ws/hybrid_2d3d_ablations_plan.txt
+#
+#   wrists   <- real_bimanual.yaml (fused run A), restricted to the wrists:
+#               fuse_cameras(stored wrist clouds, nominal T) -> workspace crop ->
+#               uniform draw; workspace-box normalizer + [-1, 1] clamp; Uni3D
+#   cam_top  <- real_bimanual_2d.yaml: 322x182, DINOv2 299 tokens
+#
+# Budget: 6400 points / 400 groups = exactly H2-U's two wrist blocks summed
+# (3200+3200, 200+200), so H2-F vs H2-U differs ONLY in the merge -- the same
+# way fused A vs unfused B did (8192/512 both). 16 points per group = 2.0x
+# coverage, identical to run A. Tokens per obs step: 299 + 400 = 699.
+# `num_points` is overridden in the dataset; the preprocess yaml (part of the
+# model, sha-checked at inference) is NOT edited.
+#
+# Pose tags:
+#   pose_source_3d -> FIXED to none: the fused cloud is already in the world
+#                     frame (run A had no pose source). Anything else raises.
+#   pose_source_2d -> cam_top only (static): extrinsic = a constant tag,
+#                     none = identity; 'proprio' would leave no block with a
+#                     pose, so it raises (that run is the 'none' control).
+
+shape_meta: &shape_meta
+  obs:
+    image_cam0:            # cam_top, static, 2D
+      shape: [3, 182, 322]
+      type: rgb
+    point_cloud:           # cam_wrist_left + cam_wrist_right FUSED, world frame
+      shape: [6400, 6]
+      type: point_cloud
+    campose_cam0:
+      shape: [9]
+      type: low_dim
+    # one entry per BLOCK: [image_cam0, fused wrists] (the fused one is always 1)
+    cam_valid:
+      shape: [2]
+      type: low_dim
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+env_runner: null
+
+
+dataset:
+  _target_: r3d.dataset.real_hybrid_dataset.RealHybridDataset
+  # Frame-identical pair (verified: episode_ends, state, action equal; also
+  # asserted at construction).
+  zarr_path_3d: R3D/data/real_bimanual_mixed150.zarr
+  zarr_path_2d: R3D/data/real_bimanual_2d_mixed150.zarr
+  preprocess_config_3d: R3D/r3d/config/preprocess/real_bimanual.yaml
+  preprocess_config_2d: R3D/r3d/config/preprocess/real_bimanual_2d.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  cameras_3d: [1, 2]
+  cameras_2d: [0]
+  fuse_3d: true
+
+  fused_num_points: 6400
+  fused_num_groups: 400
+
+  # 3D fixed to none (fused, world frame). 2D: override with the 2D winner.
+  pose_source_3d: none
+  pose_source_2d: none
+  # GLOBAL camera order: [cam_top, cam_wrist_left, cam_wrist_right]
+  camera_arm_slice: [null, [0, 7], [7, 14]]
+
+  # OFF (2026-09-04), as for every run; sigmas kept, they are measured flex.
+  use_extrinsics_randomization: false
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  # no static camera among the fused ones; irrelevant with randomization off
+  anchor_first_camera: false
+  fuse_method: random
+  fuse_device: cpu
+
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  # 2D blocks: same keys the 2D task points at
+  rgb_pixel_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  image_shift_px: ${data_augmentation.image_shift_px}
+  use_target_ee: ${policy.use_target_ee}

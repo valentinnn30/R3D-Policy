@@ -1,0 +1,113 @@
+name: ${task_name}
+
+# H1 -- cam_top as a 3D point cloud (unfused), both wrists as 2D images.
+#
+# Plan: ~/ros2_ws/hybrid_2d3d_ablations_plan.txt
+#
+# Every block is EXACTLY its block from the non-hybrid run it comes from:
+#   cam_top  <- real_bimanual_unfused.yaml (Run B / A'): stored FPS cloud (1792,
+#               exact crop, floor cut), sample-time crop with the extrinsic +
+#               uniform draw to 1792 (a no-op), METRIC_SCALE_M, Uni3D 112 groups
+#   wrists   <- real_bimanual_2d.yaml: 322x182, DINOv2 299 tokens each
+#
+# Budget: every block keeps its non-hybrid budget. 3D blocks sit at 16 points
+# per group = 2.0x coverage, the same as fused run A. Tokens per obs step:
+# 112 + 299 + 299 = 710 (3D runs: 512, 2D runs: 897). Totals are deliberately
+# NOT re-matched -- that would change a block away from its source.
+#
+# Pose tags, one source per modality (set each to the winner of that modality's
+# non-hybrid runs):
+#   pose_source_3d -> cam_top only, which is static: extrinsic = a constant tag,
+#                     proprio / none = identity embedding (as in A')
+#   pose_source_2d -> the wrists: extrinsic = FK camera pose, proprio = the
+#                     arm's EE pose with a per-camera MLP, none = identity
+# 'proprio' is rejected only when NO block ends up with a pose (that run is the
+# all-'none' control; see r3d/common/hybrid_layout.py).
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud_cam0:      # cam_top, static, 3D
+      shape: [1792, 6]
+      type: point_cloud
+    image_cam1:            # cam_wrist_left, 2D
+      shape: [3, 182, 322]
+      type: rgb
+    image_cam2:            # cam_wrist_right, 2D
+      shape: [3, 182, 322]
+      type: rgb
+    campose_cam0:
+      shape: [9]
+      type: low_dim
+    campose_cam1:
+      shape: [9]
+      type: low_dim
+    campose_cam2:
+      shape: [9]
+      type: low_dim
+    # one entry per BLOCK, in block order (ascending camera index)
+    cam_valid:
+      shape: [3]
+      type: low_dim
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+env_runner: null
+
+# Groups for the UNFUSED 3D blocks, in cameras_3d order. Read by the dataset and
+# (via oc.select) the encoder, so the two cannot drift. = Run B's cam_top value.
+num_groups_per_camera: [112]
+
+dataset:
+  _target_: r3d.dataset.real_hybrid_dataset.RealHybridDataset
+  # Frame-identical pair (verified: episode_ends, state, action equal; also
+  # asserted at construction).
+  zarr_path_3d: R3D/data/real_bimanual_mixed150.zarr
+  zarr_path_2d: R3D/data/real_bimanual_2d_mixed150.zarr
+  preprocess_config_3d: R3D/r3d/config/preprocess/real_bimanual.yaml
+  preprocess_config_2d: R3D/r3d/config/preprocess/real_bimanual_2d.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  cameras_3d: [0]
+  cameras_2d: [1, 2]
+  fuse_3d: false
+
+  points_per_camera_encoder: [1792]
+  num_groups_per_camera: ${task.num_groups_per_camera}
+
+  # Defaults = each modality's non-hybrid default (Run B: extrinsic, 2D-N: none).
+  # Override both with the winners of the non-hybrid runs.
+  pose_source_3d: extrinsic
+  pose_source_2d: none
+  # GLOBAL camera order: [cam_top, cam_wrist_left, cam_wrist_right]
+  camera_arm_slice: [null, [0, 7], [7, 14]]
+
+  # OFF (2026-09-04), as for every run; sigmas kept, they are measured flex.
+  use_extrinsics_randomization: false
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  anchor_first_camera: true
+  fuse_method: random
+  fuse_device: cpu
+
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  # 2D blocks: same keys the 2D task points at
+  rgb_pixel_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  image_shift_px: ${data_augmentation.image_shift_px}
+  use_target_ee: ${policy.use_target_ee}

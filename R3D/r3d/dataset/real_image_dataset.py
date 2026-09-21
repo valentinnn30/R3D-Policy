@@ -59,14 +59,32 @@ from r3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNorma
 POSE_SOURCES = ("extrinsic", "proprio", "none")
 
 
-def _image_keys(zarr_path):
+def _image_keys(zarr_path, cameras=None):
+    """image_cam* in the zarr, ordered by camera index.
+
+    `cameras` restricts to those GLOBAL indices (hybrid 2D/3D runs); keys keep
+    their global names so they never collide with the other modality's.
+    None -> every camera, the behaviour before subsets existed.
+    """
     root = zarr.open(zarr_path, mode="r")
     keys = [k for k in root["data"].array_keys() if k.startswith("image_cam")]
     if not keys:
         raise KeyError(
             f"{zarr_path} has no image_cam* arrays. A point-cloud zarr wants "
             "RealMultiCamUnfusedDataset instead.")
-    return sorted(keys, key=lambda k: int(k.replace("image_cam", "")))
+    keys = sorted(keys, key=lambda k: int(k.replace("image_cam", "")))
+    if cameras is not None:
+        wanted = [f"image_cam{int(i)}" for i in cameras]
+        missing = [k for k in wanted if k not in keys]
+        if missing:
+            raise KeyError(f"{zarr_path} has no {missing} (has {keys})")
+        if len(set(wanted)) != len(wanted) or wanted != sorted(
+                wanted, key=lambda k: int(k.replace("image_cam", ""))):
+            raise ValueError(
+                f"cameras must be unique and ascending, got {list(cameras)}; "
+                "every per-camera list is given in this order")
+        keys = wanted
+    return keys
 
 
 def load_preprocess_geometry(preprocess_config):
@@ -183,6 +201,10 @@ class RealMultiCamImageDataset(BaseDataset):
             # exact.
             image_shift_px=0,
             use_target_ee=False,
+            # Hybrid 2D/3D runs only: GLOBAL indices of the cameras to load as
+            # images. None -> all of them, unchanged behaviour. Per-camera lists
+            # (`camera_arm_slice`) are then given in this subset's order.
+            cameras=None,
             ):
         super().__init__()
 
@@ -190,15 +212,23 @@ class RealMultiCamImageDataset(BaseDataset):
             raise ValueError(
                 f"unknown pose_source {pose_source!r} (expected one of {POSE_SOURCES})")
 
-        self.cam_keys = _image_keys(zarr_path)
+        self.cam_keys = _image_keys(zarr_path, cameras)
         self.campose_keys = [k.replace("image_", "campose_") for k in self.cam_keys]
         self.n_cams = len(self.cam_keys)
-        self.cams, _ = load_preprocess_geometry(preprocess_config)
-        if len(self.cams) != self.n_cams:
+        all_cams, _ = load_preprocess_geometry(preprocess_config)
+        if cameras is None and len(all_cams) != self.n_cams:
             raise ValueError(
-                f"{preprocess_config} describes {len(self.cams)} cameras but the "
+                f"{preprocess_config} describes {len(all_cams)} cameras but the "
                 f"zarr holds {self.n_cams}. Camera order is positional -- "
                 "image_cam0 is cameras[0].")
+        # Geometry by GLOBAL index, so a subset still pairs image_cam2 with
+        # cameras[2] -- positional pairing would hand it cameras[1]'s mount.
+        gidx = [int(k.replace("image_cam", "")) for k in self.cam_keys]
+        if max(gidx) >= len(all_cams):
+            raise ValueError(
+                f"{preprocess_config} describes {len(all_cams)} cameras; "
+                f"{self.cam_keys} needs index {max(gidx)}")
+        self.cams = [all_cams[i] for i in gidx]
 
         self.pose_source = pose_source
         self.camera_arm_slice = camera_arm_slice

@@ -26,6 +26,7 @@ relative to the cameras while the robot does not move at all.
 """
 
 import copy
+import dataclasses
 from typing import Dict
 
 import numpy as np
@@ -50,8 +51,15 @@ from r3d.dataset.robotwin_dataset import add_noise, apply_color_jitter
 from r3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 
 
-def _camera_keys(zarr_path):
-    """Discover point_cloud_cam* in the zarr, ordered by camera index."""
+def _camera_keys(zarr_path, cameras=None):
+    """Discover point_cloud_cam* in the zarr, ordered by camera index.
+
+    `cameras` restricts the result to those GLOBAL camera indices, for the
+    hybrid 2D/3D runs where only some cameras are point clouds. Keys keep their
+    global names (`point_cloud_cam1` stays `cam1`), so a subset never collides
+    with the image keys of the other modality. None -> every camera, which is
+    exactly the behaviour before subsets existed.
+    """
     root = zarr.open(zarr_path, mode="r")
     keys = [k for k in root["data"].array_keys() if k.startswith("point_cloud_cam")]
     if not keys:
@@ -59,7 +67,19 @@ def _camera_keys(zarr_path):
             f"{zarr_path} has no point_cloud_cam* arrays. It looks like a fused "
             "zarr -- use r3d.dataset.robotwin_dataset.RobotwinDataset for that."
         )
-    return sorted(keys, key=lambda k: int(k.replace("point_cloud_cam", "")))
+    keys = sorted(keys, key=lambda k: int(k.replace("point_cloud_cam", "")))
+    if cameras is not None:
+        wanted = [f"point_cloud_cam{int(i)}" for i in cameras]
+        missing = [k for k in wanted if k not in keys]
+        if missing:
+            raise KeyError(f"{zarr_path} has no {missing} (has {keys})")
+        if len(set(wanted)) != len(wanted) or wanted != sorted(
+                wanted, key=lambda k: int(k.replace("point_cloud_cam", ""))):
+            raise ValueError(
+                f"cameras must be unique and ascending, got {list(cameras)}; "
+                "every per-camera list is given in this order")
+        keys = wanted
+    return keys
 
 
 def _nominal_extrinsics(zarr_path, cam_keys):
@@ -132,11 +152,20 @@ class RealMultiCamDataset(BaseDataset):
             contrast_range=(0.5, 1.5),
             saturation_range=(0.5, 1.5),
             use_target_ee=False,
+            # Hybrid 2D/3D runs only. `cameras`: GLOBAL indices of the cameras
+            # to load as point clouds (None -> all). `num_points`: overrides the
+            # preprocess yaml's fused budget WITHOUT editing the yaml, which is
+            # part of the model and sha-checked at inference -- used when only
+            # the wrist cameras are fused. Both None -> unchanged behaviour.
+            cameras=None,
+            num_points=None,
             ):
         super().__init__()
 
         self.pc_cfg = PointCloudPreprocessConfig.from_yaml(preprocess_config)
-        self.cam_keys = _camera_keys(zarr_path)
+        if num_points is not None:
+            self.pc_cfg = dataclasses.replace(self.pc_cfg, num_points=int(num_points))
+        self.cam_keys = _camera_keys(zarr_path, cameras)
         self.static_extrinsics, self.per_frame_extrinsics = _nominal_extrinsics(
             zarr_path, self.cam_keys)
         self.n_obs_steps = n_obs_steps
