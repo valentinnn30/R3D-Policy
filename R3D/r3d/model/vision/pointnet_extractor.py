@@ -194,10 +194,19 @@ class DP3Encoder(nn.Module):
         else:
             self.imagination_shape = None
 
-        ignored_obs_keys = {self.point_cloud_key, self.rgb_image_key, self.imagination_key}
+        # `fingertip_anchors` are patch CENTRES for the fingertip tokens, not a
+        # feature: without this entry every non-cloud key becomes a low-dim MLP
+        # input (and a rank-2 (10, 3) key would raise there).
+        self.fingertip_key = 'fingertip_anchors'
+        self.use_fingertips = self.fingertip_key in observation_space.keys()
+        ignored_obs_keys = {self.point_cloud_key, self.rgb_image_key, self.imagination_key,
+                            self.fingertip_key}
         self.low_dim_keys = [key for key in observation_space.keys() if key not in ignored_obs_keys]
         if len(self.low_dim_keys) == 0:
             raise RuntimeError("DP3Encoder requires at least one low-dimensional observation key")
+        # xyz + per-point features the encoder is BUILT for (6 = xyz rgb; 9 with
+        # the camera one-hot). Anything else arriving is an error, never a trim.
+        self.point_channels = int((pointcloud_encoder_cfg or {}).get('point_channels', 6))
         self.low_dim_shapes = {key: observation_space[key] for key in self.low_dim_keys}
 
         cprint(f"[DP3Encoder] point cloud shape: {self.point_cloud_shape}", "yellow")
@@ -309,13 +318,20 @@ class DP3Encoder(nn.Module):
             if points.shape[-1] == 3:
                 colors = torch.zeros_like(points)
                 points = torch.cat([points, colors], dim=-1)
-            elif points.shape[-1] > 6:
-                points = points[..., :6]
+            elif points.shape[-1] != self.point_channels:
+                # Used to be `points[..., :6]` for anything wider -- which would
+                # silently drop a camera one-hot. Width is a contract now.
+                raise ValueError(
+                    f"point cloud has {points.shape[-1]} channels, encoder built for "
+                    f"{self.point_channels} (pointcloud_encoder_cfg.point_channels)")
 
+        extra = {}
+        if self.use_fingertips:
+            extra["anchors"] = observations[self.fingertip_key]
         if not self.pc_encoder_extract_global_feature:
-            pn_feat, pc_pe = self.extractor(points, eval)
+            pn_feat, pc_pe = self.extractor(points, eval, **extra)
         else:
-            pn_feat = self.extractor(points, eval)
+            pn_feat = self.extractor(points, eval, **extra)
 
         low_dim_features = []
         for key in self.low_dim_keys:
@@ -690,6 +706,8 @@ class Uni3DPointcloudEncoder(nn.Module):
                  feature_mode="pointsam",
                  extract_global_feature=True,
                  fps_random_config=None,
+                 point_channels=6,
+                 fingertip_tokens=None,
                  **kwargs):
         super().__init__()
 
@@ -698,9 +716,19 @@ class Uni3DPointcloudEncoder(nn.Module):
         self.transformer_dim = self.transformer.embed_dim
         self.embed_dim = embed_dim
         self.num_group = num_group
+        self.group_size = group_size
         self.use_pretrained_weights = use_pretrained_weights
 
-        self.patch_embed = PatchEmbed(in_channels=6, out_channels=512, num_patches=num_group, patch_size=group_size, fps_random_config=fps_random_config)
+        # `point_channels` = xyz + per-point features. 6 (xyz rgb) is the
+        # pretrained layout; 9 adds the per-camera one-hot. The group features
+        # the patch encoder sees are [rel_xyz, feats], so its input width is
+        # point_channels either way. Extra input columns are ZERO-initialised
+        # (see _zero_extra_input_columns) so step 0 equals the 6-channel model.
+        if point_channels < 6:
+            raise ValueError(f"point_channels must be >= 6 (xyz rgb ...), got {point_channels}")
+        self.point_channels = int(point_channels)
+        self.patch_embed = PatchEmbed(in_channels=self.point_channels, out_channels=512, num_patches=num_group, patch_size=group_size, fps_random_config=fps_random_config)
+        self._zero_extra_input_columns()
 
         # 7 = xyz + rgb + dist
         self.pos_embed = nn.Sequential(
@@ -737,6 +765,130 @@ class Uni3DPointcloudEncoder(nn.Module):
         else:
             cprint(f"[Uni3DPointcloudEncoder] Using random initialization (training from scratch)", "red")
 
+        self.fingertip_cfg = None
+        if fingertip_tokens and fingertip_tokens.get("enabled", False):
+            self._init_fingertip_tokens(fingertip_tokens, patch_dropout, feature_mode)
+
+    # -------------------------------------------------------------------------
+    # Extra per-point input channels (camera one-hot)
+    # -------------------------------------------------------------------------
+
+    _CONV1_KEY = "patch_embed.patch_encoder.conv1.0.weight"
+
+    def _zero_extra_input_columns(self):
+        """Zero the patch encoder's input columns beyond xyz+rgb, so the extra
+        channels contribute exactly nothing until training moves them."""
+        if self.point_channels > 6:
+            with torch.no_grad():
+                self.patch_embed.patch_encoder.conv1[0].weight[:, 6:] = 0.0
+
+    # -------------------------------------------------------------------------
+    # Fingertip tokens (see ~/ros2_ws/fingertip_tokens_design_rationale.txt)
+    # -------------------------------------------------------------------------
+
+    N_HANDS, N_FINGERS = 2, 5
+    TAG_SITES = ("vit", "head")
+
+    def _init_fingertip_tokens(self, cfg, patch_dropout, feature_mode):
+        # Guards: each of these would silently break the token bookkeeping.
+        if feature_mode != "pointsam":
+            raise ValueError("fingertip tokens need feature_mode 'pointsam' (per-token output)")
+        if patch_dropout and patch_dropout > 0:
+            raise ValueError("fingertip tokens need patch_dropout 0: PatchDropout keeps a "
+                             "random subset of tokens, which would drop and reorder them")
+        tag_at = tuple(cfg.get("tag_at", self.TAG_SITES))
+        if not set(tag_at) <= set(self.TAG_SITES) or not tag_at:
+            raise ValueError(f"fingertip_tokens.tag_at must be a non-empty subset of "
+                             f"{self.TAG_SITES}, got {tag_at}")
+        self.fingertip_tag_at = tag_at
+        self.n_tips = self.N_HANDS * self.N_FINGERS
+        self.fingertip_radius_m = float(cfg.get("radius_m", 0.03))
+        idx = torch.arange(self.n_tips)
+        # anchor order [L thumb..pinky, R thumb..pinky] (real_preprocess.HandFK)
+        self.register_buffer("ft_hand_idx", idx // self.N_FINGERS, persistent=False)
+        self.register_buffer("ft_finger_idx", idx % self.N_FINGERS, persistent=False)
+
+        Dv, Dh = self.transformer_dim, self.embed_dim
+        # All zero-init: at step 0 the tags change nothing; training decides.
+        self.ft_empty = nn.Parameter(torch.zeros(Dv))
+        if "vit" in tag_at:
+            self.ft_tip_vit = nn.Parameter(torch.zeros(Dv))
+            self.ft_hand_vit = nn.Parameter(torch.zeros(self.N_HANDS, Dv))
+            self.ft_finger_vit = nn.Parameter(torch.zeros(self.N_FINGERS, Dv))
+        if "head" in tag_at:
+            self.ft_tip_head = nn.Parameter(torch.zeros(Dh))
+            self.ft_hand_head = nn.Parameter(torch.zeros(self.N_HANDS, Dh))
+            self.ft_finger_head = nn.Parameter(torch.zeros(self.N_FINGERS, Dh))
+
+        # Metres per normalized unit, per axis. The encoder sees NORMALIZED
+        # coordinates and the workspace normalizer is anisotropic (0.65/1.0/
+        # 0.6 m spans), so a radius in normalized space would be an ellipsoid.
+        # DP3.set_normalizer fills this; it is saved in the state_dict, so
+        # inference reads the same value. The flag makes a forgotten fill loud.
+        self.register_buffer("xyz_half_range", torch.ones(3))
+        self.register_buffer("xyz_half_range_set", torch.zeros((), dtype=torch.bool))
+        self.fingertip_cfg = dict(cfg)
+        cprint(f"[Uni3DPointcloudEncoder] fingertip tokens: {self.n_tips}, "
+               f"radius {self.fingertip_radius_m * 100:.1f} cm, tag at {tag_at}", "red")
+
+    def set_xyz_half_range(self, half_range):
+        half_range = torch.as_tensor(half_range, dtype=torch.float32).flatten()
+        if half_range.shape != (3,) or not torch.all(half_range > 0):
+            raise ValueError(f"xyz_half_range must be 3 positive values, got {half_range}")
+        self.xyz_half_range.copy_(half_range.to(self.xyz_half_range.device))
+        self.xyz_half_range_set.fill_(True)
+
+    def _tag(self, site):
+        tip = getattr(self, f"ft_tip_{site}")
+        hand = getattr(self, f"ft_hand_{site}")[self.ft_hand_idx]
+        finger = getattr(self, f"ft_finger_{site}")[self.ft_finger_idx]
+        return tip + hand + finger  # [n_tips, D]
+
+    def _fingertip_patches(self, pts, feats, anchors):
+        """Anchored radius patches.
+
+        pts [B, N, 3] and anchors [B, T, 3] are NORMALIZED; feats [B, N, C].
+        Returns (embeddings [B, T, 512], centers [B, T, 3] clamped to [-1, 1],
+        empty [B, T] bool).
+
+        * neighbours are chosen by METRIC distance (radius_m), never a point
+          beyond it: plain kNN always returns K points and would fill an
+          occluded fingertip with palm / table;
+        * empty slots are refilled by cycling the in-radius neighbours --
+          the patch encoder max-pools, so duplicates are exactly neutral;
+        * features are the same NORMALIZED relative coords + channels an FPS
+          patch gets, so the pretrained patch encoder sees familiar input;
+        * a patch with no point in radius, or an anchor outside the workspace
+          box, is flagged empty (the caller substitutes a learned token).
+        """
+        if not bool(self.xyz_half_range_set):
+            raise RuntimeError(
+                "fingertip tokens: xyz_half_range was never set. DP3.set_normalizer "
+                "fills it from the point_cloud normalizer; without it the 3 cm "
+                "radius would be measured in normalized units.")
+        B, N, _ = pts.shape
+        K = self.group_size
+        inside = (anchors.abs() <= 1.0).all(-1)                    # [B, T]
+        centers = anchors.clamp(-1.0, 1.0)
+        hr = self.xyz_half_range.to(pts.dtype)
+        with torch.no_grad():
+            dist, idx = knn_points(anchors * hr, pts * hr, K, sorted=True)  # metres
+            valid = dist <= self.fingertip_radius_m                # sorted -> prefix
+            n_valid = valid.sum(-1)                                # [B, T]
+            slot = torch.arange(K, device=pts.device).expand(B, anchors.shape[1], K)
+            fill = slot % n_valid.clamp(min=1).unsqueeze(-1)
+            idx = torch.gather(idx, 2, fill)
+        empty = (n_valid == 0) | ~inside
+
+        flat = idx.reshape(B, -1)                                  # [B, T*K]
+        nbr_xyz = torch.gather(pts, 1, flat.unsqueeze(-1).expand(-1, -1, 3))
+        nbr_feat = torch.gather(feats, 1, flat.unsqueeze(-1).expand(-1, -1, feats.shape[-1]))
+        T = anchors.shape[1]
+        nbr_xyz = nbr_xyz.reshape(B, T, K, 3) - centers.unsqueeze(2)
+        nbr_feat = nbr_feat.reshape(B, T, K, -1)
+        emb = self.patch_embed.patch_encoder(torch.cat([nbr_xyz, nbr_feat], dim=-1))
+        return emb, centers, empty
+
     def _load_pretrained_weights_selective(self, pretrained_weights_path, normalization_type):
         """
         Selectively load pretrained weights based on normalization_type.
@@ -759,13 +911,38 @@ class Uni3DPointcloudEncoder(nn.Module):
             if key.startswith('pc_encoder.'):
                 new_key = key.replace('pc_encoder.', '')
                 processed_state_dict[new_key] = checkpoint[key]
+        # Extra per-point channels (camera one-hot): the pretrained first layer
+        # takes 6 inputs. strict=False does NOT forgive a shape mismatch, so
+        # widen it here: pretrained weights in the first 6 columns, zeros in the
+        # rest -- the model is then exactly the 6-channel one at step 0.
+        w = processed_state_dict.get(self._CONV1_KEY)
+        if w is not None and self.point_channels > w.shape[1]:
+            cur = self.state_dict()[self._CONV1_KEY]
+            widened = torch.zeros_like(cur)
+            widened[:, :w.shape[1]] = w.to(widened.dtype)
+            processed_state_dict[self._CONV1_KEY] = widened
+            cprint(f"  widened {self._CONV1_KEY} {tuple(w.shape)} -> {tuple(cur.shape)} "
+                   "(new columns zero)", "yellow")
         missing_keys, unexpected_keys = self.load_state_dict(processed_state_dict, strict=False)
         cprint(f"  Missing keys: {missing_keys}", "yellow")
         cprint(f"  Unexpected keys: {unexpected_keys}", "yellow")
 
         cprint(f"[Uni3DPointcloudEncoder] Pretrained weights loaded: {load_weight_path}", "red")
 
-    def forward(self, pcd, eval, num_groups=None):
+    def forward(self, pcd, eval, num_groups=None, anchors=None):
+        """`anchors` [B, 10, 3] (normalized) -- fingertip-token run only.
+
+        The fingertip tokens are APPENDED after the FPS tokens of this frame, so
+        the per-frame token block stays contiguous and the action head's
+        per-obs-step temporal encoding (num_tokens = L // n_obs_steps) still
+        lines up.
+        """
+        if (anchors is not None) != (self.fingertip_cfg is not None):
+            raise ValueError("fingertip anchors given to an encoder without fingertip "
+                             "tokens, or missing for one that has them")
+        if pcd.shape[-1] != self.point_channels:
+            raise ValueError(f"encoder built for {self.point_channels} point channels, "
+                             f"got {pcd.shape[-1]}")
         # Apply point cloud dropout (data augmentation)
         if not eval:
             pcd = random_point_dropout(pcd, max_dropout_ratio=0.8)
@@ -781,6 +958,19 @@ class Uni3DPointcloudEncoder(nn.Module):
             patch_embed = patches["embeddings"]  # [B, L, D]
             centers = patches["centers"]  # [B, L, 3]
         patch_embed = self.patch_proj(patch_embed)
+
+        if anchors is not None:
+            # After the dropout on purpose: a dropped point is moved onto point
+            # 0, far away, so the metric radius test excludes it by itself.
+            ft_emb, ft_centers, ft_empty = self._fingertip_patches(
+                pts, colors, anchors.to(pts.dtype))
+            ft_emb = self.patch_proj(ft_emb)
+            ft_emb = torch.where(ft_empty.unsqueeze(-1),
+                                 self.ft_empty.to(ft_emb.dtype).expand_as(ft_emb), ft_emb)
+            if "vit" in self.fingertip_tag_at:
+                ft_emb = ft_emb + self._tag("vit").to(ft_emb.dtype)
+            patch_embed = torch.cat([patch_embed, ft_emb], dim=1)
+            centers = torch.cat([centers, ft_centers], dim=1)
 
         # Add positional embedding
         pos_embed = self.pos_embed(centers)
@@ -822,6 +1012,11 @@ class Uni3DPointcloudEncoder(nn.Module):
 
         if not self.extract_global_feature:
             pc_pe = self.pe_layer(centers)
+            if anchors is not None and "head" in self.fingertip_tag_at:
+                # the action head adds pc_pe to its point-token KEYS in every
+                # cross-attention layer, so the tag is visible in all of them
+                tag = self._tag("head").to(pc_pe.dtype)
+                pc_pe = torch.cat([pc_pe[:, :-self.n_tips], pc_pe[:, -self.n_tips:] + tag], dim=1)
             return x, pc_pe
         else:
             return x
@@ -1102,8 +1297,9 @@ class MultiCamDP3Encoder(nn.Module):
             assert points.ndim == 3, f"{key}: expected [B, N, C], got {points.shape}"
             if points.shape[-1] == 3:
                 points = torch.cat([points, torch.zeros_like(points)], dim=-1)
-            elif points.shape[-1] > 6:
-                points = points[..., :6]
+            elif points.shape[-1] != 6:
+                # was a silent `[..., :6]` trim; extra channels are unsupported here
+                raise ValueError(f"{key}: expected 3 or 6 channels, got {points.shape[-1]}")
 
             tokens, pe = self.extractor(
                 points, eval, num_groups=self.num_groups_per_camera[i])

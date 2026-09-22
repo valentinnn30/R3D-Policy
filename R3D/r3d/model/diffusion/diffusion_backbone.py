@@ -253,6 +253,10 @@ class Attention(nn.Module):
             attn = attn.masked_fill(attn_mask, float('-inf'))
 
         attn = torch.softmax(attn, dim=-1)
+        # Opt-in capture for attention diagnostics (fingertip-token mass).
+        # Off by default -> no cost; set by DP3.fingertip_attention_mass.
+        if getattr(self, "store_attn", False):
+            self.last_attn = attn.detach()
 
         # Get output
         out = attn @ v

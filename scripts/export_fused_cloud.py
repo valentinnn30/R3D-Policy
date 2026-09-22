@@ -44,7 +44,8 @@ def main():
             continue
         pc = ds[first[f]]["obs"]["point_cloud"][0].numpy()
         xyz.append(pc[:, :3].astype(np.float32))
-        rgb.append(np.clip(pc[:, 3:], 0, 1).astype(np.float32))
+        # 3:6, not 3: -- a camera one-hot (fingertip run) follows the rgb
+        rgb.append(np.clip(pc[:, 3:6], 0, 1).astype(np.float32))
     xyz, rgb = np.stack(xyz), np.stack(rgb)
     np.savez_compressed(a.out, xyz=xyz, rgb=rgb)
     print(f"episode {a.episode}: {len(xyz)} frames x {xyz.shape[1]} points -> {a.out}")

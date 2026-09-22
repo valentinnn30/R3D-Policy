@@ -233,8 +233,9 @@ class MultiModalEncoder(nn.Module):
                 assert x.ndim == 3, f"{b['key']}: expected [B, N, C], got {x.shape}"
                 if x.shape[-1] == 3:
                     x = torch.cat([x, torch.zeros_like(x)], dim=-1)
-                elif x.shape[-1] > 6:
-                    x = x[..., :6]
+                elif x.shape[-1] != 6:
+                    # was a silent `[..., :6]` trim; extra channels are unsupported here
+                    raise ValueError(f"{b['key']}: expected 3 or 6 channels, got {x.shape[-1]}")
                 tokens, pe = self.uni3d(x, eval, num_groups=self.block_groups[b["key"]])
                 embed = self.pose_embed_3d
 
