@@ -26,15 +26,18 @@ relative to the cameras while the robot does not move at all.
 """
 
 import copy
+import dataclasses
 from typing import Dict
 
 import numpy as np
 import torch
+import yaml
 import zarr
 from termcolor import cprint
 
 from r3d.common.pytorch_util import dict_apply
 from r3d.common.real_preprocess import (
+    HandFK,
     PointCloudPreprocessConfig,
     fuse_cameras,
     pose9_from_matrix,
@@ -50,8 +53,15 @@ from r3d.dataset.robotwin_dataset import add_noise, apply_color_jitter
 from r3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 
 
-def _camera_keys(zarr_path):
-    """Discover point_cloud_cam* in the zarr, ordered by camera index."""
+def _camera_keys(zarr_path, cameras=None):
+    """Discover point_cloud_cam* in the zarr, ordered by camera index.
+
+    `cameras` restricts the result to those GLOBAL camera indices, for the
+    hybrid 2D/3D runs where only some cameras are point clouds. Keys keep their
+    global names (`point_cloud_cam1` stays `cam1`), so a subset never collides
+    with the image keys of the other modality. None -> every camera, which is
+    exactly the behaviour before subsets existed.
+    """
     root = zarr.open(zarr_path, mode="r")
     keys = [k for k in root["data"].array_keys() if k.startswith("point_cloud_cam")]
     if not keys:
@@ -59,7 +69,19 @@ def _camera_keys(zarr_path):
             f"{zarr_path} has no point_cloud_cam* arrays. It looks like a fused "
             "zarr -- use r3d.dataset.robotwin_dataset.RobotwinDataset for that."
         )
-    return sorted(keys, key=lambda k: int(k.replace("point_cloud_cam", "")))
+    keys = sorted(keys, key=lambda k: int(k.replace("point_cloud_cam", "")))
+    if cameras is not None:
+        wanted = [f"point_cloud_cam{int(i)}" for i in cameras]
+        missing = [k for k in wanted if k not in keys]
+        if missing:
+            raise KeyError(f"{zarr_path} has no {missing} (has {keys})")
+        if len(set(wanted)) != len(wanted) or wanted != sorted(
+                wanted, key=lambda k: int(k.replace("point_cloud_cam", ""))):
+            raise ValueError(
+                f"cameras must be unique and ascending, got {list(cameras)}; "
+                "every per-camera list is given in this order")
+        keys = wanted
+    return keys
 
 
 def _nominal_extrinsics(zarr_path, cam_keys):
@@ -132,11 +154,28 @@ class RealMultiCamDataset(BaseDataset):
             contrast_range=(0.5, 1.5),
             saturation_range=(0.5, 1.5),
             use_target_ee=False,
+            # Hybrid 2D/3D runs only. `cameras`: GLOBAL indices of the cameras
+            # to load as point clouds (None -> all). `num_points`: overrides the
+            # preprocess yaml's fused budget WITHOUT editing the yaml, which is
+            # part of the model and sha-checked at inference -- used when only
+            # the wrist cameras are fused. Both None -> unchanged behaviour.
+            cameras=None,
+            num_points=None,
+            # Fingertip-token run (fused only; both default off -> unchanged).
+            # `camera_onehot`: append a per-point camera one-hot, (N, 6 + n_cams),
+            # in GLOBAL point_cloud_cam* order. `fingertips`: {fk_config: path}
+            # -> also emit `fingertip_anchors` (n_obs, 10, 3), world metres, the
+            # patch centres of the fingertip tokens. See
+            # ~/ros2_ws/fingertip_tokens_design_rationale.txt.
+            camera_onehot=False,
+            fingertips=None,
             ):
         super().__init__()
 
         self.pc_cfg = PointCloudPreprocessConfig.from_yaml(preprocess_config)
-        self.cam_keys = _camera_keys(zarr_path)
+        if num_points is not None:
+            self.pc_cfg = dataclasses.replace(self.pc_cfg, num_points=int(num_points))
+        self.cam_keys = _camera_keys(zarr_path, cameras)
         self.static_extrinsics, self.per_frame_extrinsics = _nominal_extrinsics(
             zarr_path, self.cam_keys)
         self.n_obs_steps = n_obs_steps
@@ -147,6 +186,9 @@ class RealMultiCamDataset(BaseDataset):
         self.anchor_first_camera = anchor_first_camera
         self.fuse_method = fuse_method
         self.fuse_device = fuse_device
+
+        self._setup_fingertip_run(zarr_path, preprocess_config, cameras,
+                                  camera_onehot, fingertips)
 
         self.use_target_ee = use_target_ee
         self.use_data_augmentation = use_data_augmentation
@@ -225,6 +267,55 @@ class RealMultiCamDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
 
+    def _setup_fingertip_run(self, zarr_path, preprocess_config, cameras,
+                             camera_onehot, fingertips):
+        self.camera_onehot = bool(camera_onehot)
+        self.fingertips = fingertips
+        self.hand_fk = None
+        if not (self.camera_onehot or fingertips):
+            return
+        if not self.FUSES:
+            raise NotImplementedError(
+                "camera_onehot / fingertips are built for the FUSED pipeline only")
+        if cameras is not None:
+            raise NotImplementedError(
+                "camera_onehot / fingertips with a camera subset (hybrid) is not "
+                "supported: the one-hot width and the flange lookup assume every camera")
+        names = list(zarr.open(zarr_path, mode="r")["meta"].attrs["camera_names"])
+        raw = yaml.safe_load(open(preprocess_config))
+        yaml_names = [c["name"] for c in raw["cameras"]]
+        if names != yaml_names:
+            raise ValueError(
+                f"zarr camera_names {names} != preprocess yaml cameras {yaml_names}: "
+                "the one-hot columns and the hand-eye lookup would be misassigned")
+        self.n_cameras = len(names)
+        # GLOBAL camera index of each loaded cloud, in cam_keys order.
+        self.camera_ids = [int(k.replace("point_cloud_cam", "")) for k in self.cam_keys]
+        if fingertips:
+            self.hand_fk = HandFK(fingertips["fk_config"])
+            # T_link8<-cam per side, by NAME: the flange pose is recovered from
+            # the per-frame wrist extrinsic, i.e. the same joint-FK route that
+            # placed that camera's cloud.
+            self.flange_cam = {}
+            for side in HandFK.SIDES:
+                i = names.index(f"cam_wrist_{side}")
+                if self.per_frame_extrinsics[i] is None:
+                    raise ValueError(f"cam_wrist_{side} has no per-frame extrinsics")
+                he = np.asarray(raw["cameras"][i]["extrinsics"], dtype=np.float64)
+                self.flange_cam[side] = (i, np.linalg.inv(he))
+        cprint(f"Fingertip run: camera_onehot={self.camera_onehot} "
+               f"(ids {self.camera_ids} of {self.n_cameras}), "
+               f"fingertips={'on (' + fingertips['fk_config'] + ')' if fingertips else 'off'}",
+               "cyan")
+
+    def _fingertip_anchors(self, sample, t):
+        """(10, 3) world fingertips for window frame t -- from the NOMINAL
+        flange (camera perturbations model calibration error; the robot itself
+        does not move) and the CLEAN state (before agent_pos noise)."""
+        link8 = {side: self._nominal_at(sample, i, t) @ inv_he
+                 for side, (i, inv_he) in self.flange_cam.items()}
+        return self.hand_fk.anchors(link8, sample["state"][t])
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -263,15 +354,41 @@ class RealMultiCamDataset(BaseDataset):
         lo, hi = workspace_limits(self.pc_cfg)
         scale = 2.0 / np.maximum(hi - lo, 1e-8)
         offset = -1.0 - scale * lo
+        mean = ((lo + hi) / 2).astype(np.float32)
+        std = ((hi - lo) / 4).astype(np.float32)
+        if self.camera_onehot:
+            # The one-hot passes through UNCHANGED (scale 1, offset 0): it is an
+            # id, not a quantity. Width must match the cloud exactly -- the
+            # normalizer's reshape(-1, width) does NOT raise on a mismatch, it
+            # silently scrambles channels whenever N*C divides evenly.
+            k = self.n_cameras
+            scale = np.concatenate([scale, np.ones(k)]).astype(np.float32)
+            offset = np.concatenate([offset, np.zeros(k)]).astype(np.float32)
+            lo = np.concatenate([lo, np.zeros(k)]).astype(np.float32)
+            hi = np.concatenate([hi, np.ones(k)]).astype(np.float32)
+            mean = np.concatenate([mean, np.full(k, 0.5)]).astype(np.float32)
+            std = np.concatenate([std, np.full(k, 0.5)]).astype(np.float32)
         normalizer["point_cloud"] = SingleFieldLinearNormalizer.create_manual(
             scale=torch.from_numpy(scale),
             offset=torch.from_numpy(offset.astype(np.float32)),
             input_stats_dict={
                 "min": torch.from_numpy(lo),
                 "max": torch.from_numpy(hi),
-                "mean": torch.from_numpy(((lo + hi) / 2).astype(np.float32)),
-                "std": torch.from_numpy(((hi - lo) / 4).astype(np.float32)),
+                "mean": torch.from_numpy(mean),
+                "std": torch.from_numpy(std),
             })
+        if self.hand_fk is not None:
+            # EXACTLY the cloud's xyz map, so anchors and points share one
+            # coordinate space in the encoder.
+            normalizer["fingertip_anchors"] = SingleFieldLinearNormalizer.create_manual(
+                scale=torch.from_numpy(scale[:3].astype(np.float32)),
+                offset=torch.from_numpy(offset[:3].astype(np.float32)),
+                input_stats_dict={
+                    "min": torch.from_numpy(lo[:3]),
+                    "max": torch.from_numpy(hi[:3]),
+                    "mean": torch.from_numpy(mean[:3]),
+                    "std": torch.from_numpy(std[:3]),
+                })
         return normalizer
 
     def __len__(self) -> int:
@@ -324,6 +441,8 @@ class RealMultiCamDataset(BaseDataset):
         agent_pos = sample["state"][:n_steps].astype(np.float32)
 
         deltas = self._sample_deltas(rng)
+        onehot = ({"camera_ids": self.camera_ids, "n_cameras": self.n_cameras}
+                  if self.camera_onehot else {})
         point_cloud = np.stack([
             fuse_cameras(
                 [sample[k][t] for k in self.cam_keys],
@@ -332,14 +451,17 @@ class RealMultiCamDataset(BaseDataset):
                 self.pc_cfg,
                 method=self.fuse_method,
                 rng=rng,
-                device=self.fuse_device)
+                device=self.fuse_device,
+                **onehot)
             for t in range(n_steps)
         ]).astype(np.float32)
 
-        return {
-            "obs": {"point_cloud": point_cloud, "agent_pos": agent_pos},
-            "action": action,
-        }
+        obs = {"point_cloud": point_cloud, "agent_pos": agent_pos}
+        if self.hand_fk is not None:
+            obs["fingertip_anchors"] = np.stack(
+                [self._fingertip_anchors(sample, t) for t in range(n_steps)]
+            ).astype(np.float32)
+        return {"obs": obs, "action": action}
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # Seeded off the global numpy state, which the DataLoader already gives
@@ -350,10 +472,12 @@ class RealMultiCamDataset(BaseDataset):
         data = self._sample_to_data(sample, rng)
 
         if self.use_data_augmentation:
+            # rgb is 3:6, NOT 3: -- anything after it (the camera one-hot) must
+            # pass through untouched, or the noise would smear the id.
             pc = data["obs"]["point_cloud"]
             xyz = add_noise(pc[..., :3], self.pc_xyz_noise_std, 2 * self.pc_xyz_noise_std)
-            rgb = add_noise(pc[..., 3:], self.pc_rgb_noise_std, 2 * self.pc_rgb_noise_std)
-            data["obs"]["point_cloud"] = np.concatenate([xyz, rgb], axis=-1)
+            rgb = add_noise(pc[..., 3:6], self.pc_rgb_noise_std, 2 * self.pc_rgb_noise_std)
+            data["obs"]["point_cloud"] = np.concatenate([xyz, rgb, pc[..., 6:]], axis=-1)
             # ONE draw per window, broadcast across the observation frames --
             # NOT independent per frame, which is what add_noise() does.
             #
@@ -376,9 +500,10 @@ class RealMultiCamDataset(BaseDataset):
         if self.use_color_jitter:
             pc = data["obs"]["point_cloud"]
             rgb = apply_color_jitter(
-                pc[..., 3:], self.brightness_range,
+                pc[..., 3:6], self.brightness_range,
                 self.contrast_range, self.saturation_range)
-            data["obs"]["point_cloud"] = np.concatenate([pc[..., :3], rgb], axis=-1)
+            data["obs"]["point_cloud"] = np.concatenate(
+                [pc[..., :3], rgb, pc[..., 6:]], axis=-1)
 
         data["obs"]["point_cloud"] = data["obs"]["point_cloud"].astype(np.float32)
         data["obs"]["agent_pos"] = data["obs"]["agent_pos"].astype(np.float32)

@@ -231,8 +231,19 @@ max_input_points: null
 
 # The per-camera crop at conversion uses the NOMINAL extrinsics and grows the
 # workspace box by this margin (metres), so points a later perturbation would
-# pull into the workspace are not discarded now. Must comfortably exceed the
-# largest displacement the randomization can produce.
+# pull into the workspace are not discarded now.
+#
+# ZERO, and it must stay zero while extrinsics randomization is off (as it has
+# been since 2026-09-04; the value here has been 0.0 since 2026-08-21, so every
+# zarr in use was converted with no margin). With no perturbation there is no
+# "later" that pulls an outside point in, so a margin only spends the per-camera
+# FPS budget on a shell that the sample-time crop in `select_camera_frame` then
+# deletes -- fewer real points reaching the encoder, and duplicate padding on
+# cam_top, whose stored budget (1792) already equals the encoder's.
+#
+# Turn it back on ONLY together with randomization, and re-convert: it must then
+# comfortably exceed the largest displacement the randomization can produce
+# (sigma_t 4 mm, sigma_R 0.7 deg per axis, truncated at 3 sigma).
 crop_margin: 0.0
 
 # ------------------------------------------------------------------- fusion --

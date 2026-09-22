@@ -72,6 +72,9 @@ policy:
   # oc.select yields null for every fused task, where DP3 ignores it.
   num_groups_per_camera: ${oc.select:task.num_groups_per_camera,null}
 
+  # Fingertip-token run only; null (-> off) for every other task.
+  fingertip_tokens: ${oc.select:task.fingertip_tokens,null}
+
   # Also mirrored from the dataset, and for the same reason: these decide what
   # the camera tag can represent, and the dataset decides what goes INTO the
   # tag. Overriding `task.dataset.pose_source` on the command line therefore

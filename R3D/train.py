@@ -407,6 +407,19 @@ class TrainDP3Workspace:
                         # log epoch average validation loss
                         step_log['val_loss'] = val_loss
 
+                    # Fingertip-token run: attention mass the action head puts
+                    # on the fingertip keys, on the last val batch, against the
+                    # uniform level. No-op (None) for every other policy.
+                    if len(val_losses) > 0 and is_main_process() \
+                            and hasattr(policy, "fingertip_attention_mass"):
+                        with autocast(device_type='cuda', dtype=self.autocast_dtype, enabled=self.use_bfloat16):
+                            ft = policy.fingertip_attention_mass(batch['obs'])
+                        if ft is not None:
+                            pooled = ft["mass"].sum(-1).mean(0)          # [n_layers]
+                            for li, v in enumerate(pooled.tolist()):
+                                step_log[f'ft_attn_mass_layer{li}'] = v
+                            step_log['ft_attn_mass_uniform'] = ft["uniform"] * ft["mass"].shape[-1]
+
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
                 with torch.no_grad():

@@ -1,0 +1,110 @@
+name: ${task_name}
+
+# H2-U -- both wrists as 3D point clouds (unfused), cam_top as a 2D image.
+#
+# Plan: ~/ros2_ws/hybrid_2d3d_ablations_plan.txt
+#
+# Every block is EXACTLY its block from the non-hybrid run it comes from:
+#   wrists   <- real_bimanual_unfused.yaml (Run B / A'): stored FPS cloud (3840,
+#               exact crop, floor cut), sample-time crop with the per-frame
+#               extrinsic + uniform draw to 3200, METRIC_SCALE_M, Uni3D 200 groups
+#   cam_top  <- real_bimanual_2d.yaml: 322x182, DINOv2 299 tokens
+#
+# Budget: 16 points per group = 2.0x coverage per 3D block, as fused run A.
+# Tokens per obs step: 299 + 200 + 200 = 699.
+#
+# Pose tags, one source per modality:
+#   pose_source_3d -> the wrists: extrinsic = calibrated per-frame pose,
+#                     proprio = the arm's EE pose with a per-camera MLP (A')
+#   pose_source_2d -> cam_top only, which is static: extrinsic = a constant tag,
+#                     proprio / none = identity embedding
+
+shape_meta: &shape_meta
+  obs:
+    image_cam0:            # cam_top, static, 2D
+      shape: [3, 182, 322]
+      type: rgb
+    point_cloud_cam1:      # cam_wrist_left, 3D
+      shape: [3200, 6]
+      type: point_cloud
+    point_cloud_cam2:      # cam_wrist_right, 3D
+      shape: [3200, 6]
+      type: point_cloud
+    campose_cam0:
+      shape: [9]
+      type: low_dim
+    campose_cam1:
+      shape: [9]
+      type: low_dim
+    campose_cam2:
+      shape: [9]
+      type: low_dim
+    # one entry per BLOCK, in block order (ascending camera index)
+    cam_valid:
+      shape: [3]
+      type: low_dim
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+env_runner: null
+
+# Groups for the UNFUSED 3D blocks, in cameras_3d order. Read by the dataset and
+# (via oc.select) the encoder, so the two cannot drift. = Run B's wrist values.
+num_groups_per_camera: [200, 200]
+
+dataset:
+  _target_: r3d.dataset.real_hybrid_dataset.RealHybridDataset
+  # Frame-identical pair (verified: episode_ends, state, action equal; also
+  # asserted at construction).
+  zarr_path_3d: R3D/data/real_bimanual_mixed150.zarr
+  zarr_path_2d: R3D/data/real_bimanual_2d_mixed150.zarr
+  preprocess_config_3d: R3D/r3d/config/preprocess/real_bimanual.yaml
+  preprocess_config_2d: R3D/r3d/config/preprocess/real_bimanual_2d.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  cameras_3d: [1, 2]
+  cameras_2d: [0]
+  fuse_3d: false
+
+  points_per_camera_encoder: [3200, 3200]
+  num_groups_per_camera: ${task.num_groups_per_camera}
+
+  # Defaults = each modality's non-hybrid default (Run B: extrinsic, 2D-N: none).
+  # Override both with the winners of the non-hybrid runs.
+  pose_source_3d: extrinsic
+  pose_source_2d: none
+  # GLOBAL camera order: [cam_top, cam_wrist_left, cam_wrist_right]
+  camera_arm_slice: [null, [0, 7], [7, 14]]
+
+  # OFF (2026-09-04), as for every run; sigmas kept, they are measured flex.
+  use_extrinsics_randomization: false
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  # the first 3D camera here is a WRIST, not the static anchor; irrelevant
+  # with randomization off
+  anchor_first_camera: false
+  fuse_method: random
+  fuse_device: cpu
+
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  # 2D blocks: same keys the 2D task points at
+  rgb_pixel_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  image_shift_px: ${data_augmentation.image_shift_px}
+  use_target_ee: ${policy.use_target_ee}

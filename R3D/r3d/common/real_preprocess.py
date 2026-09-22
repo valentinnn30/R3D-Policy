@@ -184,7 +184,7 @@ def preprocess_camera_frame(
     nominal_extrinsics: np.ndarray,
     cfg: PointCloudPreprocessConfig,
     num_points: int,
-    margin: float = 0.05,
+    margin: float = 0.0,
     device: str = "cuda",
     rgb_already_normalized: bool = False,
     max_input_points: Optional[int] = None,
@@ -198,6 +198,17 @@ def preprocess_camera_frame(
     Only the crop uses the base frame; the points that come back are untouched
     camera-frame coordinates, because the perturbation has to be applied to
     them later as an extrinsic.
+
+    `margin` DEFAULTS TO 0 because extrinsics randomization is off (2026-09-04),
+    and the margin only ever existed to leave headroom for it: with no
+    perturbation, nothing will later pull an outside point in, so a margin just
+    spends the FPS budget on a shell that the sample-time crop then deletes.
+    The default was 0.05 while randomization was live. Both real callers pass
+    `cfg["crop_margin"]` explicitly -- which has been 0.0 since 2026-08-21, so
+    every zarr now in use was built with no margin -- and this default only
+    decides what an ad-hoc caller gets. Re-enabling randomization means setting
+    `crop_margin` in the preprocess yaml AND re-converting; it must comfortably
+    exceed the largest displacement the randomization can produce.
     """
     points = np.asarray(points, dtype=np.float64)
     assert points.ndim == 2 and points.shape[1] >= 6, (
@@ -274,8 +285,16 @@ def fuse_cameras(
     method: str = "random",
     rng=None,
     device: str = "cuda",
+    camera_ids: Optional[Sequence[int]] = None,
+    n_cameras: Optional[int] = None,
 ) -> np.ndarray:
     """Fuse per-camera clouds into one (cfg.num_points, 6) cloud in base frame.
+
+    `camera_ids` (the GLOBAL index of each entry of `clouds_cam`) together with
+    `n_cameras` appends a per-point camera one-hot, giving (num_points,
+    6 + n_cameras): a fused patch mixes cameras, so the id has to ride on the
+    point. The column is attached BEFORE the crop/pad/draw so every step carries
+    it. None (default) -> the (N, 6) output, bit-identical to before.
 
     `clouds_cam[i]` is (M, 6) in camera i's frame; `extrinsics[i]` is the 4x4
     to apply -- nominal at inference, nominal composed with a perturbation at
@@ -290,12 +309,21 @@ def fuse_cameras(
     cloud handed to the encoder is part of the observation.
     """
     rng = np.random.default_rng() if rng is None else rng
+    if (camera_ids is None) != (n_cameras is None):
+        raise ValueError("camera_ids and n_cameras must be given together")
+    if camera_ids is not None and len(camera_ids) != len(clouds_cam):
+        raise ValueError(f"{len(camera_ids)} camera_ids for {len(clouds_cam)} clouds")
 
     transformed = []
-    for cloud, T in zip(clouds_cam, extrinsics):
+    for i, (cloud, T) in enumerate(zip(clouds_cam, extrinsics)):
         T = np.asarray(T, dtype=np.float64)
         xyz = np.asarray(cloud[:, :3], dtype=np.float64) @ T[:3, :3].T + T[:3, 3]
-        transformed.append(np.concatenate([xyz, cloud[:, 3:6]], axis=-1))
+        cols = [xyz, cloud[:, 3:6]]
+        if camera_ids is not None:
+            onehot = np.zeros((len(cloud), int(n_cameras)), dtype=np.float64)
+            onehot[:, int(camera_ids[i])] = 1.0
+            cols.append(onehot)
+        transformed.append(np.concatenate(cols, axis=-1))
 
     stacked = np.concatenate(transformed, axis=0)
     fused = crop_to_workspace(stacked, cfg)
@@ -314,7 +342,9 @@ def fuse_cameras(
 
     if method == "fps":
         xyz, idx = farthest_point_sample(fused, cfg.num_points, device=device)
-        out = np.concatenate([xyz, fused[idx, 3:6]], axis=-1)
+        # 3: not 3:6 -- carries the camera one-hot when present (identical
+        # otherwise, since the fused cloud then has exactly 6 columns).
+        out = np.concatenate([xyz, fused[idx, 3:]], axis=-1)
     elif method == "random":
         idx = rng.choice(len(fused), size=cfg.num_points, replace=False)
         out = fused[idx]
@@ -390,6 +420,34 @@ def pose9_from_pos_quat(pos, quat_xyzw) -> np.ndarray:
     ])
 
 
+def crop_camera_frame(
+    cloud_cam: np.ndarray,
+    extrinsics: np.ndarray,
+    cfg: PointCloudPreprocessConfig,
+) -> np.ndarray:
+    """The crop half of `select_camera_frame`, without the draw.
+
+    Split out so the robot can crop exactly as training does and still choose a
+    different SAMPLER. The crop is the part that must never drift between the
+    two -- it decides which points exist -- whereas how the surviving points are
+    thinned to the encoder budget is already allowed to differ, exactly as it
+    does on the fused path (voxel at inference, FPS at conversion).
+
+    `extrinsics` is used ONLY to decide what lies inside the workspace; the
+    coordinates returned are the untouched camera-frame ones.
+    """
+    cloud = np.asarray(cloud_cam, dtype=np.float64)
+    T = np.asarray(extrinsics, dtype=np.float64)
+
+    xyz_base = cloud[:, :3] @ T[:3, :3].T + T[:3, 3]
+    lo, hi = cfg.bounds
+    keep = np.all((xyz_base > lo) & (xyz_base < hi), axis=-1)
+    if cfg.floor_normal is not None:
+        n = np.asarray(cfg.floor_normal, dtype=np.float64)
+        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
+    return cloud[keep]
+
+
 def select_camera_frame(
     cloud_cam: np.ndarray,
     extrinsics: np.ndarray,
@@ -420,17 +478,7 @@ def select_camera_frame(
     replaces the camera's tokens with a learned `absent` embedding.
     """
     rng = np.random.default_rng() if rng is None else rng
-    cloud = np.asarray(cloud_cam, dtype=np.float64)
-    T = np.asarray(extrinsics, dtype=np.float64)
-
-    xyz_base = cloud[:, :3] @ T[:3, :3].T + T[:3, 3]
-    lo, hi = cfg.bounds
-    keep = np.all((xyz_base > lo) & (xyz_base < hi), axis=-1)
-    if cfg.floor_normal is not None:
-        n = np.asarray(cfg.floor_normal, dtype=np.float64)
-        keep &= (xyz_base @ n + float(cfg.floor_offset)) > cfg.floor_margin
-
-    kept = cloud[keep]
+    kept = crop_camera_frame(cloud_cam, extrinsics, cfg)
     if len(kept) == 0:
         # Emit zeros, NOT sentinels. `preprocess_camera_frame` places sentinels
         # far outside the box because it relies on `fuse_cameras`' crop to
@@ -489,6 +537,111 @@ def panda_fk_flange(joints: Sequence[float]) -> np.ndarray:
         T = T @ _dh_transform(a, d, alpha, theta)
     a, d, alpha = _PANDA_FLANGE
     return T @ _dh_transform(a, d, alpha, 0.0)
+
+
+# ------------------------------------------------------- orca hand fingertips --
+#
+# Fingertip positions anchor the fingertip tokens (see
+# ~/ros2_ws/fingertip_tokens_design_rationale.txt). The chains come from the
+# live xacro via scripts/export_orcahand_fk.py; the yaml is the single source
+# for training AND inference.
+#
+#     tip_world = T_world<-link8 @ T_link8<-hand_root @ FK_hand(q)[tip]
+#
+# T_world<-link8 must come from the SAME route that placed the wrist clouds
+# (joint FK), not from the recorded EE pose: joint_states and qpos_arm disagree
+# by up to 19 mm during fast motion, and the anchors have to sit on the cloud.
+
+HAND_JOINT_ORDER = (  # controller joint_ids == per-hand state layout, radians
+    "wrist", "thumb_mcp", "thumb_abd", "thumb_pip", "thumb_dip",
+    "index_abd", "index_mcp", "index_pip", "middle_abd", "middle_mcp",
+    "middle_pip", "ring_abd", "ring_mcp", "ring_pip", "pinky_abd",
+    "pinky_mcp", "pinky_pip")
+HAND_FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+# state slices of the two hands' joint angles (the 48-vector layout)
+HAND_STATE_SLICES = {"left": slice(14, 31), "right": slice(31, 48)}
+
+
+def _rpy_matrix(rpy) -> np.ndarray:
+    """URDF rpy: fixed-axis roll-pitch-yaw, R = Rz(y) @ Ry(p) @ Rx(r)."""
+    r, p, y = rpy
+    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ])
+
+
+def _axis_angle_matrix(axis, theta) -> np.ndarray:
+    k = np.asarray(axis, dtype=np.float64)
+    k = k / np.linalg.norm(k)
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+
+
+class HandFK:
+    """Fingertip FK for both orca hands, from `orcahand_v1b_fk.yaml`."""
+
+    SIDES = ("left", "right")
+
+    def __init__(self, path: str):
+        with open(path, "r") as f:
+            doc = yaml.safe_load(f)
+        if tuple(doc["joint_order"]) != HAND_JOINT_ORDER:
+            raise ValueError(f"{path}: joint_order does not match HAND_JOINT_ORDER")
+        if tuple(doc["fingers"]) != HAND_FINGERS:
+            raise ValueError(f"{path}: fingers do not match HAND_FINGERS")
+        self.path = path
+        self.mount = {}
+        self.tips = {}
+        for side in self.SIDES:
+            h = doc["hands"][side]
+            M = np.asarray(h["mount_link8"], dtype=np.float64)
+            R = M[:3, :3]
+            if not (np.allclose(R @ R.T, np.eye(3), atol=1e-6)
+                    and np.isclose(np.linalg.det(R), 1.0, atol=1e-6)):
+                raise ValueError(f"{path}: {side} mount is not a proper rotation")
+            self.mount[side] = M
+            self.tips[side] = [h["tips"][f] for f in HAND_FINGERS]
+
+    @staticmethod
+    def _eval_chain(chain, q) -> np.ndarray:
+        """hand_root<-link for one chain; `q` in HAND_JOINT_ORDER, radians."""
+        T = np.eye(4)
+        for e in chain:
+            step = np.eye(4)
+            step[:3, :3] = _rpy_matrix(e["rpy"])
+            step[:3, 3] = e["xyz"]
+            T = T @ step
+            if "joint" in e:
+                rot = np.eye(4)
+                rot[:3, :3] = _axis_angle_matrix(
+                    e["axis"], q[HAND_JOINT_ORDER.index(e["joint"])])
+                T = T @ rot
+        return T
+
+    def tips_link8(self, side: str, q) -> np.ndarray:
+        """(5, 3) fingertip positions in link8, thumb..pinky."""
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        if q.shape != (len(HAND_JOINT_ORDER),):
+            raise ValueError(f"{side} hand needs {len(HAND_JOINT_ORDER)} angles, got {q.shape}")
+        M = self.mount[side]
+        return np.stack([(M @ self._eval_chain(c, q))[:3, 3] for c in self.tips[side]])
+
+    def anchors(self, T_world_link8: dict, agent_pos) -> np.ndarray:
+        """(10, 3) world fingertips, [L thumb..pinky, R thumb..pinky].
+
+        `T_world_link8` maps 'left'/'right' to the flange pose that placed that
+        side's wrist cloud; `agent_pos` is the 48-vector (hand angles in rad).
+        """
+        agent_pos = np.asarray(agent_pos, dtype=np.float64).reshape(-1)
+        out = []
+        for side in self.SIDES:
+            T = np.asarray(T_world_link8[side], dtype=np.float64)
+            p = self.tips_link8(side, agent_pos[HAND_STATE_SLICES[side]])
+            out.append(p @ T[:3, :3].T + T[:3, 3])
+        return np.concatenate(out, axis=0)
 
 
 def depth_to_point_cloud(

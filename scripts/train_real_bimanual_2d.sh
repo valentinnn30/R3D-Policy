@@ -13,6 +13,27 @@
 #                        task.dataset.pose_source=proprio
 #   2D-B  ablation   bash scripts/train_real_bimanual_2d.sh real_bimanual_2d 44 0 \
 #                        task.dataset.pose_source=extrinsic
+#   2D-U  ablation   bash scripts/train_real_bimanual_2d.sh real_bimanual_2d 45 0 \
+#                        policy.image_encoder_cfg.freeze=false \
+#                        policy.image_encoder_cfg.train_last_n_blocks=3 \
+#                        policy.image_encoder_cfg.drop_path_rate=0.2
+#
+# 2D-U unfreezes the top of the DINOv2 trunk. The headline run's trainable
+# visual pathway is 0.099 M parameters against the 3D encoder's 6.087 M, so
+# 2D-N vs the 3D run is a frozen-vs-finetuned comparison, not an
+# encoder-vs-encoder one. Unfreezing the last 3 blocks + norm gives 5.326 M,
+# within 3% of Uni3D's 5.502 M transformer -- that is where the 3 comes from.
+#
+# NOTHING ELSE CHANGES. lr stays 1.0e-4 flat over every trainable parameter,
+# weight_decay 1.0e-6, lr_warmup_steps 500 -- the 3D run fine-tunes its own
+# PRETRAINED Uni3D trunk on exactly those (train.py:110 builds one flat param
+# group), so a discriminative backbone LR would be a second, unjustified
+# difference. drop_path_rate 0.2 is likewise the Uni3D trunk's own value.
+#
+# Costs no wall-clock: measured on the 4090 at batch 64 / bf16 the GPU step
+# goes 0.48 -> 0.77 ms/sample while the dataloader delivers only
+# 2.70 ms/sample, so training stays dataloader-bound. Peak VRAM 1.74 -> 3.53
+# GiB. Re-time before raising num_workers.
 #
 # The headline carries NO pose tag: `agent_pos` already holds both arms' EE
 # poses, and the camera pose is that pose composed with a constant, so the tag

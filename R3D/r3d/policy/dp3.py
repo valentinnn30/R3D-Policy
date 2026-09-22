@@ -54,6 +54,10 @@ class DP3(BasePolicy):
             camera_arm_slice=None,
             # None -> derived from pose_source (per-camera MLPs under 'proprio').
             per_camera_pose_mlp=None,
+            # Fingertip-token run (fused only): {enabled, radius_m, tag_at}.
+            # Must agree with the task: enabled <=> shape_meta has
+            # `fingertip_anchors`. See ~/ros2_ws/fingertip_tokens_design_rationale.txt.
+            fingertip_tokens=None,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -89,6 +93,8 @@ class DP3(BasePolicy):
         # no `point_cloud` for DP3Encoder to read. Auto-detecting means the
         # encoder cannot be set inconsistently with the dataset that feeds it.
         self.unfused = any(k.startswith("point_cloud_cam") for k in obs_dict)
+        if self.unfused and fingertip_tokens and fingertip_tokens.get("enabled", False):
+            raise NotImplementedError("fingertip tokens are built for the FUSED pipeline only")
         # Every observation key holding a cloud. One entry when fused; one per
         # camera when not. Used by the clip / drop-colour steps below, which
         # would otherwise KeyError on 'point_cloud' for an unfused batch.
@@ -157,6 +163,9 @@ class DP3(BasePolicy):
                 camera_has_pose=camera_has_pose,
             )
         else:
+            pointcloud_encoder_cfg = self._fused_encoder_cfg(
+                obs_dict, pointcloud_encoder_cfg, use_pc_color, pointnet_type,
+                fingertip_tokens)
             obs_encoder = DP3Encoder(
                 observation_space=obs_dict,
                 img_crop_shape=crop_shape,
@@ -280,6 +289,7 @@ class DP3(BasePolicy):
         result: must include "action" key
         """
         # normalize input
+        self._check_obs_widths(obs_dict)
         nobs = self.normalizer.normalize(obs_dict)
 
         # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
@@ -398,12 +408,108 @@ class DP3(BasePolicy):
         return result
 
     # ========= training  ============
+    # ========= fingertip-token run helpers ============
+    @staticmethod
+    def _fused_encoder_cfg(obs_dict, pointcloud_encoder_cfg, use_pc_color,
+                           pointnet_type, fingertip_tokens):
+        """Encoder cfg for the FUSED path, with the point-channel width taken
+        from the TASK's shape_meta (so the dataset and the encoder cannot
+        disagree) and the fingertip block cross-checked against the task."""
+        cfg = dict(pointcloud_encoder_cfg)
+        n_ch = int(obs_dict["point_cloud"][-1])
+        ft_on = bool(fingertip_tokens and fingertip_tokens.get("enabled", False))
+        has_anchors = "fingertip_anchors" in obs_dict
+        if ft_on != has_anchors:
+            raise ValueError(
+                f"policy.fingertip_tokens.enabled={ft_on} but the task shape_meta "
+                f"{'has' if has_anchors else 'has no'} `fingertip_anchors` -- the "
+                "encoder and the dataset would disagree")
+        if n_ch > 6 or ft_on:
+            if pointnet_type not in ("uni3d", "uni3d_pretrained"):
+                raise ValueError("camera one-hot / fingertip tokens need the uni3d encoder")
+            if not use_pc_color:
+                raise ValueError(
+                    "use_pc_color=false slices the cloud to xyz, which would silently "
+                    "drop the per-point camera one-hot")
+        if n_ch != 6:
+            cfg["point_channels"] = n_ch
+        if ft_on:
+            cfg["fingertip_tokens"] = dict(fingertip_tokens)
+        return cfg
+
+    def _check_obs_widths(self, obs_dict):
+        """LinearNormalizer reshapes to (-1, width) and does NOT raise on a
+        mismatch whenever N*C divides evenly -- it silently scrambles channels
+        (a 9-channel cloud against a 6-wide scale does exactly that). Checked
+        on every call so a wrong checkpoint/observation pairing fails loudly,
+        at training and at inference alike."""
+        for key in ("point_cloud", "fingertip_anchors"):
+            if key in obs_dict and key in self.normalizer.params_dict:
+                width = self.normalizer.params_dict[key]["scale"].shape[0]
+                if obs_dict[key].shape[-1] != width:
+                    raise ValueError(
+                        f"obs '{key}' has {obs_dict[key].shape[-1]} channels but its "
+                        f"normalizer is {width} wide")
+
+    def _uni3d(self):
+        return getattr(getattr(self, "obs_encoder", None), "extractor", None)
+
+    def fingertip_key_indices(self, n_obs_steps=None):
+        """Indices of the fingertip tokens in the action head's key sequence
+        ([n_obs_steps blocks of (FPS tokens + fingertip tokens)]), or None."""
+        enc = self._uni3d()
+        if enc is None or getattr(enc, "fingertip_cfg", None) is None:
+            return None
+        To = self.n_obs_steps if n_obs_steps is None else n_obs_steps
+        per_step = enc.num_group + enc.n_tips
+        return [s * per_step + enc.num_group + j for s in range(To) for j in range(enc.n_tips)]
+
+    @torch.no_grad()
+    def fingertip_attention_mass(self, obs_dict):
+        """How much the action head attends to the fingertip tokens.
+
+        Runs predict_action and reads the cross-attention of the LAST denoising
+        step. Returns None for a policy without fingertip tokens, else
+        {'mass': [B, n_layers, n_tips] -- attention summed over the obs steps,
+        averaged over heads and action queries; 'uniform': the per-tip level
+        under uniform attention (n_obs_steps / n_keys)}. The pooled mass over
+        all tips is mass.sum(-1), against uniform * n_tips.
+        """
+        idx = self.fingertip_key_indices()
+        if idx is None or getattr(self.model, "one_way_transformer", None) is None:
+            return None
+        mods = [layer.cross_attn_token_to_image
+                for layer in self.model.one_way_transformer.layers]
+        for m in mods:
+            m.store_attn = True
+        try:
+            self.predict_action(obs_dict)
+            enc = self._uni3d()
+            T, To = enc.n_tips, self.n_obs_steps
+            masses = []
+            for m in mods:
+                a = m.last_attn.float().mean(dim=(1, 2))           # [B, n_keys]
+                per_key = a[:, idx].reshape(a.shape[0], To, T)      # [B, To, tips]
+                masses.append(per_key.sum(1))
+            n_keys = mods[0].last_attn.shape[-1]
+        finally:
+            for m in mods:
+                m.store_attn = False
+                m.last_attn = None
+        return {"mass": torch.stack(masses, dim=1).cpu(), "uniform": To / n_keys}
+
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
+        enc = self._uni3d()
+        if enc is not None and getattr(enc, "fingertip_cfg", None) is not None:
+            # metres per normalized unit = 1 / scale, xyz only
+            scale = self.normalizer.params_dict["point_cloud"]["scale"][:3].detach()
+            enc.set_xyz_half_range(1.0 / scale.float().cpu())
 
     def compute_loss(self, batch):
         # normalize input
         obs_dict = batch['obs']
+        self._check_obs_widths(obs_dict)
         nobs = self.normalizer.normalize(obs_dict)
 
         # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
