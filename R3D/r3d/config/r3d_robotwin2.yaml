@@ -93,7 +93,9 @@ policy:
     pc_feat_dim: 192
     embed_dim: 256
     group_size: 32
-    num_group: 512
+    # 512 unless the task sets `num_group` -- only the token-count control of
+    # the fingertip anchor-set runs does (512 + the anchor count of run F).
+    num_group: ${oc.select:task.num_group,512}
     patch_dropout: 0 # pointSAM without patch_dropout
     drop_path_rate: 0.2
     pretrained_pc: null # Point transformer in Uni3D is initialized empty

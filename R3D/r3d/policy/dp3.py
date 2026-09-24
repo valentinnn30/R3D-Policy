@@ -435,6 +435,15 @@ class DP3(BasePolicy):
             cfg["point_channels"] = n_ch
         if ft_on:
             cfg["fingertip_tokens"] = dict(fingertip_tokens)
+            from r3d.common.real_preprocess import anchor_layout, normalize_anchor_spec
+            spec = fingertip_tokens.get("anchors")
+            n_anchors = len(anchor_layout(normalize_anchor_spec(
+                None if spec is None else [dict(e) for e in spec])))
+            n_meta = int(obs_dict["fingertip_anchors"][0])
+            if n_anchors != n_meta:
+                raise ValueError(
+                    f"fingertip_tokens.anchors gives {n_anchors} anchors but shape_meta "
+                    f"fingertip_anchors is {n_meta} long")
         return cfg
 
     def _check_obs_widths(self, obs_dict):
@@ -496,7 +505,12 @@ class DP3(BasePolicy):
             for m in mods:
                 m.store_attn = False
                 m.last_attn = None
-        return {"mass": torch.stack(masses, dim=1).cpu(), "uniform": To / n_keys}
+        out = {"mass": torch.stack(masses, dim=1).cpu(), "uniform": To / n_keys}
+        if getattr(enc, "ft_type_names", None) is not None:
+            # anchor-set run: per-anchor type id (index into type_names)
+            out["type_idx"] = enc.ft_type_idx.cpu()
+            out["type_names"] = enc.ft_type_names
+        return out
 
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())

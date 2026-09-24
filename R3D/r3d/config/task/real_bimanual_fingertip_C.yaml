@@ -1,0 +1,127 @@
+# Fingertip ANCHOR-SET variant (2026-09-24), one of six new runs against the
+# reference real_bimanual_fingertip.yaml (10 tip tokens + camera one-hot).
+# Identical to the reference in every other respect. Plan and reasoning:
+# ~/.claude/plans/i-want-to-add-merry-crab.md and
+# ~/ros2_ws/fingertip_tokens_design_rationale.txt
+#
+# C: pad-surface tip + axial-front + pad-front. Anticipatory contact: what the
+# finger is about to push into / the pad is about to touch.
+
+name: ${task_name}
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [8192, 9]    # FUSED, 30 mm floor cut; xyz rgb + camera one-hot (3)
+      type: point_cloud
+    fingertip_anchors:
+      shape: [30, 3]      # FK anchors (see fingertip_tokens.anchors), world m
+      type: point_cloud
+    agent_pos:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]  # joint only
+
+# Read by the POLICY (oc.select in r3d_robotwin2.yaml). enabled <=> shape_meta
+# has fingertip_anchors; the policy raises if the two disagree.
+fingertip_tokens:
+  enabled: true
+  radius_m: 0.03          # default radius; each anchor below sets its own
+  tag_at: [vit, head]     # Uni3D ViT input + action-head key PE; all tags zero-init
+  # HOW each token's 32 points are drawn from inside its radius: nearest (the
+  # reference) | fps (spread over the whole ball, 2026-09-24). Switch here.
+  sampling: fps
+  # FPS starts at a random in-radius point while TRAINING (augmentation, like
+  # the scene tokens); predict_action / inference always starts at the nearest.
+  fps_random_start: true
+  # pad point = FK tip projected onto the finger axis, then this far out along
+  # the pad normal. 9 mm = where the index..pinky CAD tips already sit.
+  pad_offset_m: 0.009
+  # ANCHOR SET, 30 per frame, order entry -> hand -> finger. Geometry and
+  # types: R3D/r3d/common/real_preprocess.py ANCHOR_TYPES. The dataset and the
+  # inference server read THIS list (interpolated below / off the checkpoint).
+  anchors:
+    # pad_mid at the REFERENCE radius: the tip token moved onto the pad. Same
+    # point as the FK tip on index..pinky; the thumb moves 9 mm onto its pad.
+    - {type: pad_mid,   radius_m: 0.03}
+    - {type: axial,     radius_m: 0.03}    # pad point + 3 cm, beyond the tip
+    - {type: pad_front, radius_m: 0.03}    # pad point + 1.5 cm along the pad normal
+
+# No simulator in this checkout -- train.py sets this to None and every use
+# site guards on it, so we get train/val loss only and no rollout metrics.
+env_runner: null
+
+dataset:
+  _target_: r3d.dataset.real_multicam_dataset.RealMultiCamDataset
+  # train.py chdirs to the repo root, so these are relative to ~/R3D-Policy
+  zarr_path: R3D/data/real_bimanual_mixed150.zarr
+  preprocess_config: R3D/r3d/config/preprocess/real_bimanual.yaml
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  # One file == one episode == one trajectory, WITH a reset between takes
+  # (80traj_seperate, 2026-08-12). create_indices clamps windows inside their
+  # episode, so no cross-reset window is sampled. Nothing to split or merge.
+  #
+  # Hinges on the reset: without one (the old ~5-per-file scheme) terminal and
+  # initial states alias, and pad_after end-padding teaches "hold still" at
+  # both -- failing as "it never starts". Measured here, start poses cluster to
+  # std 0.032 m while |start(n+1) - end(n)| = 0.29 m. No aliasing.
+  #
+  # val is a divergence tripwire, not a checkpoint selector (env_runner is
+  # sim-only; real checkpoints get picked on the robot). 4 of 80 reads cleanly
+  # -- episodes, not windows, set the noise floor -- without spending more of a
+  # small dataset. The paper's 0.02 is a copied default, identical for
+  # 1000-demo ManiSkill and 50-demo RoboTwin, and yields only 2 here.
+  val_ratio: 0.05
+  max_train_episodes: null
+
+  # Extrinsics randomization: per camera, redrawn per sampled window, constant
+  # across the window. Validation always fuses at the nominal calibration.
+  #
+  # MEASURED, not guessed. charuco_calib/flex_randomization.py recovers the true
+  # per-view camera pose from the 251-view joint calibration -- within a placement
+  # the board is fixed, so pinning it and reading the disagreement back out gives
+  # the real scatter about the deployed extrinsic: 3.15 mm / 0.48 deg per axis on
+  # the left wrist, 2.52 mm / 0.42 deg on the right. 4 mm / 0.7 deg covers both,
+  # with margin for tails heavier than Gaussian (max |dp| 15.6 mm ~ 4.9 sigma).
+  # The scatter is almost entirely WITHIN a placement, i.e. it tracks arm
+  # attitude: this is bracket flex, and no amount of recalibration removes it.
+  #
+  # Do NOT set these from inspect_zarr's inter-camera NN distance. The two wrist
+  # cameras view largely different surfaces, so that metric has no correspondence
+  # and scales with its own 5 cm search cutoff -- median/cap holds near 0.5 from a
+  # 10 mm cap to a 200 mm one. It measures the cutoff, not misregistration.
+  use_extrinsics_randomization: false
+  extrinsics_rot_sigma_deg: 0.7
+  extrinsics_trans_sigma_m: 0.004
+  anchor_first_camera: true
+  fuse_method: random
+  fuse_device: cpu   # runs in dataloader workers; 'random' does not need a GPU
+
+  # Fuse (and load) only the frames the policy actually encodes: dp3.py:335
+  # slices observations to n_obs_steps, so the other `horizon - n_obs_steps`
+  # are built and thrown away. This also feeds SequenceSampler's `key_first_k`,
+  # which stops them being copied out of the replay buffer at all.
+  # `dataset_obs_steps` is declared in every policy config and was the intended
+  # plumbing for exactly this; it had no consumer until now.
+  # Requires policy.obs_as_global_cond: true, which is the default.
+  n_obs_steps: ${dataset_obs_steps}
+
+  use_data_augmentation: ${data_augmentation.use_augmentation}
+  pc_xyz_noise_std: ${data_augmentation.pc_xyz_noise_std}
+  pc_rgb_noise_std: ${data_augmentation.pc_rgb_noise_std}
+  agent_pos_noise_std: ${data_augmentation.agent_pos_noise_std}
+  use_color_jitter: ${data_augmentation.use_color_jitter}
+  brightness_range: ${data_augmentation.brightness_range}
+  contrast_range: ${data_augmentation.contrast_range}
+  saturation_range: ${data_augmentation.saturation_range}
+  use_target_ee: ${policy.use_target_ee}
+
+  camera_onehot: true
+  fingertips:
+    fk_config: R3D/r3d/config/preprocess/orcahand_v1b_fk.yaml
+    anchors: ${task.fingertip_tokens.anchors}
+    pad_offset_m: ${task.fingertip_tokens.pad_offset_m}

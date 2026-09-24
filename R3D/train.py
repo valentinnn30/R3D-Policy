@@ -419,6 +419,16 @@ class TrainDP3Workspace:
                             for li, v in enumerate(pooled.tolist()):
                                 step_log[f'ft_attn_mass_layer{li}'] = v
                             step_log['ft_attn_mass_uniform'] = ft["uniform"] * ft["mass"].shape[-1]
+                            if "type_idx" in ft:
+                                # anchor-set run: per anchor type, layer mean,
+                                # against that type's own uniform level
+                                for ti, name in enumerate(ft["type_names"]):
+                                    sel = ft["type_idx"] == ti
+                                    if sel.any():
+                                        step_log[f'ft_attn_mass_{name}'] = \
+                                            ft["mass"][..., sel].sum(-1).mean().item()
+                                        step_log[f'ft_attn_mass_{name}_uniform'] = \
+                                            ft["uniform"] * int(sel.sum())
 
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
@@ -444,7 +454,9 @@ class TrainDP3Workspace:
                 step_log['test_mean_score'] = - train_loss
                 
             # checkpoint (only save on main process)
-            if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt and is_main_process():
+            # epoch > 0: epochs count from 0, so without it every run also saves
+            # an untrained 0.ckpt (~2 GB) next to the ones actually wanted.
+            if self.epoch > 0 and (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt and is_main_process():
                 if not cfg.policy.use_pc_color:
                     # Build checkpoint save path
                     base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')

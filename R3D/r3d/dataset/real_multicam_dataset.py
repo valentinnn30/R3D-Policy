@@ -37,6 +37,7 @@ from termcolor import cprint
 
 from r3d.common.pytorch_util import dict_apply
 from r3d.common.real_preprocess import (
+    DEFAULT_PAD_OFFSET_M,
     HandFK,
     PointCloudPreprocessConfig,
     fuse_cameras,
@@ -234,7 +235,17 @@ class RealMultiCamDataset(BaseDataset):
         keys += [k for k in self.per_frame_extrinsics if k]
         if self.use_target_ee:
             keys.append("target_ee")
-        self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
+        # create_from_path, NOT copy_from_path: read the zarr off disk through
+        # the OS page cache instead of holding a private ~12.6 GiB copy per
+        # process. Concurrent runs on one machine then share ONE cached copy,
+        # and the kernel evicts it under pressure instead of OOM-killing.
+        # Needs a zarr with one chunk PER FRAME (rechunk_zarr_per_frame.py):
+        # with the converter's 100-frame chunks every 2-frame window would
+        # decompress ~50x what it uses.
+        self.replay_buffer = ReplayBuffer.create_from_path(zarr_path, mode="r")
+        # The on-disk buffer exposes EVERY array in the zarr, and SequenceSampler
+        # slices all of replay_buffer.keys() unless told otherwise.
+        self._buffer_keys = keys
 
         # Stop the sampler copying observation frames the policy will discard.
         # At 3 cameras x 4096 points that is ~4.7 MB per sample sliced out of the
@@ -257,6 +268,7 @@ class RealMultiCamDataset(BaseDataset):
             mask=~val_mask, max_n=max_train_episodes, seed=seed)
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
+            keys=self._buffer_keys,
             sequence_length=horizon,
             pad_before=pad_before,
             pad_after=pad_after,
@@ -293,6 +305,12 @@ class RealMultiCamDataset(BaseDataset):
         self.camera_ids = [int(k.replace("point_cloud_cam", "")) for k in self.cam_keys]
         if fingertips:
             self.hand_fk = HandFK(fingertips["fk_config"])
+            # Anchor SET (real_preprocess.ANCHOR_TYPES); mirrored from the
+            # task's fingertip_tokens block so the encoder reads the same list.
+            spec = fingertips.get("anchors")
+            self.anchor_kwargs = {} if spec is None else {
+                "spec": [dict(e) for e in spec],
+                "pad_offset_m": float(fingertips.get("pad_offset_m", DEFAULT_PAD_OFFSET_M))}
             # T_link8<-cam per side, by NAME: the flange pose is recovered from
             # the per-frame wrist extrinsic, i.e. the same joint-FK route that
             # placed that camera's cloud.
@@ -309,17 +327,19 @@ class RealMultiCamDataset(BaseDataset):
                "cyan")
 
     def _fingertip_anchors(self, sample, t):
-        """(10, 3) world fingertips for window frame t -- from the NOMINAL
+        """(n_anchors, 3) world anchors for window frame t -- from the NOMINAL
         flange (camera perturbations model calibration error; the robot itself
-        does not move) and the CLEAN state (before agent_pos noise)."""
+        does not move) and the CLEAN state (before agent_pos noise). No
+        `anchors` spec: the 10 reference fingertips."""
         link8 = {side: self._nominal_at(sample, i, t) @ inv_he
                  for side, (i, inv_he) in self.flange_cam.items()}
-        return self.hand_fk.anchors(link8, sample["state"][t])
+        return self.hand_fk.anchors(link8, sample["state"][t], **self.anchor_kwargs)
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
+            keys=self._buffer_keys,
             sequence_length=self.horizon,
             pad_before=self.pad_before,
             pad_after=self.pad_after,

@@ -580,6 +580,71 @@ def _axis_angle_matrix(axis, theta) -> np.ndarray:
     return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
 
 
+# Anchor SETS (2026-09-24). A spec is a list of entries {type, fingers?,
+# radius_m?, offset_m?}; the anchors come out entry -> side -> finger, so the
+# spec [{type: tip}] is exactly the original [L thumb..pinky, R thumb..pinky].
+# Geometry lives in the DISTAL frame of each finger: `a` = finger axis (local
+# +z, toward the tip), `n` = pad normal (last flexion axis x a; flexion is
+# positive on every orca joint, so this is the palm side), `s` = pad point =
+# the tip projected onto the axis, then `pad_offset_m` out along n. The
+# index..pinky CAD tips already sit 9 mm to the pad side, so with the default
+# 9 mm s == tip there; the thumb tip is on the axis and moves out to its pad.
+#
+#   tip        FK tip (the reference run)
+#   pad_back   s + offset * a   (default -1.5 cm)  \
+#   pad_mid    s                                    > the tip cluster
+#   pad_tip    s + offset * a   (default +1.5 cm)  /
+#   axial      s + offset * a   (default +3 cm)    beyond the tip, along the finger
+#   pad_front  s + offset * n   (default +1.5 cm)  off the pad, along its normal
+#   pinch      (s_thumb + s_finger) / 2, per listed non-thumb finger
+ANCHOR_TYPES = ("tip", "pad_back", "pad_mid", "pad_tip", "axial", "pad_front", "pinch")
+_ANCHOR_DEFAULT_OFFSET = {"pad_back": -0.015, "pad_mid": 0.0, "pad_tip": 0.015,
+                          "axial": 0.03, "pad_front": 0.015}
+DEFAULT_PAD_OFFSET_M = 0.009
+DEFAULT_ANCHOR_RADIUS_M = 0.03
+
+
+def normalize_anchor_spec(anchors, default_radius_m=DEFAULT_ANCHOR_RADIUS_M):
+    """Validated entries with every field filled. `None` -> the reference [tip]."""
+    if anchors is None:
+        anchors = [{"type": "tip"}]
+    out = []
+    for e in anchors:
+        e = dict(e)
+        t = e.pop("type")
+        if t not in ANCHOR_TYPES:
+            raise ValueError(f"unknown anchor type {t!r}; known {ANCHOR_TYPES}")
+        default_fingers = HAND_FINGERS[1:3] if t == "pinch" else HAND_FINGERS
+        fingers = tuple(e.pop("fingers", default_fingers))
+        if not fingers or not set(fingers) <= set(HAND_FINGERS) or len(set(fingers)) != len(fingers):
+            raise ValueError(f"anchor {t}: bad fingers {fingers}")
+        if t == "pinch" and "thumb" in fingers:
+            raise ValueError("pinch fingers are the thumb's PARTNERS; list them without the thumb")
+        radius = float(e.pop("radius_m", default_radius_m))
+        if not radius > 0:
+            raise ValueError(f"anchor {t}: radius_m must be > 0")
+        offset = e.pop("offset_m", _ANCHOR_DEFAULT_OFFSET.get(t))
+        if offset is not None and t in ("tip", "pinch"):
+            raise ValueError(f"anchor {t} takes no offset_m")
+        if e:
+            raise ValueError(f"anchor {t}: unknown keys {sorted(e)}")
+        out.append({"type": t, "fingers": fingers, "radius_m": radius,
+                    "offset_m": None if offset is None else float(offset)})
+    return out
+
+
+def anchor_layout(entries):
+    """Per anchor, in output order: (hand_idx, finger_idx, type_idx, radius_m).
+    A pinch anchor carries its non-thumb partner's finger id."""
+    lay = []
+    for e in entries:
+        for h in range(len(HandFK.SIDES)):
+            for f in e["fingers"]:
+                lay.append((h, HAND_FINGERS.index(f), ANCHOR_TYPES.index(e["type"]),
+                            e["radius_m"]))
+    return lay
+
+
 class HandFK:
     """Fingertip FK for both orca hands, from `orcahand_v1b_fk.yaml`."""
 
@@ -604,6 +669,28 @@ class HandFK:
                 raise ValueError(f"{path}: {side} mount is not a proper rotation")
             self.mount[side] = M
             self.tips[side] = [h["tips"][f] for f in HAND_FINGERS]
+        self.distal = {side: [self._distal_geometry(c) for c in self.tips[side]]
+                       for side in self.SIDES}
+
+    @staticmethod
+    def _distal_geometry(chain):
+        """(n_local, d_n) of one finger: the pad normal in the distal frame and
+        the tip's offset along it. The distal frame is the frame after the LAST
+        joint; everything after it must be a pure translation (rpy 0), so the
+        full chain's rotation IS the distal frame."""
+        last = max(i for i, e in enumerate(chain) if "joint" in e)
+        trail = chain[last + 1:]
+        if any(np.any(np.asarray(e["rpy"], dtype=np.float64) != 0) for e in trail):
+            raise ValueError("fingertip chain: rotation after the last joint")
+        d = np.sum([np.asarray(e["xyz"], dtype=np.float64) for e in trail], axis=0)
+        z = np.array([0.0, 0.0, 1.0])
+        if not (d[2] > 0 and abs(d[1]) < 1e-9):
+            raise ValueError(f"fingertip chain: distal offset {d} is not along +z")
+        n = np.cross(np.asarray(chain[last]["axis"], dtype=np.float64), z)
+        if np.linalg.norm(n) < 0.9:
+            raise ValueError("fingertip chain: last joint axis is not perpendicular to the finger")
+        n = n / np.linalg.norm(n)
+        return n, float(d @ n)
 
     @staticmethod
     def _eval_chain(chain, q) -> np.ndarray:
@@ -629,19 +716,67 @@ class HandFK:
         M = self.mount[side]
         return np.stack([(M @ self._eval_chain(c, q))[:3, 3] for c in self.tips[side]])
 
-    def anchors(self, T_world_link8: dict, agent_pos) -> np.ndarray:
-        """(10, 3) world fingertips, [L thumb..pinky, R thumb..pinky].
+    def distal_link8(self, side: str, q, pad_offset_m=DEFAULT_PAD_OFFSET_M):
+        """Per finger (thumb..pinky), in link8: tip, pad point s, axis a, pad
+        normal n -- each (5, 3). See ANCHOR_TYPES for the geometry."""
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        if q.shape != (len(HAND_JOINT_ORDER),):
+            raise ValueError(f"{side} hand needs {len(HAND_JOINT_ORDER)} angles, got {q.shape}")
+        M = self.mount[side]
+        tip, pad, a, n = [], [], [], []
+        for chain, (n_loc, d_n) in zip(self.tips[side], self.distal[side]):
+            T = M @ self._eval_chain(chain, q)
+            R = T[:3, :3]
+            nw = R @ n_loc
+            tip.append(T[:3, 3])
+            pad.append(T[:3, 3] + (pad_offset_m - d_n) * nw)
+            a.append(R[:, 2])
+            n.append(nw)
+        return np.stack(tip), np.stack(pad), np.stack(a), np.stack(n)
+
+    def anchors(self, T_world_link8: dict, agent_pos, spec=None,
+                pad_offset_m=DEFAULT_PAD_OFFSET_M) -> np.ndarray:
+        """World anchors. `spec=None`: (10, 3) fingertips, [L thumb..pinky,
+        R thumb..pinky] -- the reference, computed exactly as before. Else
+        (n_anchors, 3) in `anchor_layout(normalize_anchor_spec(spec))` order.
 
         `T_world_link8` maps 'left'/'right' to the flange pose that placed that
         side's wrist cloud; `agent_pos` is the 48-vector (hand angles in rad).
         """
         agent_pos = np.asarray(agent_pos, dtype=np.float64).reshape(-1)
-        out = []
+        if spec is None:
+            out = []
+            for side in self.SIDES:
+                T = np.asarray(T_world_link8[side], dtype=np.float64)
+                p = self.tips_link8(side, agent_pos[HAND_STATE_SLICES[side]])
+                out.append(p @ T[:3, :3].T + T[:3, 3])
+            return np.concatenate(out, axis=0)
+
+        entries = normalize_anchor_spec(spec)
+        geo = {}
         for side in self.SIDES:
             T = np.asarray(T_world_link8[side], dtype=np.float64)
-            p = self.tips_link8(side, agent_pos[HAND_STATE_SLICES[side]])
-            out.append(p @ T[:3, :3].T + T[:3, 3])
-        return np.concatenate(out, axis=0)
+            R, t = T[:3, :3], T[:3, 3]
+            tip, pad, a, n = self.distal_link8(
+                side, agent_pos[HAND_STATE_SLICES[side]], pad_offset_m)
+            geo[side] = (tip @ R.T + t, pad @ R.T + t, a @ R.T, n @ R.T)
+        out = []
+        for e in entries:
+            typ, off = e["type"], e["offset_m"]
+            for side in self.SIDES:
+                tip, pad, a, n = geo[side]
+                for f in e["fingers"]:
+                    i = HAND_FINGERS.index(f)
+                    if typ == "tip":
+                        p = tip[i]
+                    elif typ == "pinch":
+                        p = 0.5 * (pad[0] + pad[i])
+                    elif typ == "pad_front":
+                        p = pad[i] + off * n[i]
+                    else:  # pad_back / pad_mid / pad_tip / axial: along the finger
+                        p = pad[i] + off * a[i]
+                    out.append(p)
+        return np.stack(out)
 
 
 def depth_to_point_cloud(

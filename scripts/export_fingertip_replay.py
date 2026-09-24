@@ -36,9 +36,40 @@ import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "R3D"))
 from r3d.common.real_preprocess import (  # noqa: E402
-    HAND_FINGERS, HAND_STATE_SLICES, HandFK, PointCloudPreprocessConfig, fuse_cameras)
+    ANCHOR_TYPES, HAND_FINGERS, HAND_STATE_SLICES, HandFK, PointCloudPreprocessConfig,
+    anchor_layout, fuse_cameras, normalize_anchor_spec)
+
+# The ANCHOR SET of the 2026-09-24 variants: every type, run F's list plus
+# the reference tip. Published on ~/anchor_set, one RViz namespace per type.
+ANCHOR_SET = [{"type": "tip", "radius_m": 0.03},
+              {"type": "pad_back", "radius_m": 0.03},
+              {"type": "pad_mid", "radius_m": 0.03},
+              {"type": "pad_tip", "radius_m": 0.03},
+              {"type": "axial", "radius_m": 0.03},
+              {"type": "pad_front", "radius_m": 0.03},
+              {"type": "pinch", "fingers": ["index", "middle", "ring"], "radius_m": 0.03}]
 
 K_GROUP = 32  # group_size of the encoder
+FPS_CANDIDATES = 512  # fingertip_tokens.fps_candidates default
+
+
+def pick_patch(dist_row, radius, sampling, xyz, n_cand=FPS_CANDIDATES):
+    """The encoder's draw for one anchor: indices of up to K_GROUP in-radius
+    points. nearest = the K nearest; fps = farthest-point sampling over the
+    n_cand nearest in-radius points, starting at the nearest one (the
+    encoder's deterministic rule; float ties may pick differently)."""
+    order = np.argsort(dist_row)[:n_cand if sampling == "fps" else K_GROUP]
+    cand = order[dist_row[order] <= radius]
+    if sampling == "nearest" or len(cand) <= K_GROUP:
+        return cand[:K_GROUP]
+    p = xyz[cand].astype(np.float64)
+    chosen = [0]
+    d = ((p - p[0]) ** 2).sum(1)
+    for _ in range(K_GROUP - 1):
+        j = int(d.argmax())
+        chosen.append(j)
+        d = np.minimum(d, ((p - p[j]) ** 2).sum(1))
+    return cand[chosen]
 
 
 def main():
@@ -50,8 +81,30 @@ def main():
     ap.add_argument("--fk", default="R3D/r3d/config/preprocess/orcahand_v1b_fk.yaml")
     ap.add_argument("--radius", type=float, default=0.03)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pad-offset", type=float, default=0.009,
+                    help="anchor set: FK tip -> pad surface along the pad normal [m]")
+    ap.add_argument("--task", default=None,
+                    help="anchor set of ONE run: a task yaml name, e.g. "
+                         "real_bimanual_fingertip_F (its anchors, radii and pad offset). "
+                         "Default: every anchor type (ANCHOR_SET above)")
+    ap.add_argument("--sampling", choices=("nearest", "fps"), default=None,
+                    help="anchor-set patch draw; default: the task's "
+                         "fingertip_tokens.sampling, else nearest")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    set_spec, pad_offset, set_name = ANCHOR_SET, args.pad_offset, "all types"
+    sampling = "nearest"
+    if args.task:
+        tdoc = yaml.safe_load(open(f"R3D/r3d/config/task/{args.task}.yaml"))
+        ftc = tdoc.get("fingertip_tokens") or {}
+        # no anchors key = the legacy 10 tips (reference, A); no block at all = K
+        set_spec = ftc.get("anchors") or (
+            [{"type": "tip", "radius_m": float(ftc.get("radius_m", 0.03))}] if ftc else [])
+        pad_offset = float(ftc.get("pad_offset_m", args.pad_offset))
+        sampling = str(ftc.get("sampling", "nearest"))
+        set_name = args.task
+    if args.sampling:
+        sampling = args.sampling
 
     cfg = PointCloudPreprocessConfig.from_yaml(args.preprocess)
     raw = yaml.safe_load(open(args.preprocess))
@@ -87,6 +140,14 @@ def main():
     link8 = np.zeros((T, 2, 4, 4), np.float64)
     q_meas = np.zeros((T, 2, 17), np.float32)
     q_cmd = np.zeros((T, 2, 17), np.float32)
+    set_lay = anchor_layout(normalize_anchor_spec(set_spec)) if set_spec else []
+    n_set = len(set_lay)
+    set_r = np.array([r for *_, r in set_lay])
+    anchor_set = np.zeros((T, n_set, 3), np.float32)
+    # the encoder's grouping for every set anchor: nearest K_GROUP within ITS radius
+    set_patch = np.full((T, n_set, K_GROUP), -1, np.int32)
+    set_nvalid = np.zeros((T, n_set), np.int16)
+    set_empty = np.zeros((T, n_set), bool)
 
     for k, t in enumerate(frames):
         clouds = [np.asarray(root[f"data/point_cloud_cam{i}"][t]) for i in range(n_cam)]
@@ -107,6 +168,16 @@ def main():
         cmd[14:48] = action[14:48]
         anchors[k] = fk.anchors(L8, state)
         anchors_cmd[k] = fk.anchors(L8, cmd)
+        if n_set:
+            anchor_set[k] = fk.anchors(L8, state, spec=set_spec, pad_offset_m=pad_offset)
+            ds = np.linalg.norm(fused[None, :, :3] - anchor_set[k][:, None, :], axis=-1)
+            ins = np.all((anchor_set[k] >= lo) & (anchor_set[k] <= hi), axis=1)
+            for a in range(n_set):
+                sel = pick_patch(ds[a], set_r[a], sampling, fused[:, :3])
+                set_nvalid[k, a] = len(sel)
+                set_empty[k, a] = len(sel) == 0 or not ins[a]
+                if not set_empty[k, a]:
+                    set_patch[k, a, :len(sel)] = sel
         for j, s in enumerate(HandFK.SIDES):
             link8[k, j] = L8[s]
             q_meas[k, j] = state[HAND_STATE_SLICES[s]]
@@ -135,7 +206,15 @@ def main():
         episode=args.episode, control_hz=float(root["meta"].attrs.get("control_hz", 20.0)),
         radius=args.radius, camera_names=np.array(names),
         sides=np.array(HandFK.SIDES), fingers=np.array(HAND_FINGERS),
-        fk_config=os.path.abspath(args.fk), zarr=os.path.abspath(args.zarr))
+        fk_config=os.path.abspath(args.fk), zarr=os.path.abspath(args.zarr),
+        anchor_set=anchor_set, anchor_set_types=np.array(ANCHOR_TYPES),
+        anchor_set_type=np.array([t for _, _, t, _ in set_lay]),
+        anchor_set_hand=np.array([h for h, *_ in set_lay]),
+        anchor_set_finger=np.array([f for _, f, _, _ in set_lay]),
+        anchor_set_radius=set_r, anchor_set_patch=set_patch,
+        anchor_set_nvalid=set_nvalid, anchor_set_empty=set_empty,
+        anchor_set_name=f"{set_name}, sampling {sampling}", anchor_set_sampling=sampling,
+        pad_offset=pad_offset)
     print(f"wrote {out}  ({os.path.getsize(out) / 1e6:.1f} MB)")
 
 

@@ -418,12 +418,15 @@ def write_zarr(out_path, clouds, nominals, states, actions, target_ees,
     data, meta = root.create_group("data"), root.create_group("meta")
     comp = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
 
-    def put(group, name, arr, dtype="float32"):
+    def put(group, name, arr, dtype="float32", frames_per_chunk=100):
         group.create_dataset(name, data=arr, dtype=dtype,
-                             chunks=(100,) + arr.shape[1:], compressor=comp)
+                             chunks=(frames_per_chunk,) + arr.shape[1:], compressor=comp)
 
     for i, name in enumerate(cam_names):
-        put(data, f"point_cloud_cam{i}", clouds[name])
+        # One chunk per frame: the dataset reads 2-frame windows off disk
+        # (create_from_path), so a 100-frame chunk would decompress 50x what
+        # is used.
+        put(data, f"point_cloud_cam{i}", clouds[name], frames_per_chunk=1)
         # The nominal extrinsics travel with the data: fusion cannot be
         # reproduced without them, at training time or on the robot. A wrist
         # camera needs one matrix per frame, a static one needs a single matrix.

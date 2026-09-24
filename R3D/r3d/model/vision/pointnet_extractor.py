@@ -801,12 +801,54 @@ class Uni3DPointcloudEncoder(nn.Module):
             raise ValueError(f"fingertip_tokens.tag_at must be a non-empty subset of "
                              f"{self.TAG_SITES}, got {tag_at}")
         self.fingertip_tag_at = tag_at
-        self.n_tips = self.N_HANDS * self.N_FINGERS
         self.fingertip_radius_m = float(cfg.get("radius_m", 0.03))
-        idx = torch.arange(self.n_tips)
-        # anchor order [L thumb..pinky, R thumb..pinky] (real_preprocess.HandFK)
-        self.register_buffer("ft_hand_idx", idx // self.N_FINGERS, persistent=False)
-        self.register_buffer("ft_finger_idx", idx % self.N_FINGERS, persistent=False)
+        # HOW the K points of a patch are drawn from inside its radius:
+        #   nearest -- the K nearest (the reference; what every FPS patch does)
+        #   fps     -- farthest-point sampling over up to `fps_candidates`
+        #              nearest in-radius points, in METRES, starting at the
+        #              point nearest the centre (deterministic: training and
+        #              inference draw identically). Spreads the K points over
+        #              the whole ball instead of its dense core.
+        self.ft_sampling = str(cfg.get("sampling", "nearest"))
+        if self.ft_sampling not in ("nearest", "fps"):
+            raise ValueError(f"fingertip_tokens.sampling must be nearest | fps, "
+                             f"got {self.ft_sampling!r}")
+        self.ft_fps_candidates = int(cfg.get("fps_candidates", 512))
+        # fps only: start the FPS at a RANDOM in-radius point while training
+        # (eval=False) -- a fresh, still evenly spread draw of the same ball
+        # every step, like the scene tokens' fps_random_config. eval=True
+        # (predict_action, i.e. inference) always starts at the nearest point.
+        self.ft_fps_random_start = bool(cfg.get("fps_random_start", False))
+        if self.ft_fps_random_start and self.ft_sampling != "fps":
+            raise ValueError("fingertip_tokens.fps_random_start needs sampling: fps")
+        if self.ft_fps_candidates < self.group_size:
+            raise ValueError("fingertip_tokens.fps_candidates must be >= group_size")
+        # `anchors` absent: the reference run -- 10 tips, one radius, no type
+        # tag, state_dict unchanged (old checkpoints load). Present: an anchor
+        # SET (real_preprocess.ANCHOR_TYPES), in anchor_layout order.
+        self.ft_anchor_spec = cfg.get("anchors")
+        if self.ft_anchor_spec is None:
+            self.n_tips = self.N_HANDS * self.N_FINGERS
+            idx = torch.arange(self.n_tips)
+            # anchor order [L thumb..pinky, R thumb..pinky] (real_preprocess.HandFK)
+            hand_idx, finger_idx = idx // self.N_FINGERS, idx % self.N_FINGERS
+            self.ft_type_names = None
+        else:
+            from r3d.common.real_preprocess import (
+                ANCHOR_TYPES, normalize_anchor_spec, anchor_layout)
+            entries = normalize_anchor_spec(
+                [dict(e) for e in self.ft_anchor_spec], self.fingertip_radius_m)
+            lay = anchor_layout(entries)
+            self.n_tips = len(lay)
+            hand_idx = torch.tensor([h for h, _, _, _ in lay])
+            finger_idx = torch.tensor([f for _, f, _, _ in lay])
+            self.ft_type_names = ANCHOR_TYPES
+            self.register_buffer("ft_type_idx", torch.tensor([t for _, _, t, _ in lay]),
+                                 persistent=False)
+            self.register_buffer("ft_radius", torch.tensor([r for *_, r in lay]),
+                                 persistent=False)
+        self.register_buffer("ft_hand_idx", hand_idx, persistent=False)
+        self.register_buffer("ft_finger_idx", finger_idx, persistent=False)
 
         Dv, Dh = self.transformer_dim, self.embed_dim
         # All zero-init: at step 0 the tags change nothing; training decides.
@@ -819,6 +861,15 @@ class Uni3DPointcloudEncoder(nn.Module):
             self.ft_tip_head = nn.Parameter(torch.zeros(Dh))
             self.ft_hand_head = nn.Parameter(torch.zeros(self.N_HANDS, Dh))
             self.ft_finger_head = nn.Parameter(torch.zeros(self.N_FINGERS, Dh))
+        # Anchor TYPE (tip / pad cluster / axial / pad_front / pinch): without
+        # it a pinch token and the tip token of its partner finger would carry
+        # identical tags. Zero-init like the rest; only in an anchor-set run.
+        if self.ft_type_names is not None:
+            n_types = len(self.ft_type_names)
+            if "vit" in tag_at:
+                self.ft_type_vit = nn.Parameter(torch.zeros(n_types, Dv))
+            if "head" in tag_at:
+                self.ft_type_head = nn.Parameter(torch.zeros(n_types, Dh))
 
         # Metres per normalized unit, per axis. The encoder sees NORMALIZED
         # coordinates and the workspace normalizer is anisotropic (0.65/1.0/
@@ -829,7 +880,9 @@ class Uni3DPointcloudEncoder(nn.Module):
         self.register_buffer("xyz_half_range_set", torch.zeros((), dtype=torch.bool))
         self.fingertip_cfg = dict(cfg)
         cprint(f"[Uni3DPointcloudEncoder] fingertip tokens: {self.n_tips}, "
-               f"radius {self.fingertip_radius_m * 100:.1f} cm, tag at {tag_at}", "red")
+               f"radius {self.fingertip_radius_m * 100:.1f} cm, tag at {tag_at}, "
+               f"sampling {self.ft_sampling}"
+               f"{' (random start in training)' if self.ft_fps_random_start else ''}", "red")
 
     def set_xyz_half_range(self, half_range):
         half_range = torch.as_tensor(half_range, dtype=torch.float32).flatten()
@@ -842,9 +895,12 @@ class Uni3DPointcloudEncoder(nn.Module):
         tip = getattr(self, f"ft_tip_{site}")
         hand = getattr(self, f"ft_hand_{site}")[self.ft_hand_idx]
         finger = getattr(self, f"ft_finger_{site}")[self.ft_finger_idx]
-        return tip + hand + finger  # [n_tips, D]
+        tag = tip + hand + finger  # [n_tips, D]
+        if self.ft_type_names is not None:
+            tag = tag + getattr(self, f"ft_type_{site}")[self.ft_type_idx]
+        return tag
 
-    def _fingertip_patches(self, pts, feats, anchors):
+    def _fingertip_patches(self, pts, feats, anchors, eval=True):
         """Anchored radius patches.
 
         pts [B, N, 3] and anchors [B, T, 3] are NORMALIZED; feats [B, N, C].
@@ -854,6 +910,7 @@ class Uni3DPointcloudEncoder(nn.Module):
         * neighbours are chosen by METRIC distance (radius_m), never a point
           beyond it: plain kNN always returns K points and would fill an
           occluded fingertip with palm / table;
+        * which K: the nearest, or FPS-spread over the ball (`sampling`);
         * empty slots are refilled by cycling the in-radius neighbours --
           the patch encoder max-pools, so duplicates are exactly neutral;
         * features are the same NORMALIZED relative coords + channels an FPS
@@ -871,19 +928,40 @@ class Uni3DPointcloudEncoder(nn.Module):
         inside = (anchors.abs() <= 1.0).all(-1)                    # [B, T]
         centers = anchors.clamp(-1.0, 1.0)
         hr = self.xyz_half_range.to(pts.dtype)
+        T = anchors.shape[1]
         with torch.no_grad():
-            dist, idx = knn_points(anchors * hr, pts * hr, K, sorted=True)  # metres
-            valid = dist <= self.fingertip_radius_m                # sorted -> prefix
+            # nearest: exactly K candidates; fps: a larger pool to spread over
+            Kc = K if self.ft_sampling == "nearest" else min(self.ft_fps_candidates, N)
+            dist, idx = knn_points(anchors * hr, pts * hr, Kc, sorted=True)  # metres
+            # per-anchor radius in an anchor-set run, else the one scalar
+            radius = (self.ft_radius.to(dist.dtype)[None, :, None]
+                      if self.ft_type_names is not None else self.fingertip_radius_m)
+            valid = dist <= radius                                 # sorted -> prefix
             n_valid = valid.sum(-1)                                # [B, T]
-            slot = torch.arange(K, device=pts.device).expand(B, anchors.shape[1], K)
-            fill = slot % n_valid.clamp(min=1).unsqueeze(-1)
-            idx = torch.gather(idx, 2, fill)
+            slot = torch.arange(K, device=pts.device).expand(B, T, K)
+            if self.ft_sampling == "nearest":
+                fill = slot % n_valid.clamp(min=1).unsqueeze(-1)
+                idx = torch.gather(idx, 2, fill)
+            else:
+                # FPS over the in-radius prefix of each candidate list, in
+                # metres. Start at candidate 0 (the nearest point) -> the draw
+                # is deterministic -- or, training with fps_random_start, at a
+                # random in-radius point. Short patches come back -1 padded
+                # after min(n, K) picks; refill by cycling, as above.
+                cand = torch.gather((pts * hr).unsqueeze(1).expand(B, T, N, 3), 2,
+                                    idx.unsqueeze(-1).expand(-1, -1, -1, 3))
+                _, pick = sample_farthest_points(
+                    cand.reshape(B * T, Kc, 3).float(),
+                    lengths=n_valid.reshape(-1).clamp(min=1), K=K,
+                    random_start_point=self.ft_fps_random_start and not eval)
+                n_pick = n_valid.clamp(min=1, max=K).reshape(-1, 1)
+                pick = torch.gather(pick, 1, slot.reshape(B * T, K) % n_pick)
+                idx = torch.gather(idx, 2, pick.reshape(B, T, K))
         empty = (n_valid == 0) | ~inside
 
         flat = idx.reshape(B, -1)                                  # [B, T*K]
         nbr_xyz = torch.gather(pts, 1, flat.unsqueeze(-1).expand(-1, -1, 3))
         nbr_feat = torch.gather(feats, 1, flat.unsqueeze(-1).expand(-1, -1, feats.shape[-1]))
-        T = anchors.shape[1]
         nbr_xyz = nbr_xyz.reshape(B, T, K, 3) - centers.unsqueeze(2)
         nbr_feat = nbr_feat.reshape(B, T, K, -1)
         emb = self.patch_embed.patch_encoder(torch.cat([nbr_xyz, nbr_feat], dim=-1))
@@ -940,6 +1018,9 @@ class Uni3DPointcloudEncoder(nn.Module):
         if (anchors is not None) != (self.fingertip_cfg is not None):
             raise ValueError("fingertip anchors given to an encoder without fingertip "
                              "tokens, or missing for one that has them")
+        if anchors is not None and anchors.shape[1] != self.n_tips:
+            raise ValueError(f"encoder built for {self.n_tips} fingertip anchors, "
+                             f"got {anchors.shape[1]} (anchor spec mismatch)")
         if pcd.shape[-1] != self.point_channels:
             raise ValueError(f"encoder built for {self.point_channels} point channels, "
                              f"got {pcd.shape[-1]}")
@@ -963,7 +1044,7 @@ class Uni3DPointcloudEncoder(nn.Module):
             # After the dropout on purpose: a dropped point is moved onto point
             # 0, far away, so the metric radius test excludes it by itself.
             ft_emb, ft_centers, ft_empty = self._fingertip_patches(
-                pts, colors, anchors.to(pts.dtype))
+                pts, colors, anchors.to(pts.dtype), eval=eval)
             ft_emb = self.patch_proj(ft_emb)
             ft_emb = torch.where(ft_empty.unsqueeze(-1),
                                  self.ft_empty.to(ft_emb.dtype).expand_as(ft_emb), ft_emb)

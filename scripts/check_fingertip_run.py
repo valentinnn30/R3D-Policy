@@ -19,6 +19,12 @@
     pretrained load widens conv1, zero tags are a no-op.
 [5] full Hydra compose of task=real_bimanual_fingertip: compute_loss +
     backward, predict_action, attention mass; and the width guard fires.
+[4b] anchor SETS (2026-09-24), synthetic: per-anchor radius honoured, the
+    type tag moves only its own type's tokens, anchor-count guard.
+[6] the six variant tasks real_bimanual_fingertip_{A,B,C,D,F,K}: Hydra compose,
+    dataset anchors (shape + independent recompute), policy loss / backward /
+    predict / attention mass, token layout; and the REFERENCE checkpoint
+    (fingertip_150/300.ckpt) still loads strict into the reference policy.
 
 One ReplayBuffer is ~12 GiB, so exactly ONE dataset is constructed; the
 flags-off variant is a copy.copy sharing it.
@@ -286,6 +292,147 @@ def section4():
           and torch.equal(x2, x))
 
 
+def section4b():
+    print("\n[4b] anchor-set encoder (synthetic)")
+    from r3d.model.vision.pointnet_extractor import Uni3DPointcloudEncoder
+    common = dict(pc_model="eva02_tiny_patch14_224", pc_feat_dim=192, embed_dim=256,
+                  group_size=32, num_group=64, patch_dropout=0, drop_path_rate=0.0,
+                  pretrained_pc=None, pc_encoder_dim=512, normalization_type="layer_norm",
+                  feature_mode="pointsam", use_pretrained_weights=False, point_channels=9,
+                  fps_random_config={"use_random": False, "random_start": False,
+                                     "random_noise_scale": 0, "shuffle_output": False})
+    spec = [{"type": "pad_mid", "radius_m": 0.015}, {"type": "tip", "radius_m": 0.03},
+            {"type": "pinch", "fingers": ["index"], "radius_m": 0.03}]
+    torch.manual_seed(0)
+    ef = Uni3DPointcloudEncoder(fingertip_tokens={"enabled": True, "radius_m": 0.03,
+                                                  "tag_at": ["vit", "head"],
+                                                  "anchors": spec}, **common).eval()
+    hr = torch.tensor([0.325, 0.5, 0.3])
+    ef.set_xyz_half_range(hr)
+    T = ef.n_tips
+    check("anchor count 10 + 10 + 2 = 22", T == 22)
+    check("type tags exist and are zero-init",
+          ef.ft_type_vit.shape[0] == len(rp.ANCHOR_TYPES)
+          and torch.all(ef.ft_type_vit == 0).item() and torch.all(ef.ft_type_head == 0).item())
+    lay = rp.anchor_layout(rp.normalize_anchor_spec(spec))
+    check("encoder per-anchor ids == anchor_layout",
+          ef.ft_hand_idx.tolist() == [h for h, *_ in lay]
+          and ef.ft_finger_idx.tolist() == [f for _, f, *_ in lay]
+          and ef.ft_type_idx.tolist() == [t for _, _, t, _ in lay])
+    g = torch.Generator().manual_seed(5)
+    B, N = 1, 4096
+    pts = torch.rand(B, N, 3, generator=g) * 2 - 1
+    anchors = (torch.rand(B, T, 3, generator=g) - 0.5)
+    # a shell of points at 2 cm (metric) around every anchor: inside a 3 cm
+    # radius, outside a 1.5 cm one
+    d = torch.randn(T, 20, 3, generator=g)
+    d = d / d.norm(dim=-1, keepdim=True) * 0.02
+    pts[0, :T * 20] = (anchors[0, :, None, :] + d / hr).reshape(-1, 3)
+    near = [(((pts[0] - anchors[0, t]) * hr).norm(dim=-1) < 0.015).any().item() for t in range(T)]
+    feats = torch.rand(B, N, 6, generator=g)
+    with torch.no_grad():
+        _, _, empty = ef._fingertip_patches(pts, feats, anchors)
+    r = ef.ft_radius
+    want = [(r[t] < 0.02).item() and not near[t] for t in range(T)]
+    check("per-anchor radius: 1.5 cm anchors empty, 3 cm anchors hit the 2 cm shell",
+          empty[0].tolist() == want, f"{sum(want)} of {T} expected empty")
+    with torch.no_grad():
+        x, pe = ef(torch.cat([pts, feats], -1), eval=True, anchors=anchors)
+        pinch = rp.ANCHOR_TYPES.index("pinch")
+        ef.ft_type_head[pinch].fill_(0.5)
+        _, pe2 = ef(torch.cat([pts, feats], -1), eval=True, anchors=anchors)
+        ef.ft_type_head.zero_()
+    moved = [not torch.equal(pe2[0, 64 + t], pe[0, 64 + t]) for t in range(T)]
+    check("pinch type tag moves only the pinch tokens",
+          moved == [ti == pinch for ti in ef.ft_type_idx.tolist()]
+          and torch.equal(pe2[:, :64], pe[:, :64]))
+    try:
+        ef(torch.cat([pts, feats], -1), eval=True, anchors=anchors[:, :10])
+        check("anchor-count guard: 10 anchors into a 22-anchor encoder raises", False)
+    except ValueError:
+        check("anchor-count guard: 10 anchors into a 22-anchor encoder raises", True)
+
+    # --- sampling: fps (2026-09-24) ------------------------------------
+    sys.path.insert(0, str(REPO / "scripts"))
+    from export_fingertip_replay import pick_patch
+    torch.manual_seed(0)
+    efn = Uni3DPointcloudEncoder(fingertip_tokens={"enabled": True, "radius_m": 0.03,
+                                                   "tag_at": ["vit", "head"],
+                                                   "anchors": [{"type": "tip"}]},
+                                 **common).eval()
+    torch.manual_seed(0)
+    eff = Uni3DPointcloudEncoder(fingertip_tokens={"enabled": True, "radius_m": 0.03,
+                                                   "tag_at": ["vit", "head"],
+                                                   "anchors": [{"type": "tip"}],
+                                                   "sampling": "fps"}, **common).eval()
+    for e in (efn, eff):
+        e.set_xyz_half_range(hr)
+    g = torch.Generator().manual_seed(9)
+    P = torch.rand(1, 4096, 3, generator=g) * 2 - 1
+    A = (torch.rand(1, 10, 3, generator=g) - 0.5)
+    # dense core (0.5 cm) + sparse shell (2-2.9 cm) around each anchor, and
+    # anchor 9 with only 5 in-radius points
+    for t in range(10):
+        n_core, n_shell = (150, 60) if t < 9 else (5, 0)
+        core = torch.randn(n_core, 3, generator=g) * 0.005
+        sh = torch.randn(n_shell, 3, generator=g)
+        sh = sh / sh.norm(dim=-1, keepdim=True) * (0.02 + 0.009 * torch.rand(n_shell, 1, generator=g))
+        blob = A[0, t] + torch.cat([core, sh]) / hr
+        P[0, t * 210:t * 210 + len(blob)] = blob
+    F6 = torch.rand(1, 4096, 6, generator=g)
+    hrP, hrA = (P * hr)[0].numpy(), (A * hr)[0].numpy()
+
+    with torch.no_grad():
+        embn, _, _ = efn._fingertip_patches(P, F6, A)
+        embf, _, emf = eff._fingertip_patches(P, F6, A)
+    check("fps: embeddings differ from nearest (a different draw)",
+          not torch.allclose(embn, embf))
+    # independent numpy draw -> encode -> must equal the encoder's fps embedding
+    ok_same, ok_rad, spread = True, True, []
+    for t in range(10):
+        d = np.linalg.norm(hrP - hrA[t], axis=1)
+        sel_f = pick_patch(d, 0.03, "fps", hrP)
+        sel_n = pick_patch(d, 0.03, "nearest", hrP)
+        ok_rad &= bool(np.all(d[sel_f] <= 0.03))
+        spread.append((d[sel_f].mean(), d[sel_n].mean()))
+        sel = torch.as_tensor(sel_f)
+        reps = torch.arange(32) % len(sel)
+        rel = P[0, sel[reps]] - A[0, t].clamp(-1, 1)
+        one = eff.patch_embed.patch_encoder(torch.cat([rel, F6[0, sel[reps]]], -1)[None, None])
+        ok_same &= torch.allclose(one[0, 0], embf[0, t], atol=1e-5)
+    check("fps: encoder draw == independent numpy draw (replay) on all 10 patches", ok_same)
+    check("fps: no point beyond the radius", ok_rad)
+    sf, sn = np.mean([a for a, _ in spread]), np.mean([b for _, b in spread])
+    check("fps spreads over the ball: mean distance to centre > nearest's",
+          sf > 1.5 * sn, f"fps {sf * 100:.2f} cm vs nearest {sn * 100:.2f} cm")
+    check("fps: short patch (5 in radius) not empty, refilled", not bool(emf[0, 9]))
+
+    # fps_random_start: random only when training (eval=False)
+    torch.manual_seed(0)
+    efr = Uni3DPointcloudEncoder(fingertip_tokens={"enabled": True, "radius_m": 0.03,
+                                                   "tag_at": ["vit", "head"],
+                                                   "anchors": [{"type": "tip"}],
+                                                   "sampling": "fps",
+                                                   "fps_random_start": True}, **common).eval()
+    efr.load_state_dict(eff.state_dict())
+    efr.set_xyz_half_range(hr)
+    with torch.no_grad():
+        ev = [efr._fingertip_patches(P, F6, A, eval=True)[0] for _ in range(3)]
+        tr = [efr._fingertip_patches(P, F6, A, eval=False)[0] for _ in range(3)]
+    check("fps_random_start: eval draw deterministic and == the fixed-start draw",
+          all(torch.equal(e, embf) for e in ev))
+    check("fps_random_start: training draws differ from step to step",
+          not torch.allclose(tr[0], tr[1]) and not torch.allclose(tr[1], tr[2]))
+    check("fps_random_start: short patch still not empty in training",
+          not bool(efr._fingertip_patches(P, F6, A, eval=False)[2][0, 9]))
+    try:
+        Uni3DPointcloudEncoder(fingertip_tokens={"enabled": True, "tag_at": ["vit"],
+                                                 "fps_random_start": True}, **common)
+        check("fps_random_start without sampling fps raises", False)
+    except ValueError:
+        check("fps_random_start without sampling fps raises", True)
+
+
 def rp_knn(q, k, K=32):
     from r3d.model.vision.pointnet_extractor import knn_points
     return knn_points(q, k, K, sorted=True)
@@ -341,6 +488,123 @@ def section5(cfg, dataset, batch_size):
         check("normalizer width guard: 6-channel obs into a 9-channel policy raises", True)
 
 
+# ----------------------------------------------------------------------- [6]
+VARIANTS = {"A": 10, "B": 30, "C": 30, "D": 16, "F": 56, "K": 0}
+
+
+def section6(ds_ref, batch_size):
+    print("\n[6] variant tasks A B C D F K + the reference checkpoint")
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    import yaml
+    import zarr
+    dev = "cuda"
+    with initialize_config_dir(config_dir=str(REPO / "R3D/r3d/config"), version_base=None):
+        ref_cfg = compose(config_name="r3d_robotwin2",
+                          overrides=["task=real_bimanual_fingertip",
+                                     "task_name=real_bimanual_fingertip"])
+        cfgs = {k: compose(config_name="r3d_robotwin2",
+                           overrides=[f"task=real_bimanual_fingertip_{k}",
+                                      f"task_name=real_bimanual_fingertip_{k}"])
+                for k in VARIANTS}
+
+    # reference checkpoint loads strict into the (refactored) reference policy
+    ckpt = REPO / "R3D/data/outputs/fingertip_150/300.ckpt"
+    if ckpt.exists():
+        import dill
+        payload = torch.load(ckpt.open("rb"), pickle_module=dill, map_location="cpu",
+                             weights_only=False)
+        pol = hydra.utils.instantiate(ref_cfg.policy)
+        try:
+            pol.load_state_dict(payload["state_dicts"]["model"], strict=True)
+            check("reference checkpoint 300.ckpt loads strict", True)
+        except RuntimeError as e:
+            check("reference checkpoint 300.ckpt loads strict", False, str(e)[:300])
+        del pol, payload
+    else:
+        check("reference checkpoint present", False, str(ckpt))
+
+    root = zarr.open(ref_cfg.task.dataset.zarr_path, mode="r")
+    raw = yaml.safe_load(open(ref_cfg.task.dataset.preprocess_config))
+    he = {s: np.asarray(raw["cameras"][i]["extrinsics"]) for s, i in (("left", 1), ("right", 2))}
+    n_obs = ref_cfg.n_obs_steps
+    for k, n_anchor in VARIANTS.items():
+        cfg = cfgs[k]
+        dcfg = cfg.task.dataset
+        onehot = bool(dcfg.camera_onehot)
+        ft = dcfg.get("fingertips")
+        # the variant dataset = the reference one with its flags swapped (one buffer)
+        ds = copy.copy(ds_ref)
+        ds.camera_onehot = onehot
+        if ft is None:
+            ds.hand_fk, ds.fingertips = None, None
+        else:
+            spec = ft.get("anchors")
+            ds.anchor_kwargs = {} if spec is None else {
+                "spec": OmegaConf.to_container(spec, resolve=True),
+                "pad_offset_m": float(ft.pad_offset_m)}
+        n_ch = 9 if onehot else 6
+        meta = cfg.task.shape_meta.obs
+        np.random.seed(7)
+        smp = ds[len(ds) // 2]
+        pc = smp["obs"]["point_cloud"]
+        ok = tuple(pc.shape) == (n_obs, 8192, n_ch) and tuple(meta.point_cloud.shape) == (8192, n_ch)
+        if n_anchor:
+            an = smp["obs"]["fingertip_anchors"]
+            ok = ok and tuple(an.shape) == (n_obs, n_anchor, 3) \
+                and tuple(meta.fingertip_anchors.shape) == (n_anchor, 3)
+        else:
+            ok = ok and "fingertip_anchors" not in smp["obs"] and "fingertip_anchors" not in meta
+        check(f"{k}: dataset + shape_meta shapes (cloud {n_ch} ch, {n_anchor} anchors)", ok)
+        if n_anchor and ds.anchor_kwargs:
+            idx = len(ds) // 2
+            t0 = int(ds.sampler.indices[idx][0])
+            got = ds._fingertip_anchors(ds.sampler.sample_sequence(idx), 0)
+            link8 = {s: np.asarray(root[f"data/extrinsics_cam{i}"][t0]) @ np.linalg.inv(he[s])
+                     for s, i in (("left", 1), ("right", 2))}
+            want = rp.HandFK(ft.fk_config).anchors(
+                link8, np.asarray(root["data/state"][t0]), **ds.anchor_kwargs)
+            check(f"{k}: anchors == independent recompute from the zarr",
+                  np.allclose(got, want, atol=1e-9))
+
+        policy = hydra.utils.instantiate(cfg.policy)
+        policy.set_normalizer(ds.get_normalizer())
+        policy = policy.to(dev)
+        enc = policy.obs_encoder.extractor
+        want_g = int(cfg.task.get("num_group", 512))
+        check(f"{k}: encoder {n_ch} ch, num_group {enc.num_group}, anchors {getattr(enc, 'n_tips', 0)}",
+              enc.point_channels == n_ch and enc.num_group == want_g
+              and (enc.fingertip_cfg is not None) == bool(n_anchor)
+              and (not n_anchor or enc.n_tips == n_anchor))
+        loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+        batch = next(iter(loader))
+        batch = {"obs": {kk: v.to(dev) for kk, v in batch["obs"].items()},
+                 "action": batch["action"].to(dev)}
+        policy.train()
+        loss, _ = policy.compute_loss(batch)
+        loss.backward()
+        grads = [n for n, p in policy.named_parameters() if "ft_" in n and p.grad is None]
+        check(f"{k}: loss finite ({loss.item():.4f}), grad on every ft_ param",
+              torch.isfinite(loss).item() and not grads, f"no grad: {grads}" if grads else "")
+        policy.eval()
+        with torch.no_grad():
+            out = policy.predict_action(batch["obs"])
+        check(f"{k}: predict_action finite", torch.isfinite(out["action"]).all().item())
+        if n_anchor:
+            ftm = policy.fingertip_attention_mass(batch["obs"])
+            idx = policy.fingertip_key_indices()
+            per = 512 + n_anchor
+            check(f"{k}: attention mass {tuple(ftm['mass'].shape)}, keys at the end of each block",
+                  tuple(ftm["mass"].shape) == (batch_size, 4, n_anchor)
+                  and idx[0] == 512 and idx[n_anchor] == per + 512 and len(idx) == n_obs * n_anchor
+                  and abs(ftm["uniform"] - n_obs / (n_obs * per)) < 1e-9)
+            if k != "A":
+                check(f"{k}: per-type ids present", "type_idx" in ftm)
+        del policy
+        torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-dataset", action="store_true")
@@ -351,9 +615,11 @@ def main():
     root = zarr.open("R3D/data/real_bimanual_mixed150.zarr", mode="r")
     section1(root, cfg_pp)
     section4()
+    section4b()
     if not args.skip_dataset:
         cfg, ds = sections23(args)
         section5(cfg, ds, args.batch)
+        section6(ds, args.batch)
     print(f"\n{'ALL PASS' if not fails else f'{len(fails)} FAILED: {fails}'}")
     sys.exit(1 if fails else 0)
 
