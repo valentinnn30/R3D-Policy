@@ -457,14 +457,16 @@ class TrainDP3Workspace:
             # epoch > 0: epochs count from 0, so without it every run also saves
             # an untrained 0.ckpt (~2 GB) next to the ones actually wanted.
             if self.epoch > 0 and (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt and is_main_process():
-                if not cfg.policy.use_pc_color:
-                    # Build checkpoint save path
-                    base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
-                    save_path = os.path.join(base_checkpoint_dir, f'{self.epoch}.ckpt')
-                else:
-                    # Build checkpoint save path (with rgb)
-                    base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
-                    save_path = os.path.join(base_checkpoint_dir, f'{self.epoch}.ckpt')
+                # if not cfg.policy.use_pc_color:
+                #     # Build checkpoint save path
+                #     base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
+                #     save_path = os.path.join(base_checkpoint_dir, f'{self.epoch}.ckpt')
+                # else:
+                #     # Build checkpoint save path (with rgb)
+                #     base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
+                #     save_path = os.path.join(base_checkpoint_dir, f'{self.epoch}.ckpt')
+                base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
+                save_path = os.path.join(base_checkpoint_dir, f'{self.epoch}.ckpt')
                 self.save_checkpoint(save_path)
 
             # Synchronize all processes after checkpoint saving
