@@ -187,6 +187,12 @@ class TrainDP3Workspace:
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
 
+        # Optimizer (and so scheduler and EMA) steps already taken. global_step
+        # counts BATCHES, one step per `gradient_accumulate_every` of them (on
+        # global_step % accum == 0), so after G batches that is ceil(G / accum).
+        # 0 on a fresh run; only a resume from a checkpoint makes it non-zero.
+        n_opt_steps = -(-self.global_step // cfg.training.gradient_accumulate_every)
+
         # configure lr scheduler
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
@@ -196,8 +202,11 @@ class TrainDP3Workspace:
                 len(train_dataloader) * cfg.training.num_epochs) \
                     // cfg.training.gradient_accumulate_every,
             # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            # however huggingface diffusers steps it every batch.
+            # In OPTIMIZER steps, not batches: global_step-1 put a resumed run
+            # accum x too far along the (unclamped) cosine -- at accum 4, a
+            # resume from mid-run landed back at peak LR.
+            last_epoch=n_opt_steps-1
         )
 
         # configure ema
@@ -206,6 +215,10 @@ class TrainDP3Workspace:
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            # The decay warmup counter is not in the checkpoint; without this a
+            # resumed run restarts it at decay 0 and the first step overwrites the
+            # loaded EMA weights with the raw model.
+            ema.optimization_step = n_opt_steps
             
         # configure env
         env_runner = None
@@ -263,7 +276,8 @@ class TrainDP3Workspace:
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        # Remaining epochs, not num_epochs: a resumed run starts at self.epoch > 0.
+        for local_epoch_idx in range(cfg.training.num_epochs - self.epoch):
             # Set epoch for DistributedSampler
             if self.use_ddp and train_sampler is not None:
                 train_sampler.set_epoch(self.epoch)

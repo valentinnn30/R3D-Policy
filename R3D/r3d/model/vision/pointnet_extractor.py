@@ -198,9 +198,10 @@ class DP3Encoder(nn.Module):
         # feature: without this entry every non-cloud key becomes a low-dim MLP
         # input (and a rank-2 (10, 3) key would raise there).
         self.fingertip_key = 'fingertip_anchors'
+        self.lengths_key = 'point_cloud_len'   # robot-cut run: valid points per cloud
         self.use_fingertips = self.fingertip_key in observation_space.keys()
         ignored_obs_keys = {self.point_cloud_key, self.rgb_image_key, self.imagination_key,
-                            self.fingertip_key}
+                            self.fingertip_key, self.lengths_key}
         self.low_dim_keys = [key for key in observation_space.keys() if key not in ignored_obs_keys]
         if len(self.low_dim_keys) == 0:
             raise RuntimeError("DP3Encoder requires at least one low-dimensional observation key")
@@ -328,6 +329,13 @@ class DP3Encoder(nn.Module):
         extra = {}
         if self.use_fingertips:
             extra["anchors"] = observations[self.fingertip_key]
+        # Robot-cut run (R1, 2026-10-05): the cloud is padded after its valid
+        # points; `point_cloud_len` (B,) masks the padding out of FPS and kNN.
+        # Deliberately NOT in shape_meta, so it never gets a low-dim MLP.
+        if self.lengths_key in observations:
+            if self.pointnet_type not in ("uni3d", "uni3d_pretrained") or self.use_imagined_robot:
+                raise ValueError("point_cloud_len needs the uni3d encoder without imagined robot")
+            extra["lengths"] = observations[self.lengths_key]
         if not self.pc_encoder_extract_global_feature:
             pn_feat, pc_pe = self.extractor(points, eval, **extra)
         else:
@@ -361,12 +369,16 @@ class DP3Encoder(nn.Module):
 # PointSAM encoder components (adapted from Uni3D)
 # =============================================================================
 
-def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, shuffle_output=True):
+def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, shuffle_output=True,
+        lengths=None):
     '''
     Enhanced FPS with randomness options
     Args:
         data: B N 3 (or more channels)
         number: int, number of points to sample
+        lengths: optional (B,) count of VALID points per cloud; the rest is
+            padding (robot-cut run, 2026-10-05) and is never sampled. None ->
+            every point valid, the original behaviour.
         use_random: bool, whether to enable randomness
         random_start: bool, whether to use random starting point
         random_noise_scale: float, scale of random noise added to distances
@@ -375,14 +387,21 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
     xyz_coordinates = data[:, :, :3]
     B, N, _ = xyz_coordinates.shape
     
+    if lengths is not None:
+        lengths = lengths.to(device=data.device, dtype=torch.long).reshape(-1)
+        if lengths.shape[0] != B or bool((lengths < 1).any()) or bool((lengths > N).any()):
+            raise ValueError(f"fps lengths must be (B,) in [1, N], got {lengths}")
     if not use_random:
         # Original deterministic FPS
-        _, fps_idx = sample_farthest_points(xyz_coordinates, K=number)
+        _, fps_idx = sample_farthest_points(xyz_coordinates, lengths=lengths, K=number)
     else:
         # Enhanced FPS with randomness
         if random_start:
             # Randomly select starting points for each batch
-            start_indices = torch.randint(0, N, (B,), device=data.device)
+            if lengths is None:
+                start_indices = torch.randint(0, N, (B,), device=data.device)
+            else:   # a valid point
+                start_indices = (torch.rand(B, device=data.device) * lengths).long()
             
             # Create modified coordinates with random starting points moved to front
             modified_xyz = xyz_coordinates.clone()
@@ -401,7 +420,7 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
             noisy_xyz = modified_xyz
         
         # Perform FPS on modified/noisy coordinates
-        _, fps_idx = sample_farthest_points(noisy_xyz, K=number)
+        _, fps_idx = sample_farthest_points(noisy_xyz, lengths=lengths, K=number)
         
         # If we used random start, we need to map back the indices
         if random_start:
@@ -419,6 +438,9 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
                 perm = torch.randperm(number, device=data.device)
                 fps_idx[b] = fps_idx[b][perm]
     
+    if lengths is not None:
+        # fewer valid points than `number`: pytorch3d pads with -1 -> point 0
+        fps_idx = torch.where(fps_idx < 0, torch.zeros_like(fps_idx), fps_idx)
     # Gather the selected points using the (possibly randomized) indices
     fps_data = torch.gather(
         data, 1, fps_idx.unsqueeze(-1).long().expand(-1, -1, data.shape[-1]))
@@ -502,7 +524,7 @@ class KNNGrouper(nn.Module):
         cprint(f"[Group] FPS randomness config: {fps_random_config}", "cyan")
 
     def forward(self, xyz: torch.Tensor, features: torch.Tensor, use_fps=True,
-                num_groups=None):
+                num_groups=None, lengths=None):
         """
         Args:
             xyz: [B, N, 3]. Input point clouds.
@@ -526,8 +548,10 @@ class KNNGrouper(nn.Module):
         # can give each camera a different token budget for free.
         G = self.num_groups if num_groups is None else int(num_groups)
         with torch.no_grad():
-            centers = fps(xyz, G, **self.fps_random_config) # B G 3
-            _, knn_idx = knn_points(centers, xyz, self.group_size)  # [B, G, K]
+            # `lengths` (B,): valid points per cloud, the rest is padding (robot cut)
+            centers = fps(xyz, G, lengths=lengths, **self.fps_random_config) # B G 3
+            _, knn_idx = knn_points(centers, xyz, self.group_size,
+                                    key_lengths=lengths)  # [B, G, K]
 
         batch_offset = torch.arange(batch_size, device=xyz.device) * num_points
         batch_offset = batch_offset.reshape(-1, 1, 1)
@@ -608,8 +632,8 @@ class PatchEmbed(nn.Module):
         self.fps_random_config = fps_random_config or {}
 
     def forward(self, coords: torch.Tensor, features: torch.Tensor,
-                num_groups=None):
-        patches = self.grouper(coords, features, num_groups=num_groups)
+                num_groups=None, lengths=None):
+        patches = self.grouper(coords, features, num_groups=num_groups, lengths=lengths)
         patch_features = patches["features"]  # [B, L, K, C_in]
         x = self.patch_encoder(patch_features)
         patches["embeddings"] = x
@@ -622,6 +646,7 @@ def knn_points(
     k: int,
     sorted: bool = False,
     transpose: bool = False,
+    key_lengths: torch.Tensor = None,
 ):
     """Compute k nearest neighbors.
 
@@ -641,6 +666,11 @@ def knn_points(
         key = key.transpose(1, 2)
     # Compute pairwise distances, [B, N1, N2]
     distance = torch.cdist(query, key)
+    if key_lengths is not None:
+        # padded keys (robot-cut run) can never be a neighbour
+        pad = torch.arange(key.shape[1], device=key.device)[None, :] >= \
+            key_lengths.to(key.device).reshape(-1, 1)
+        distance = distance.masked_fill(pad[:, None, :], float("inf"))
     if k == 1:
         knn_dist, knn_ind = torch.min(distance, dim=2, keepdim=True)
     else:
@@ -1007,7 +1037,7 @@ class Uni3DPointcloudEncoder(nn.Module):
 
         cprint(f"[Uni3DPointcloudEncoder] Pretrained weights loaded: {load_weight_path}", "red")
 
-    def forward(self, pcd, eval, num_groups=None, anchors=None):
+    def forward(self, pcd, eval, num_groups=None, anchors=None, lengths=None):
         """`anchors` [B, 10, 3] (normalized) -- fingertip-token run only.
 
         The fingertip tokens are APPENDED after the FPS tokens of this frame, so
@@ -1015,6 +1045,9 @@ class Uni3DPointcloudEncoder(nn.Module):
         per-obs-step temporal encoding (num_tokens = L // n_obs_steps) still
         lines up.
         """
+        if lengths is not None and anchors is not None:
+            raise NotImplementedError("robot-cut lengths with fingertip tokens: the "
+                                      "anchor patches do not mask padding")
         if (anchors is not None) != (self.fingertip_cfg is not None):
             raise ValueError("fingertip anchors given to an encoder without fingertip "
                              "tokens, or missing for one that has them")
@@ -1031,7 +1064,9 @@ class Uni3DPointcloudEncoder(nn.Module):
         pts = pcd[..., :3].contiguous()
         colors = pcd[..., 3:].contiguous()
         # Group points into patches and get embeddings
-        patches = self.patch_embed(pts, colors, num_groups=num_groups)
+        # `lengths` (B,): valid points; padding sits AFTER them, so the dropout's
+        # "move onto point 0" target is always a valid point
+        patches = self.patch_embed(pts, colors, num_groups=num_groups, lengths=lengths)
         if isinstance(patches, list):
             patch_embed = patches[-1]["embeddings"]
             centers = patches[-1]["centers"]

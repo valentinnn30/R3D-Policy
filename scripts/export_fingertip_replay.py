@@ -19,6 +19,14 @@ _fingertip_anchors), so what RViz shows is what the model gets:
   link8        world <- {left,right}_link8, for the posed hand models
   q_meas/q_cmd the 17 hand angles per hand (rad), for the hand models
 
+With --robot-cut (2026-10-05, ~/ros2_ws/robot_cut_r1_plan.txt), also:
+  rc_label     per point KEEP/ARM/MOUNT/SHADOW/SAVED (r3d.common.robot_cut v2), from the 14
+               arm joint angles in <zarr>_joints14.npz (export_zarr_joints.py)
+  rc_tok*_c/p  token centres (G,) and their 32-NN patches (G, 32), indices into
+               `xyz`, for 512 and 568 deterministic FPS centres on the UNCUT
+               cloud and 512 on the CUT cloud -- scripts/robot_cut_tokens.py's
+               exact computation, so the replay shows what it counts
+
 The publisher (`experiments/scripts/fingertip_replay_node.py`) runs in ros_env,
 which has neither zarr nor pytorch3d -- hence this split, as for inference.
 
@@ -35,6 +43,7 @@ import yaml
 import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "R3D"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from r3d.common.real_preprocess import (  # noqa: E402
     ANCHOR_TYPES, HAND_FINGERS, HAND_STATE_SLICES, HandFK, PointCloudPreprocessConfig,
     anchor_layout, fuse_cameras, normalize_anchor_spec)
@@ -90,7 +99,11 @@ def main():
     ap.add_argument("--sampling", choices=("nearest", "fps"), default=None,
                     help="anchor-set patch draw; default: the task's "
                          "fingertip_tokens.sampling, else nearest")
+    ap.add_argument("--robot-cut", action="store_true",
+                    help="also export the robot-cut labels and token sets")
     ap.add_argument("--out", default=None)
+    from r3d.common.robot_cut import add_cli_args
+    add_cli_args(ap)
     args = ap.parse_args()
     set_spec, pad_offset, set_name = ANCHOR_SET, args.pad_offset, "all types"
     sampling = "nearest"
@@ -149,6 +162,18 @@ def main():
     set_nvalid = np.zeros((T, n_set), np.int16)
     set_empty = np.zeros((T, n_set), bool)
 
+    if args.robot_cut:
+        import json
+        from r3d.common.robot_cut import CUT_LABELS, RobotCut, default_paths, params_from_args
+        from robot_cut_tokens import token_sets
+        import torch
+        rc_params = params_from_args(args)
+        rc = RobotCut(**default_paths(), **rc_params)
+        J = np.load(args.zarr.replace(".zarr", "_joints14.npz"))["joints14"]
+        rc_label = np.zeros((T, N), np.int8)
+        rc_sets = {}
+        rc_dev = "cuda" if torch.cuda.is_available() else "cpu"
+
     for k, t in enumerate(frames):
         clouds = [np.asarray(root[f"data/point_cloud_cam{i}"][t]) for i in range(n_cam)]
         Ts = [statics[i] if i in statics else
@@ -193,8 +218,23 @@ def main():
             empty[k, a] = len(sel) == 0 or not inside[a]
             if not empty[k, a]:
                 patch_idx[k, a, :len(sel)] = sel
+        if args.robot_cut:
+            rc_label[k] = rc.labels(fused[:, :3], J[t], np.asarray(root["data/state"][t]), cam[k])
         if k % 50 == 0:
             print(f"  frame {k}/{T}", flush=True)
+
+    rc_out = {}
+    if args.robot_cut:
+        for s in range(0, T, 64):
+            sl = slice(s, min(s + 64, T))
+            for name, (c, p) in token_sets(xyz[sl], ~np.isin(rc_label[sl], CUT_LABELS), rc_dev).items():
+                rc_sets.setdefault(name, ([], []))
+                rc_sets[name][0].append(c.astype(np.int16))
+                rc_sets[name][1].append(p.astype(np.int16))
+        rc_out = {"rc_label": rc_label, "rc_params": json.dumps(rc_params)}
+        for name, (c, p) in rc_sets.items():
+            rc_out[f"rc_{name}_c"] = np.concatenate(c)
+            rc_out[f"rc_{name}_p"] = np.concatenate(p)
 
     out = args.out or f"R3D/data/outputs/fingertip_replay/ep{args.episode:03d}.npz"
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -214,7 +254,7 @@ def main():
         anchor_set_radius=set_r, anchor_set_patch=set_patch,
         anchor_set_nvalid=set_nvalid, anchor_set_empty=set_empty,
         anchor_set_name=f"{set_name}, sampling {sampling}", anchor_set_sampling=sampling,
-        pad_offset=pad_offset)
+        pad_offset=pad_offset, **rc_out)
     print(f"wrote {out}  ({os.path.getsize(out) / 1e6:.1f} MB)")
 
 

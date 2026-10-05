@@ -170,6 +170,13 @@ class RealMultiCamDataset(BaseDataset):
             # ~/ros2_ws/fingertip_tokens_design_rationale.txt.
             camera_onehot=False,
             fingertips=None,
+            # Robot-cut run (R1, 2026-10-05; ~/ros2_ws/robot_cut_r1_plan.txt).
+            # {labels: <sidecar zarr from scripts/precompute_robot_cut.py>} ->
+            # after the UNCHANGED stage-2 draw, the points labelled cut are
+            # dropped; the cloud is re-padded (copies of its first point) to
+            # num_points and `point_cloud_len` gives the valid count, which
+            # masks the padding out of the encoder's FPS and kNN. None -> off.
+            robot_cut=None,
             ):
         super().__init__()
 
@@ -190,6 +197,7 @@ class RealMultiCamDataset(BaseDataset):
 
         self._setup_fingertip_run(zarr_path, preprocess_config, cameras,
                                   camera_onehot, fingertips)
+        self._setup_robot_cut(zarr_path, robot_cut)
 
         self.use_target_ee = use_target_ee
         self.use_data_augmentation = use_data_augmentation
@@ -326,6 +334,63 @@ class RealMultiCamDataset(BaseDataset):
                f"fingertips={'on (' + fingertips['fk_config'] + ')' if fingertips else 'off'}",
                "cyan")
 
+    def _setup_robot_cut(self, zarr_path, robot_cut):
+        """Load the precomputed per-STORED-point cut mask (all frames, in RAM:
+        ~0.5 GB of bool for mixed150, shared copy-on-write by the workers)."""
+        self.robot_cut = None
+        if not robot_cut:
+            return
+        if not self.FUSES:
+            raise NotImplementedError("robot_cut is built for the FUSED pipeline only")
+        from r3d.common.robot_cut import CUT_LABELS
+        path = robot_cut["labels"]
+        side = zarr.open(path, mode="r")
+        if not side.attrs.get("complete", False):
+            raise RuntimeError(f"{path} is incomplete -- rerun scripts/precompute_robot_cut.py")
+        root = zarr.open(zarr_path, mode="r")
+        if list(side.attrs["camera_names"]) != list(root["meta"].attrs["camera_names"]):
+            raise ValueError(f"{path} camera_names do not match {zarr_path}")
+        # the task's params are what INFERENCE rebuilds the cut from, so they
+        # must be exactly the ones the labels were computed with
+        import json
+        stored = json.loads(side.attrs["params"])
+        wanted = dict(robot_cut.get("params") or {})
+        if wanted != stored:
+            raise ValueError(f"robot_cut.params {wanted} != the labels' params {stored} "
+                             f"({path}); rerun precompute_robot_cut.py with them")
+        masks = []
+        for k in self.cam_keys:
+            gi = int(k.replace("point_cloud_cam", ""))
+            lab = side[f"labels_cam{gi}"]
+            if lab.shape != root[f"data/{k}"].shape[:2]:
+                raise ValueError(f"{path} labels_cam{gi} {lab.shape} != {k} "
+                                 f"{root[f'data/{k}'].shape[:2]}")
+            masks.append(np.isin(lab[:], CUT_LABELS))
+        self.robot_cut = {"labels": path, "params": side.attrs["params"], "cut": masks}
+        frac = np.mean([m.mean() for m in masks])
+        cprint(f"Robot cut ON: {path}\n  params {side.attrs['params']}\n"
+               f"  {100 * frac:.1f}% of stored points labelled cut", "cyan")
+
+    def _window_frames(self, idx):
+        """Absolute zarr frame of each window position, with the sampler's
+        edge padding (repeat first / last frame) -- see SequenceSampler."""
+        b0, b1, s0, s1 = self.sampler.indices[idx]
+        p = np.arange(self.horizon)
+        return np.where(p < s0, b0, np.where(p >= s1, b1 - 1, b0 + p - s0))
+
+    def _cut_and_pad(self, fused):
+        """Drop the rows whose carried label (LAST column) says cut; pad the
+        rest back to num_points with copies of the first valid point."""
+        keep = fused[:, -1] < 0.5
+        pts = fused[keep, :-1]
+        n = len(pts)
+        if n == 0:
+            raise RuntimeError("robot cut removed every point of a frame")
+        out = np.empty((self.pc_cfg.num_points, pts.shape[1]), dtype=fused.dtype)
+        out[:n] = pts
+        out[n:] = pts[0]
+        return out, n
+
     def _fingertip_anchors(self, sample, t):
         """(n_anchors, 3) world anchors for window frame t -- from the NOMINAL
         flange (camera perturbations model calibration error; the robot itself
@@ -444,7 +509,7 @@ class RealMultiCamDataset(BaseDataset):
             return self.static_extrinsics[i]
         return np.asarray(sample[key][t], dtype=np.float64)
 
-    def _sample_to_data(self, sample, rng):
+    def _sample_to_data(self, sample, rng, frames=None):
         joint_action = sample["action"].astype(np.float32)
         if self.use_target_ee:
             action = np.concatenate(
@@ -463,8 +528,13 @@ class RealMultiCamDataset(BaseDataset):
         deltas = self._sample_deltas(rng)
         onehot = ({"camera_ids": self.camera_ids, "n_cameras": self.n_cameras}
                   if self.camera_onehot else {})
-        point_cloud = np.stack([
-            fuse_cameras(
+        if self.robot_cut is not None and frames is None:
+            raise RuntimeError("robot_cut needs the window's frame indices")
+        clouds, lengths = [], []
+        for t in range(n_steps):
+            labels = ({"point_labels": [m[frames[t]] for m in self.robot_cut["cut"]]}
+                      if self.robot_cut is not None else {})
+            fused = fuse_cameras(
                 [sample[k][t] for k in self.cam_keys],
                 [self._nominal_at(sample, i, t) @ deltas[i]
                  for i in range(len(self.cam_keys))],
@@ -472,11 +542,16 @@ class RealMultiCamDataset(BaseDataset):
                 method=self.fuse_method,
                 rng=rng,
                 device=self.fuse_device,
-                **onehot)
-            for t in range(n_steps)
-        ]).astype(np.float32)
+                **onehot, **labels)
+            if self.robot_cut is not None:
+                fused, n = self._cut_and_pad(fused)
+                lengths.append(n)
+            clouds.append(fused)
+        point_cloud = np.stack(clouds).astype(np.float32)
 
         obs = {"point_cloud": point_cloud, "agent_pos": agent_pos}
+        if self.robot_cut is not None:
+            obs["point_cloud_len"] = np.asarray(lengths, dtype=np.int64)
         if self.hand_fk is not None:
             obs["fingertip_anchors"] = np.stack(
                 [self._fingertip_anchors(sample, t) for t in range(n_steps)]
@@ -489,7 +564,8 @@ class RealMultiCamDataset(BaseDataset):
         rng = np.random.default_rng(np.random.randint(0, 2 ** 31 - 1))
 
         sample = self.sampler.sample_sequence(idx)
-        data = self._sample_to_data(sample, rng)
+        frames = self._window_frames(idx) if self.robot_cut is not None else None
+        data = self._sample_to_data(sample, rng, frames=frames)
 
         if self.use_data_augmentation:
             # rgb is 3:6, NOT 3: -- anything after it (the camera one-hot) must

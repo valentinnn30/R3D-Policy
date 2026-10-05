@@ -287,8 +287,16 @@ def fuse_cameras(
     device: str = "cuda",
     camera_ids: Optional[Sequence[int]] = None,
     n_cameras: Optional[int] = None,
+    point_labels: Optional[Sequence[np.ndarray]] = None,
 ) -> np.ndarray:
     """Fuse per-camera clouds into one (cfg.num_points, 6) cloud in base frame.
+
+    `point_labels[i]` (len(clouds_cam[i]),) -- one value per STORED point, e.g.
+    the precomputed robot-cut labels (scripts/precompute_robot_cut.py) -- is
+    carried through crop / pad / draw as the LAST column, so the caller can see
+    which drawn points it has to drop. The draw itself is unaffected (same rng
+    calls), so with the labels stripped the cloud is bit-identical to a call
+    without them. None (default) -> no extra column.
 
     `camera_ids` (the GLOBAL index of each entry of `clouds_cam`) together with
     `n_cameras` appends a per-point camera one-hot, giving (num_points,
@@ -323,6 +331,11 @@ def fuse_cameras(
             onehot = np.zeros((len(cloud), int(n_cameras)), dtype=np.float64)
             onehot[:, int(camera_ids[i])] = 1.0
             cols.append(onehot)
+        if point_labels is not None:
+            lab = np.asarray(point_labels[i], dtype=np.float64).reshape(-1, 1)
+            if len(lab) != len(cloud):
+                raise ValueError(f"camera {i}: {len(lab)} labels for {len(cloud)} points")
+            cols.append(lab)
         transformed.append(np.concatenate(cols, axis=-1))
 
     stacked = np.concatenate(transformed, axis=0)

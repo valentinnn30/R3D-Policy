@@ -290,7 +290,10 @@ class DP3(BasePolicy):
         """
         # normalize input
         self._check_obs_widths(obs_dict)
+        obs_dict, pc_len = self._split_lengths(obs_dict)
         nobs = self.normalizer.normalize(obs_dict)
+        if pc_len is not None:
+            nobs["point_cloud_len"] = pc_len
 
         # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
         #
@@ -446,6 +449,17 @@ class DP3(BasePolicy):
                     f"fingertip_anchors is {n_meta} long")
         return cfg
 
+    @staticmethod
+    def _split_lengths(obs_dict):
+        """Robot-cut run (R1, 2026-10-05): `point_cloud_len` (B, To) counts the
+        valid points of each padded cloud. It is a count, not a quantity, so it
+        bypasses the normalizer (which would KeyError on it) and goes straight
+        to the encoder, where it masks the padding out of FPS and kNN."""
+        if "point_cloud_len" not in obs_dict:
+            return obs_dict, None
+        rest = {k: v for k, v in obs_dict.items() if k != "point_cloud_len"}
+        return rest, obs_dict["point_cloud_len"].long()
+
     def _check_obs_widths(self, obs_dict):
         """LinearNormalizer reshapes to (-1, width) and does NOT raise on a
         mismatch whenever N*C divides evenly -- it silently scrambles channels
@@ -524,7 +538,10 @@ class DP3(BasePolicy):
         # normalize input
         obs_dict = batch['obs']
         self._check_obs_widths(obs_dict)
+        obs_dict, pc_len = self._split_lengths(obs_dict)
         nobs = self.normalizer.normalize(obs_dict)
+        if pc_len is not None:
+            nobs["point_cloud_len"] = pc_len
 
         # Clip point cloud to ensure it's within [-1-1e-6, 1+1e-6].
         #
