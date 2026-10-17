@@ -1,0 +1,63 @@
+# Sim baseline for the token-allocation study (CLAUDE.md "Sim baseline").
+# RoboTwin2 aloha-agilex, right arm only, HEAD camera only, stock workspace +
+# table crop, 1024 stored points, 128 encoder tokens. No learned crop.
+#
+#   bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0
+#
+# `task_name` (the RoboTwin task) and `setting` (the RoboTwin task config) come
+# from the launcher. `setting` matters beyond the name: train.py passes it to
+# env_runner.run() as the task config, overriding env_runner.task_config.
+name: ${task_name}-${setting}
+
+# 128 tokens x 32 points = 4096 patch slots over 1024 points = 4x coverage.
+# Read by r3d_robotwin2.yaml: num_group: ${oc.select:task.num_group,512}
+num_group: 128
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [1024, 6]
+      type: point_cloud
+    agent_pos:
+      shape: [14]
+      type: low_dim
+  action:
+    shape: [14]
+
+env_runner:
+  _target_: r3d.env_runner.robotwin2_runner.RoboTwin2Runner
+  output_dir: ${hydra:run.dir}
+  task_name: ${task_name}
+  seed: 0
+  eval_episodes: 100
+  max_steps: 2000
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  task_config: sim_head_p1024   # SAME config as collection: identical crop + FPS
+  instruction_type: unseen
+  action_space_type: joint
+  head_camera_type: D435
+  save_video: true
+  tqdm_interval_sec: 5.0
+
+dataset:
+  _target_: r3d.dataset.robotwin_sim_dataset.RobotwinSimDataset
+  zarr_path: R3D/data/${task.name}-50.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  # Stock R3D RoboTwin augmentation (the first commit of r3d_robotwin2.yaml), NOT
+  # the policy yaml's data_augmentation block: those values were re-measured for
+  # our real cameras. agent_pos here is joint radians, hence 0.0002.
+  use_data_augmentation: true
+  pc_xyz_noise_std: 0.002
+  pc_rgb_noise_std: 0.0
+  agent_pos_noise_std: 0.0002
+  use_color_jitter: true
+  brightness_range: [-0.125, 0.125]
+  contrast_range: [0.5, 1.5]
+  saturation_range: [0.5, 1.5]
+  use_target_ee: ${policy.use_target_ee}

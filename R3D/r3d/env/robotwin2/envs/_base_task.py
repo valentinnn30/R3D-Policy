@@ -13,6 +13,7 @@ from collections import OrderedDict
 import torch, random
 
 from .utils import *
+from .utils import point_labels
 import math
 from .robot import Robot
 from .camera import Camera
@@ -132,6 +133,11 @@ class Base_Task(gym.Env):
 
         if self.cluttered_table:
             self.get_cluttered_table()
+
+        # entity id -> semantic class, fixed for the episode (all actors exist now)
+        self._point_label_lut = None
+        if (self.data_type or {}).get("pointcloud_label", False):
+            self._point_label_lut = point_labels.build_label_lut(self)
 
         is_stable, unstable_list = self.check_stable()
         if not is_stable:
@@ -494,7 +500,14 @@ class Base_Task(gym.Env):
             pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
         # pointcloud
         if self.data_type.get("pointcloud", False):
-            pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
+            if self.data_type.get("pointcloud_label", False):
+                # per-point semantic class (utils/point_labels.py); the cloud is
+                # bit-identical to the unlabelled path
+                pkl_dic["pointcloud"], actor_ids = self.cameras.get_pcd(
+                    self.data_type.get("conbine", False), return_actor_ids=True)
+                pkl_dic["pointcloud_label"] = point_labels.ids_to_labels(actor_ids, self._point_label_lut)
+            else:
+                pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic

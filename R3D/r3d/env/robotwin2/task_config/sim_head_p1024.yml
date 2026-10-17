@@ -1,0 +1,61 @@
+# Sim baseline for the token-allocation study (see CLAUDE.md "Sim baseline").
+# demo_clean + head camera only + per-point semantic labels. Used by BOTH data
+# collection and the env_runner, so training and evaluation see the identical
+# crop -> FPS-1024 pipeline (camera.py get_pcd).
+render_freq: 0
+episode_num: 50
+use_seed: false
+save_freq: 15
+embodiment: [aloha-agilex]
+language_num: 100
+domain_randomization:
+  random_background: false
+  cluttered_table: false
+  clean_background_rate: 1
+  random_head_camera_dis: 0
+  random_table_height: 0
+  random_light: false
+  crazy_random_light_rate: 0
+camera:
+  head_camera_type: D435
+  wrist_camera_type: D435
+  collect_head_camera: true
+  collect_wrist_camera: false   # head camera only
+  # Far side of the table, facing the robot (2026-10-17). The stock aloha head pose
+  # (-0.032, -0.45, 1.35) loses the cup at x >~ 0.24 and sees the right arm only once
+  # it reaches; raising it behind the robot's head occludes the table, and a steep
+  # top-down view hides the cup under the gripper. This pose keeps the cup in view
+  # in every frame and sees right-arm links 1-8.
+  head_camera_pose:
+    position: [0.0, 0.30, 1.75]
+    look_at: [0.0, -0.15, 0.80]
+data_type:
+  rgb: true                     # head rgb, for the episode videos only
+  third_view: false
+  depth: false
+  pointcloud: true
+  pointcloud_label: true        # per-point class, utils/point_labels.py
+  observer: false
+  endpose: true
+  qpos: true
+  mesh_segmentation: false
+  actor_segmentation: false
+pcd_down_sample_num: 1024
+pcd_crop: true
+# Crop box, world frame, metres. Also defines the point-cloud normalizer
+# (RobotwinSimDataset, via the zarr's meta.attrs) -- changing it invalidates
+# checkpoints. Static, never-relevant geometry is cut HERE, not left for the
+# token-allocation method (cutting static clutter is not a claim). Measured with
+# check_head_view.py (2026-10-17):
+#   z >= 0.748   table top 0.74 AND the pinned coaster (top 0.7474; sim depth is
+#                exact, so 0.6 mm margin); the cup loses only its bottom rim
+#   x >= -0.10   the idle left arm/gripper (stored at x <= -0.21)
+#   y >= -0.32   the robot torso / front plate between the arms (y -0.50..-0.34,
+#                z <= 0.94): 0% of it survives. Costs 36% of right-arm points --
+#                the near-base links, which barely move; gripper and cup 100% kept
+#   z <= 1.30    the arm stays below ~1.22 m; 2.0 wasted 2/3 of normalized z
+bbox: [[-0.10, -0.32, 0.748], [0.60, 0.35, 1.30]]
+save_path: ./data
+clear_cache_freq: 5
+collect_data: true
+eval_video_log: true

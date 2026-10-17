@@ -56,6 +56,9 @@ class Camera:
         self.wrist_camera_type = kwags["camera"].get("wrist_camera_type", "D435")
 
         self.collect_head_camera = kwags["camera"].get("collect_head_camera", True)
+        # Optional {position: [x,y,z], look_at: [x,y,z]} replacing the embodiment's
+        # head-camera pose (world frame, camera kept upright). None = stock pose.
+        self.head_camera_pose = kwags["camera"].get("head_camera_pose", None)
         self.collect_wrist_camera = kwags["camera"].get("collect_wrist_camera", True)
 
         # embodiment = kwags.get('embodiment')
@@ -184,6 +187,15 @@ class Camera:
                 if self.collect_head_camera:
                     self.head_camera_id = i
                     camera_info["type"] = self.head_camera_type
+                    if self.head_camera_pose is not None:
+                        # copy: static_camera_info_list is the embodiment config, shared across episodes
+                        pos = np.asarray(self.head_camera_pose["position"], dtype=float)
+                        fwd = np.asarray(self.head_camera_pose["look_at"], dtype=float) - pos
+                        fwd /= np.linalg.norm(fwd)
+                        left = np.cross([0.0, 0.0, 1.0], fwd)
+                        left /= np.linalg.norm(left)
+                        camera_info = dict(camera_info, position=pos.tolist(), forward=fwd.tolist(),
+                                           left=left.tolist())
                     # camera, sensor_camera, camera_config = create_camera(camera_info)
                     camera, camera_config = create_camera(camera_info,
                                                           random_head_camera_dis=self.random_head_camera_dis)
@@ -464,6 +476,7 @@ class Camera:
             valid_mask = position[..., 3] < 1
             points_opengl = position[..., :3][valid_mask]
             points_color = rgba[valid_mask][:, :3]
+            points_id = actor_id[valid_mask] if return_actor_ids else None
             # Transform into the world coordinate system.
             points_world = (torch.bmm(
                 points_opengl.view(1, -1, 3),
@@ -493,12 +506,21 @@ class Camera:
         return pcd_array
 
     # Get Camera PointCloud
-    def get_pcd(self, if_combine=False):
+    def get_pcd(self, if_combine=False, return_actor_ids=False):
+        """Fused world-frame cloud, cropped to `pcd_crop_bbox` and FPS'd to
+        `pcd_down_sample_num`. With `return_actor_ids` also returns, per point, the
+        actor-level segmentation id (sapien `per_scene_id`; -1 = padding), carried
+        through exactly the same valid / crop / FPS indexing as the colour. The
+        cloud itself is identical either way."""
 
         def _get_camera_pcd(camera, point_num=0):
             rgba = camera.get_picture_cuda("Color").torch()  # [H, W, 4]
             position = camera.get_picture_cuda("Position").torch()
             model_matrix = camera.get_model_matrix()
+            if return_actor_ids:
+                # channel 1 = actor-level id (see get_segmentation); [H, W]
+                actor_id = torch.from_numpy(
+                    camera.get_picture("Segmentation")[..., 1].astype(np.int64)).to(position.device)
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model_matrix = torch.tensor(model_matrix, dtype=torch.float32).to(device)
@@ -507,6 +529,7 @@ class Camera:
             valid_mask = position[..., 3] < 1
             points_opengl = position[..., :3][valid_mask]
             points_color = rgba[valid_mask][:, :3]
+            points_id = actor_id[valid_mask] if return_actor_ids else None
             # Transform into the world coordinate system.
             points_world = (torch.bmm(
                 points_opengl.view(1, -1, 3),
@@ -526,6 +549,8 @@ class Camera:
                                                                                           <= max_bound).all(dim=1)
                 points_world = points_world[inside_bounds_mask]
                 points_color = points_color[inside_bounds_mask]
+                if return_actor_ids:
+                    points_id = points_id[inside_bounds_mask]
 
             # Convert the tensor back to a NumPy array for use with Open3D.
             points_world_np = points_world.cpu().numpy()
@@ -536,7 +561,11 @@ class Camera:
                 index = index.detach().cpu().numpy()[0]
                 points_color_np = points_color_np[index, :]
 
-            return np.hstack((points_world_np, points_color_np))
+            out = np.hstack((points_world_np, points_color_np))
+            if return_actor_ids:
+                # extra column, stripped again after FPS; float64 holds ids exactly
+                out = np.hstack((out, points_id.cpu().numpy().astype(np.float64)[:, None]))
+            return out
 
         if self.head_camera_id is None:
             print("No head camera in static camera list, pointcloud save error!")
@@ -561,15 +590,19 @@ class Camera:
         elif self.collect_head_camera:
             combined_pcd = _get_camera_pcd(self.static_camera_list[self.head_camera_id])
         
+        n_col = 7 if return_actor_ids else 6
+
         def pad_array(numpy_array, target_num):
             current_num = numpy_array.shape[0]
             if current_num < target_num:
                 if current_num == 0:
-                    numpy_array = np.zeros((target_num, 6))
+                    numpy_array = np.zeros((target_num, n_col))
                 else:
                     pad_num = target_num - current_num
-                    padding = np.zeros((pad_num, 6))
+                    padding = np.zeros((pad_num, n_col))
                     numpy_array = np.vstack([numpy_array, padding])
+                if return_actor_ids:
+                    numpy_array[current_num:, 6] = -1
             return numpy_array
 
         combined_pcd = pad_array(combined_pcd, self.pcd_down_sample_num)
@@ -580,4 +613,7 @@ class Camera:
             pcd_array, index = fps(combined_pcd[:, :3], self.pcd_down_sample_num)
             index = index.detach().cpu().numpy()[0]
 
+        if return_actor_ids:
+            sel = combined_pcd[index]
+            return sel[:, :6], sel[:, 6].astype(np.int64)
         return combined_pcd[index]
