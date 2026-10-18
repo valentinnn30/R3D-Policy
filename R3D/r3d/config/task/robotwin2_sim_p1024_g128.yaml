@@ -13,6 +13,12 @@ name: ${task_name}-${setting}
 # Read by r3d_robotwin2.yaml: num_group: ${oc.select:task.num_group,512}
 num_group: 128
 
+# Oracle label cut AFTER preprocessing (r3d/common/label_cut.py), applied in
+# training (dataset) and evaluation (env_runner) alike. Classes from
+# envs/utils/point_labels.py: [5] = right arm (the gripper, 7, is kept).
+# null = no cut. E.g. task.drop_point_labels=[5]
+drop_point_labels: null
+
 shape_meta: &shape_meta
   obs:
     point_cloud:
@@ -39,6 +45,9 @@ env_runner:
   head_camera_type: D435
   save_video: true
   tqdm_interval_sec: 5.0
+  # Oracle label cut at EVALUATION, from the simulator's segmentation. Must equal
+  # dataset.drop_point_labels -- both read the top-level key below.
+  drop_point_labels: ${task.drop_point_labels}
 
 dataset:
   _target_: r3d.dataset.robotwin_sim_dataset.RobotwinSimDataset
@@ -61,3 +70,4 @@ dataset:
   contrast_range: [0.5, 1.5]
   saturation_range: [0.5, 1.5]
   use_target_ee: ${policy.use_target_ee}
+  drop_point_labels: ${task.drop_point_labels}

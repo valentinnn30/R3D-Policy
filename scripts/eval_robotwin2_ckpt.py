@@ -3,6 +3,7 @@
 
     python scripts/eval_robotwin2_ckpt.py R3D/data/outputs/sim/<run>/checkpoints/1000.ckpt
     python scripts/eval_robotwin2_ckpt.py <run>/checkpoints/{300,600,1000}.ckpt --episodes 100
+    python scripts/eval_robotwin2_ckpt.py <ckpt> --episodes 3 --render-freq 5   # live SAPIEN window
 
 Replaces `scripts/robotwin2_eval.sh`, which calls a `RoboTwin2.0_3D_policy/test.py`
 that is not in this repo. Everything (policy, env_runner, RoboTwin task + task
@@ -32,10 +33,16 @@ def main():
     ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0, help="eval seed block (not the training seed)")
     ap.add_argument("--no-video", action="store_true")
+    ap.add_argument("--render-freq", type=int, default=0,
+                    help="open the SAPIEN viewer and redraw every N sim steps (needs a display); "
+                         "only the policy's episodes, not the expert runs that validate eval seeds")
     a = ap.parse_args()
 
     ckpts = [pathlib.Path(c).resolve() for c in a.ckpts]  # before the chdir
-    os.chdir(R3D_DIR)
+    # repo root, as train.py: relative cfg paths (pretrained_weights_path
+    # "R3D/pretrain_weight", zarr paths) resolve against it. The trained ckpt
+    # overwrites the pretrained weights anyway; this only keeps the log honest.
+    os.chdir(ROOT)
     sys.path.insert(0, str(R3D_DIR))
     import dill
     import hydra
@@ -69,6 +76,16 @@ def main():
             runner = hydra.utils.instantiate(cfg.task.env_runner)
             runner_key = rk
         runner.output_dir = str(out_dir)
+        if a.render_freq > 0:
+            em = runner.env_manager
+            if not getattr(em, "_render_patched", False):
+                orig_init = em.Init_task_env
+
+                def init_with_viewer(*args, **kwargs):
+                    em.args["render_freq"] = a.render_freq
+                    return orig_init(*args, **kwargs)
+                em.Init_task_env = init_with_viewer
+                em._render_patched = True
 
         t0 = time.time()
         # NOT under torch.no_grad(): the runner validates eval seeds by running the

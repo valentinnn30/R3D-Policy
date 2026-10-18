@@ -440,6 +440,8 @@ class RoboTwin2EnvManager:
             'point_cloud': torch.from_numpy(observation['pointcloud']),
             'agent_pos': torch.from_numpy(agent_pos_vector)
         }
+        if 'pointcloud_label' in observation:  # sim per-point classes; the runner strips or applies them
+            current_obs['point_cloud_label'] = torch.from_numpy(observation['pointcloud_label'])
         obs_history.append(current_obs)
         
         # Execute second stage actions and update observation history
@@ -465,6 +467,8 @@ class RoboTwin2EnvManager:
                 'point_cloud': torch.from_numpy(observation['pointcloud']),
                 'agent_pos': torch.from_numpy(agent_pos_vector)
             }
+            if 'pointcloud_label' in observation:
+                current_obs['point_cloud_label'] = torch.from_numpy(observation['pointcloud_label'])
             obs_history.append(current_obs)
         
         # Save video frame

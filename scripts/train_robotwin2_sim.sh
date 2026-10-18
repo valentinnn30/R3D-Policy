@@ -23,7 +23,10 @@ extra_args=("${@:4}")
 task_cfg=${TASK_CFG:-robotwin2_sim_p1024_g128}
 setting=${SETTING:-sim_head_p1024}      # RoboTwin task config: collection == evaluation
 alg_name=${ALG:-r3d_robotwin2}
-epochs=${EPOCHS:-600}
+# 601, not 600: train.py counts epochs 0..N-1 and saves at epoch % checkpoint_every
+# == 0, so N=600 never writes 600.ckpt (last is 500) and the final weights are
+# lost. The real-data runs use 601 for the same reason.
+epochs=${EPOCHS:-601}
 checkpoint_every=${CHECKPOINT_EVERY:-100}
 # Effective batch 256 = R3D's RoboTwin setting. A micro-batch of 256 does NOT fit
 # a 24 GB card even at 1024 points / 128 tokens (OOM at 18.6 GiB in patch_embed,

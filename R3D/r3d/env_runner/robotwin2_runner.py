@@ -53,9 +53,13 @@ class RoboTwin2Runner(BaseRunner):
         head_camera_type: str = "D435",
         save_video: bool = True,
         tqdm_interval_sec: float = 5.0,
+        drop_point_labels=None,
         **kwargs
     ):
         super().__init__(output_dir)
+        # Sim oracle label cut (r3d/common/label_cut.py), same as the training
+        # dataset's `drop_point_labels`. None = the policy sees the cloud as is.
+        self.drop_point_labels = None if drop_point_labels is None else [int(c) for c in drop_point_labels]
 
         self.task_name = task_name
         self.task_entries = None
@@ -112,6 +116,22 @@ class RoboTwin2Runner(BaseRunner):
         for obs in obs_history:
             fixed_history.append(self._add_task_onehot(obs, task_idx, num_tasks))
         return fixed_history
+
+    def _policy_obs(self, obs):
+        """What the policy sees: the sim's per-point classes are never an input.
+        With `drop_point_labels` they cut the cloud (padded + point_cloud_len),
+        exactly as RobotwinSimDataset does in training; without, they are dropped."""
+        obs = dict(obs)
+        labels = obs.pop('point_cloud_label', None)
+        if self.drop_point_labels:
+            if labels is None:
+                raise RuntimeError("drop_point_labels needs per-point labels: set "
+                                   "data_type.pointcloud_label in the RoboTwin task config")
+            from r3d.common.label_cut import cut_points_by_label
+            pc, n = cut_points_by_label(obs['point_cloud'].numpy(), labels.numpy(), self.drop_point_labels)
+            obs['point_cloud'] = torch.from_numpy(pc)
+            obs['point_cloud_len'] = torch.tensor(n, dtype=torch.int64)
+        return obs
 
     def _agent_pos_from_observation(self, observation):
         if self.action_space_type == 'ee':
@@ -177,15 +197,18 @@ class RoboTwin2Runner(BaseRunner):
                         'point_cloud': torch.from_numpy(observation['pointcloud']),
                         'agent_pos': torch.from_numpy(agent_pos_vector),
                     }
+                    if 'pointcloud_label' in observation:
+                        current_obs['point_cloud_label'] = torch.from_numpy(observation['pointcloud_label'])
                     current_obs = self._add_task_onehot(current_obs, task_idx, num_tasks)
 
                     for _ in range(self.n_obs_steps):
                         obs_history.append(current_obs.copy())
 
                     while not done and episode_length < self.max_steps:
+                        hist = [self._policy_obs(o) for o in obs_history]
                         obs_dict = {
-                            key: torch.stack([o[key] for o in obs_history], dim=0)
-                            for key in obs_history[0].keys()
+                            key: torch.stack([o[key] for o in hist], dim=0)
+                            for key in hist[0].keys()
                         }
 
                         obs_dict_input = dict_apply(
