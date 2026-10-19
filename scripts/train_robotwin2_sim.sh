@@ -3,8 +3,9 @@
 #
 #   bash scripts/train_robotwin2_sim.sh <robotwin_task> <seed> <gpu_id> [hydra overrides...]
 #   bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0
+#   SETTING=sim_stock_p1024 bash scripts/train_robotwin2_sim.sh stack_blocks_two_fov 42 0
 #   TAG=g64 bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0 task.num_group=64
-#   TASK_CFG=robotwin2_sim_p1024_g128 EPOCHS=1000 bash scripts/train_robotwin2_sim.sh ...
+#   TASK_CFG=robotwin2_sim_p1024 EPOCHS=1001 bash scripts/train_robotwin2_sim.sh ...
 #
 # No in-loop rollouts (rollout_every > epochs): RoboTwin rollouts block training.
 # Score checkpoints afterwards with scripts/eval_robotwin2_ckpt.py.
@@ -20,7 +21,7 @@ seed=${2:?missing seed}
 gpu_id=${3:?missing gpu id}
 extra_args=("${@:4}")
 
-task_cfg=${TASK_CFG:-robotwin2_sim_p1024_g128}
+task_cfg=${TASK_CFG:-robotwin2_sim_p1024}
 setting=${SETTING:-sim_head_p1024}      # RoboTwin task config: collection == evaluation
 alg_name=${ALG:-r3d_robotwin2}
 # 601, not 600: train.py counts epochs 0..N-1 and saves at epoch % checkpoint_every

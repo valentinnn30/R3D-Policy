@@ -1,0 +1,48 @@
+# Sim task 2 (stack_blocks_two_fov): STOCK aloha head camera, both arms, head camera
+# only, per-point labels (CLAUDE.md "Sim baseline").
+# demo_clean + head camera only + per-point semantic labels. Used by BOTH data
+# collection and the env_runner, so training and evaluation see the identical
+# crop -> FPS-1024 pipeline (camera.py get_pcd).
+render_freq: 0
+episode_num: 50
+use_seed: false
+save_freq: 15
+embodiment: [aloha-agilex]
+language_num: 100
+domain_randomization:
+  random_background: false
+  cluttered_table: false
+  clean_background_rate: 1
+  random_head_camera_dis: 0
+  random_table_height: 0
+  random_light: false
+  crazy_random_light_rate: 0
+camera:
+  head_camera_type: D435
+  wrist_camera_type: D435
+  collect_head_camera: true
+  collect_wrist_camera: false   # head camera only
+data_type:
+  rgb: true                     # head rgb, for the episode videos only
+  third_view: false
+  depth: false
+  pointcloud: true
+  pointcloud_label: true        # per-point class, utils/point_labels.py
+  observer: false
+  endpose: true
+  qpos: true
+  mesh_segmentation: false
+  actor_segmentation: false
+pcd_down_sample_num: 1024
+pcd_crop: true
+# Crop box, world frame, metres. Also defines the point-cloud normalizer
+# (RobotwinSimDataset, via the zarr's meta.attrs) -- changing it invalidates
+# checkpoints. Stock table width; only the table is cut (z floor 0.7401 = 0.1 mm
+# above the 0.74 table top). No arm/torso cut: both arms are task arms, and the
+# stock head camera sees no torso inside this box. z <= 1.30: set from the view
+# check's stored z max.
+bbox: [[-0.6, -0.35, 0.7401], [0.6, 0.35, 1.30]]
+save_path: ./data
+clear_cache_freq: 5
+collect_data: true
+eval_video_log: true

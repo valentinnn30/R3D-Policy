@@ -4,11 +4,14 @@
 #   2. pick the token count whose 600-epoch success is in [30%, 40%]
 #      (several -> closest to 35%; none -> closest to 35% overall, run anyway,
 #      as decided by the user -- the choice and all numbers go to selection.json)
-#   3. train the SAME run with the right-arm points cut (oracle label cut,
-#      task.drop_point_labels=[5]): same data, seed, 600 epochs, batch 64 x 4
+#   3. train the SAME run with the arm points cut (oracle label cut,
+#      task.drop_point_labels=$DROP, default [5] = right arm): same data, seed,
+#      601 epochs (-> 600.ckpt), batch 64 x 4
 #   4. evaluate its 200/400/600 checkpoints, 50 episodes each
 #
-#   WAIT_PID=<eval_sweep pid> bash scripts/sim/after_sweep_armcut.sh
+#   WAIT_PID=<eval_sweep pid> bash scripts/sim/after_sweep_armcut.sh                  # task 1 (cup)
+#   TASK=stack_blocks_two_fov SETTING=sim_stock_p1024 DROP='[4,5]' WAIT_PID=<pid> \
+#       bash scripts/sim/after_sweep_armcut.sh                                         # task 2, both arms
 #
 # Never writes into the sweep's run dirs: the new run is TAG g<N>-armcut, its
 # eval logs and jsons live in that run's own directory.
@@ -16,6 +19,9 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 sim="${here}/R3D/data/outputs/sim"
 task=${TASK:-place_empty_cup_right}
+setting=${SETTING:-sim_head_p1024}
+drop=${DROP:-[5]}             # point_labels classes: 4 left arm, 5 right arm (grippers 6/7 kept)
+sel_file="${sim}/armcut_selection_${task}.json"
 seed=${SEED:-42}
 episodes=${EPISODES:-50}
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -45,7 +51,7 @@ g = min(pool, key=lambda k: (abs(pool[k] - 0.35), k))
 out = {"success_600": {str(k): v for k, v in sorted(res.items())}, "chosen_num_group": g,
        "rule": "600-epoch success in [0.30, 0.40]; several -> closest to 0.35; none -> closest to 0.35 overall",
        "in_range": bool(inside)}
-json.dump(out, open(f"{sim}/armcut_selection.json", "w"), indent=2)
+json.dump(out, open(f"{sim}/armcut_selection_{task}.json", "w"), indent=2)
 print(g)
 EOF
 )
@@ -53,13 +59,13 @@ if [ "${sel}" = "NONE" ] || [ -z "${sel}" ]; then
     log "no 600-epoch eval results found under ${sim} -- NOT starting the arm-cut run"
     exit 1
 fi
-log "selection: $(cat "${sim}/armcut_selection.json" | tr -d '\n' | tr -s ' ')"
+log "selection: $(cat "${sel_file}" | tr -d '\n' | tr -s ' ')"
 g=${sel}
 tag="g${g}-armcut"
 
-log "training ${tag} (task.num_group=${g} task.drop_point_labels=[5], 601 epochs -> 600.ckpt, 64 x 4)"
-TAG="${tag}" EPOCHS=601 BATCH_SIZE=64 GRAD_ACCUM=4 bash "${here}/scripts/train_robotwin2_sim.sh" \
-    "${task}" "${seed}" 0 task.num_group="${g}" "task.drop_point_labels=[5]" \
+log "training ${tag} (task.num_group=${g} task.drop_point_labels=${drop}, 601 epochs -> 600.ckpt, 64 x 4)"
+TAG="${tag}" SETTING="${setting}" EPOCHS=601 BATCH_SIZE=64 GRAD_ACCUM=4 bash "${here}/scripts/train_robotwin2_sim.sh" \
+    "${task}" "${seed}" 0 task.num_group="${g}" "task.drop_point_labels=${drop}" \
     > "${sim}/sweep_${task}_${tag}_seed${seed}.log" 2>&1
 log "training exit $?"
 

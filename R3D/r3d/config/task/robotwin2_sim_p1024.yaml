@@ -1,8 +1,10 @@
-# Sim baseline for the token-allocation study (CLAUDE.md "Sim baseline").
-# RoboTwin2 aloha-agilex, right arm only, HEAD camera only, stock workspace +
-# table crop, 1024 stored points, 128 encoder tokens. No learned crop.
+# Sim token-allocation runs (CLAUDE.md "Sim baseline"): RoboTwin2 aloha-agilex,
+# HEAD camera only, box crop from the RoboTwin task config, 1024 stored points,
+# num_group tokens (128 default; the sweep overrides it). Renamed from
+# robotwin2_sim_p1024_g128.yaml on 2026-10-18 (num_group is a sweep variable).
 #
-#   bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0
+#   bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0            # task 1
+#   SETTING=sim_stock_p1024 bash scripts/train_robotwin2_sim.sh stack_blocks_two_fov 42 0
 #
 # `task_name` (the RoboTwin task) and `setting` (the RoboTwin task config) come
 # from the launcher. `setting` matters beyond the name: train.py passes it to

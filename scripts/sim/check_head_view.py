@@ -5,6 +5,7 @@ crop cut, where do the 128 tokens land?  Run in the r3d_sim env.
     python scripts/sim/check_head_view.py                      # collect + report
     python scripts/sim/check_head_view.py --tasks place_empty_cup_right --episodes 10
     python scripts/sim/check_head_view.py --report-only        # re-analyse existing runs
+    python scripts/sim/check_head_view.py --tasks stack_blocks_two_fov --task-config sim_stock_p1024
 
 Collection is the REAL RoboTwin path (`script/collect_data.py:run` with the
 `sim_head_p1024` config), so the stored clouds and labels are exactly what data
@@ -16,6 +17,9 @@ collection writes. The only addition, in this process only, is a per-frame
     link_px      (L,)  pixels per robot link, whole image
     link_inbox   (L,)  of those, inside the crop box
     link_inimg   (L,)  link origin projects inside the image (frustum check)
+    obj_px       (O,)  pixels per task object (point_label_roles()["object"]), whole image
+    obj_inbox    (O,)  of those, inside the crop box -- per object, so "every cube
+                       visible in every frame" is checked per cube
 
 so "lost to the box" and "lost to the frustum" can be told apart.
 
@@ -36,7 +40,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 R3D_DIR = os.path.join(ROOT, "R3D")
 RT_DIR = os.path.join(R3D_DIR, "r3d", "env", "robotwin2")
 OUT_DIR = os.path.join(R3D_DIR, "data", "outputs", "sim_view")
-TASK_CONFIG = "sim_head_p1024"
+TASK_CONFIG = "sim_head_p1024"  # default; --task-config overrides
 
 
 # --------------------------------------------------------------------------- collect
@@ -75,7 +79,12 @@ def _view_stats(task, point_labels):
         pc = E[:3, :3] @ l.entity.get_pose().p + E[:3, 3]
         u, v, z = (K @ pc)
         link_inimg.append(bool(pc[2] > 0 and 0 <= u / z < W and 0 <= v / z < H))
+    objs = [e for o in task.point_label_roles().get("object", []) for e in point_labels._entities_of(o)]
+    obj_px = [int((ids == e.per_scene_id).sum()) for e in objs]
+    obj_inbox = [int(((ids == e.per_scene_id) & inbox).sum()) for e in objs]
     return {
+        "obj_px": np.asarray(obj_px),
+        "obj_inbox": np.asarray(obj_inbox),
         "class_px": np.bincount(lab, minlength=C),
         "class_inbox": np.bincount(lab[inbox], minlength=C),
         "link_px": np.asarray(link_px),
@@ -84,7 +93,7 @@ def _view_stats(task, point_labels):
     }
 
 
-def collect(task_name, n_episodes):
+def collect(task_name, n_episodes, task_config=TASK_CONFIG):
     os.chdir(RT_DIR)
     # same search path RoboTwin2EnvManager sets up: envs/ is imported both as a
     # package and flat (envs/utils/get_camera_config.py: `from _GLOBAL_CONFIGS import`)
@@ -110,10 +119,10 @@ def collect(task_name, n_episodes):
 
     _base_task.Base_Task.get_obs = get_obs
 
-    with open(os.path.join(CONFIGS_PATH, f"{TASK_CONFIG}.yml")) as f:
+    with open(os.path.join(CONFIGS_PATH, f"{task_config}.yml")) as f:
         args = yaml.safe_load(f)
     args["task_name"] = task_name
-    args["task_config"] = TASK_CONFIG
+    args["task_config"] = task_config
     args["episode_num"] = n_episodes
     args["language_num"] = 1
     with open(os.path.join(CONFIGS_PATH, "_embodiment_config.yml")) as f:
@@ -163,24 +172,25 @@ def _save_ply(path, xyz, labels):
     o3d.io.write_point_cloud(path, pcd)
 
 
-def report(task_name, num_group, group_size, n_draws):
+def report(task_name, num_group, group_size, n_draws, task_config=TASK_CONFIG):
     import cv2
     sys.path.insert(0, R3D_DIR)
     pl = load_point_labels()
     CLASS_NAMES, PAD = pl.CLASS_NAMES, pl.PAD
     RIGHT_ARM, RIGHT_GRIPPER, OBJECT, TARGET = pl.RIGHT_ARM, pl.RIGHT_GRIPPER, pl.OBJECT, pl.TARGET
+    PHASE_CLASSES = (pl.LEFT_ARM, RIGHT_ARM, pl.LEFT_GRIPPER, RIGHT_GRIPPER, OBJECT, TARGET)
     ARM_CLASSES = [pl.ROBOT_BODY, pl.LEFT_ARM, pl.RIGHT_ARM]
     GRIPPER_CLASSES = [pl.LEFT_GRIPPER, pl.RIGHT_GRIPPER]
     from r3d.common.token_allocation import box_normalize, token_allocation
     import yaml
 
-    tdir = os.path.join(OUT_DIR, task_name, TASK_CONFIG) if os.path.isdir(
-        os.path.join(OUT_DIR, task_name, TASK_CONFIG)) else os.path.join(OUT_DIR, task_name)
+    tdir = os.path.join(OUT_DIR, task_name, task_config) if os.path.isdir(
+        os.path.join(OUT_DIR, task_name, task_config)) else os.path.join(OUT_DIR, task_name)
     files = sorted(glob.glob(os.path.join(tdir, "data", "episode*.hdf5")),
                    key=lambda p: int(os.path.basename(p)[7:-5]))
     if not files:
         raise FileNotFoundError(f"no episodes under {tdir}/data")
-    with open(os.path.join(RT_DIR, "task_config", f"{TASK_CONFIG}.yml")) as f:
+    with open(os.path.join(RT_DIR, "task_config", f"{task_config}.yml")) as f:
         bbox = yaml.safe_load(f)["bbox"]
     with open(os.path.join(tdir, "link_names.json")) as f:
         link_names = json.load(f)
@@ -189,7 +199,7 @@ def report(task_name, num_group, group_size, n_draws):
     names = [CLASS_NAMES[i] for i in range(C)]
 
     acc = {k: [] for k in ("class_px", "class_inbox", "stored", "centres", "slots", "coverage",
-                           "phase", "link_px", "link_inbox", "link_inimg")}
+                           "phase", "link_px", "link_inbox", "link_inimg", "obj_px", "obj_inbox")}
     pad_frames, zmax, n_frames = 0, [], 0
     img_dir = os.path.join(tdir, "frames")
     os.makedirs(img_dir, exist_ok=True)
@@ -204,7 +214,7 @@ def report(task_name, num_group, group_size, n_draws):
         for k in ("centres", "slots", "coverage"):
             acc[k].append(np.nanmean(np.stack([t[k] for t in tok]), 0))
         acc["stored"].append(tok[0]["points"])
-        for k in ("class_px", "class_inbox", "link_px", "link_inbox", "link_inimg"):
+        for k in ("class_px", "class_inbox", "link_px", "link_inbox", "link_inimg", "obj_px", "obj_inbox"):
             acc[k].append(ep[k])
         acc["phase"].append(np.arange(T) / max(T - 1, 1))
         if ei == 0:
@@ -224,8 +234,8 @@ def report(task_name, num_group, group_size, n_draws):
     for a, b in phase_bins:
         m = (A["phase"] >= a) & (A["phase"] < b)
         per_phase[f"{a:.2f}-{min(b, 1):.2f}"] = {
-            "centres": {names[i]: float(A["centres"][m, i].mean()) for i in (RIGHT_ARM, RIGHT_GRIPPER, OBJECT, TARGET)},
-            "stored_points": {names[i]: float(A["stored"][m, i].mean()) for i in (RIGHT_ARM, RIGHT_GRIPPER, OBJECT, TARGET)},
+            "centres": {names[i]: float(A["centres"][m, i].mean()) for i in PHASE_CLASSES},
+            "stored_points": {names[i]: float(A["stored"][m, i].mean()) for i in PHASE_CLASSES},
         }
     links = {}
     for j, n in enumerate(link_names):
@@ -246,6 +256,13 @@ def report(task_name, num_group, group_size, n_draws):
         "stored_z_max_m": {"p50": float(np.median(zmax)), "p99": float(np.percentile(zmax, 99)),
                            "max": float(zmax.max())},
         "right_gripper_points_ge10_frac": float((A["stored"][:, RIGHT_GRIPPER] >= 10).mean()),
+        "any_gripper_points_ge10_frac": float((A["stored"][:, [pl.LEFT_GRIPPER, RIGHT_GRIPPER]].max(1) >= 10).mean()),
+        "frames_per_episode": {"mean": float(n_frames / len(files)),
+                               "min": int(min(len(p) for p in acc["phase"])), "max": int(max(len(p) for p in acc["phase"]))},
+        # per task object (e.g. each cube): pixels in the head image / inside the box
+        "per_object_px_min": [int(v) for v in A["obj_px"].min(0)],
+        "per_object_inbox_min": [int(v) for v in A["obj_inbox"].min(0)],
+        "frames_any_object_inbox_lt30": float((A["obj_inbox"].min(1) < 30).mean()),
         # the object leaving the head camera's FRUSTUM (not the crop box) shows up here:
         # at x >~ 0.24 the stock D435 sees only the cup's rim (2026-10-17)
         "object_points_lt50_frac": float((A["stored"][:, OBJECT] < 50).mean()),
@@ -282,6 +299,9 @@ def _print_report(r, names):
     rs = r["robot_token_share"]
     print(f"robot share of the {r['num_group']} tokens: arm {rs['arm']:.1%}, arm+gripper {rs['arm+gripper']:.1%}"
           "  | per phase: " + "  ".join(f"{k} {v:.0%}" for k, v in rs["arm+gripper_per_phase"].items()))
+    print(f"frames/episode {r['frames_per_episode']}  | per-object min px (image / in box): "
+          f"{r['per_object_px_min']} / {r['per_object_inbox_min']}  | frames with an object < 30 px in box: "
+          f"{r['frames_any_object_inbox_lt30']:.1%}  | any gripper >= 10 pts: {r['any_gripper_points_ge10_frac']:.1%}")
     print(f"object < 50 pts: {r['object_points_lt50_frac']:.1%} of frames; "
           f"episodes with median < 50: {r['object_points_lt50_episodes']}")
     hdr = f"{'class':<14}{'img px':>9}{'in box':>9}{'stored':>8}{'centres':>9}{'slots':>7}{'cover':>7}"
@@ -303,6 +323,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", nargs="+", default=["place_empty_cup_right"])
     ap.add_argument("--episodes", type=int, default=20)
+    ap.add_argument("--task-config", default=TASK_CONFIG, help="RoboTwin task config (task_config/<name>.yml)")
     ap.add_argument("--num-group", type=int, nargs="+", default=[128, 64, 32],
                     help="token counts to report (the planned sweep)")
     ap.add_argument("--group-size", type=int, default=32)
@@ -315,17 +336,17 @@ def main():
             # one task per process: sapien scenes and the get_obs patch are process-global
             import subprocess
             t0 = time.time()
-            subprocess.run([sys.executable, __file__, "--_collect", t, str(a.episodes)], check=True)
+            subprocess.run([sys.executable, __file__, "--_collect", t, str(a.episodes), a.task_config], check=True)
             print(f"[{t}] collected in {time.time() - t0:.0f}s")
         if not a.collect_only:
             for g in a.num_group:
-                report(t, g, a.group_size, a.fps_draws)
+                report(t, g, a.group_size, a.fps_draws, a.task_config)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--_collect":
+    if len(sys.argv) == 5 and sys.argv[1] == "--_collect":
         import torch.multiprocessing as mp
         mp.set_start_method("spawn", force=True)
-        collect(sys.argv[2], int(sys.argv[3]))
+        collect(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     else:
         main()

@@ -7,8 +7,10 @@
 #
 # Fewer tokens is the lever the crop method works through: group_size stays 32,
 # so 128/64/32/16 tokens cover 4x/2x/1x/0.5x of the 1024 points.  Runs land in
-# R3D/data/outputs/sim/robotwin2_sim_p1024_g128-<task>-g<N>-<seed>/ (the config
-# name is fixed; the g<N> tag is what differs).  Logs next to them as train.log.
+# R3D/data/outputs/sim/robotwin2_sim_p1024-<task>-g<N>-<seed>/ (the g<N> tag is
+# what differs; the 2026-10-17 cup runs carry the old config name
+# robotwin2_sim_p1024_g128).  Logs: outputs/sim/sweep_<task>_g<N>_seed<seed>.log.
+# Task 2: TASK=stack_blocks_two_fov SETTING=sim_stock_p1024 bash ... 0
 
 set -uo pipefail
 gpu_id=${1:?usage: sweep_robotwin2_sim_tokens.sh <gpu_id> [token counts...]}
