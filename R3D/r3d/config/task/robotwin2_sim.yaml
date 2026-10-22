@@ -1,7 +1,7 @@
 # Sim token-allocation runs (CLAUDE.md "Sim baseline"): RoboTwin2 aloha-agilex,
-# HEAD camera only, box crop from the RoboTwin task config, 1024 stored points,
-# num_group tokens (128 default; the sweep overrides it). Renamed from
-# robotwin2_sim_p1024_g128.yaml on 2026-10-18 (num_group is a sweep variable).
+# HEAD camera only, box crop from the RoboTwin task config, num_points points,
+# num_group tokens (both sweep variables). Renamed robotwin2_sim_p1024_g128.yaml
+# -> robotwin2_sim_p1024.yaml (2026-10-18) -> robotwin2_sim.yaml (2026-10-19).
 #
 #   bash scripts/train_robotwin2_sim.sh place_empty_cup_right 42 0            # task 1
 #   SETTING=sim_stock_p1024 bash scripts/train_robotwin2_sim.sh stack_blocks_two_fov 42 0
@@ -15,6 +15,11 @@ name: ${task_name}-${setting}
 # Read by r3d_robotwin2.yaml: num_group: ${oc.select:task.num_group,512}
 num_group: 128
 
+# Points per cloud the policy sees. The dataset keeps the first num_points of each
+# stored cloud (FPS order = the FPS-num_points cloud); evaluation must use a
+# RoboTwin task config with pcd_down_sample_num == num_points.
+num_points: 1024
+
 # Oracle label cut AFTER preprocessing (r3d/common/label_cut.py), applied in
 # training (dataset) and evaluation (env_runner) alike. Classes from
 # envs/utils/point_labels.py: [5] = right arm (the gripper, 7, is kept).
@@ -24,7 +29,7 @@ drop_point_labels: null
 shape_meta: &shape_meta
   obs:
     point_cloud:
-      shape: [1024, 6]
+      shape: ['${task.num_points}', 6]   # quoted: { inside [ ] is YAML flow syntax
       type: point_cloud
     agent_pos:
       shape: [14]
@@ -50,6 +55,7 @@ env_runner:
   # Oracle label cut at EVALUATION, from the simulator's segmentation. Must equal
   # dataset.drop_point_labels -- both read the top-level key below.
   drop_point_labels: ${task.drop_point_labels}
+  num_points: ${task.num_points}   # runner raises if RoboTwin delivers another size
 
 dataset:
   _target_: r3d.dataset.robotwin_sim_dataset.RobotwinSimDataset
@@ -73,3 +79,4 @@ dataset:
   saturation_range: [0.5, 1.5]
   use_target_ee: ${policy.use_target_ee}
   drop_point_labels: ${task.drop_point_labels}
+  num_points: ${task.num_points}

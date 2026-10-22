@@ -54,12 +54,16 @@ class RoboTwin2Runner(BaseRunner):
         save_video: bool = True,
         tqdm_interval_sec: float = 5.0,
         drop_point_labels=None,
+        num_points=None,
         **kwargs
     ):
         super().__init__(output_dir)
         # Sim oracle label cut (r3d/common/label_cut.py), same as the training
         # dataset's `drop_point_labels`. None = the policy sees the cloud as is.
         self.drop_point_labels = None if drop_point_labels is None else [int(c) for c in drop_point_labels]
+        # Points per cloud the policy was trained on; the RoboTwin task config must
+        # deliver exactly this many (pcd_down_sample_num). None = unchecked.
+        self.num_points = None if num_points is None else int(num_points)
 
         self.task_name = task_name
         self.task_entries = None
@@ -122,6 +126,9 @@ class RoboTwin2Runner(BaseRunner):
         With `drop_point_labels` they cut the cloud (padded + point_cloud_len),
         exactly as RobotwinSimDataset does in training; without, they are dropped."""
         obs = dict(obs)
+        if self.num_points is not None and obs['point_cloud'].shape[0] != self.num_points:
+            raise RuntimeError(f"RoboTwin delivered {obs['point_cloud'].shape[0]}-point clouds but the policy "
+                               f"expects num_points={self.num_points}: task config pcd_down_sample_num mismatch")
         labels = obs.pop('point_cloud_label', None)
         if self.drop_point_labels:
             if labels is None:

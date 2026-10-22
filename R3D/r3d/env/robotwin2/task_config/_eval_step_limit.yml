@@ -50,3 +50,4 @@ stamp_seal: 400
 turn_switch: 400
 place_empty_cup_right: 500
 stack_blocks_two_fov: 800
+hanging_mug_labeled: 900

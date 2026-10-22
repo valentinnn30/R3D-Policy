@@ -30,10 +30,12 @@ def box_normalize(xyz, bbox):
 
 @torch.no_grad()
 def token_allocation(xyz_norm, labels, n_classes, num_group=128, group_size=32,
-                     random_start=True, device="cuda"):
+                     random_start=True, device="cuda", return_idx=False):
     """xyz_norm: (B, N, 3) normalized clouds; labels: (B, N) int class per point.
 
     Returns dict of (B, n_classes) arrays: centres, slots, coverage, points.
+    return_idx=True adds `centre_idx` (B, G) and `knn_idx` (B, G, K): which
+    points are the token centres and which points each token's patch holds.
     """
     xyz = torch.as_tensor(np.asarray(xyz_norm), dtype=torch.float32, device=device)
     lab = torch.as_tensor(np.asarray(labels), dtype=torch.long, device=device)
@@ -55,5 +57,7 @@ def token_allocation(xyz_norm, labels, n_classes, num_group=128, group_size=32,
     covered = (onehot * seen.unsqueeze(-1)).sum(1)
     coverage = torch.where(points > 0, covered / points.clamp(min=1), torch.full_like(points, float("nan")))
 
-    return {k: v.cpu().numpy() for k, v in
-            dict(centres=centres, slots=slots, coverage=coverage, points=points).items()}
+    out = dict(centres=centres, slots=slots, coverage=coverage, points=points)
+    if return_idx:
+        out.update(centre_idx=c_idx, knn_idx=knn_idx)
+    return {k: v.cpu().numpy() for k, v in out.items()}

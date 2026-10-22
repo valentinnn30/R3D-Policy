@@ -42,6 +42,10 @@ pcd_crop: true
 # stock head camera sees no torso inside this box. z <= 1.30: set from the view
 # check's stored z max.
 bbox: [[-0.6, -0.35, 0.7401], [0.6, 0.35, 1.30]]
+# Eval scenes: one validated list shared by sim_stock_p1024 / p2048 / p4096, which
+# render the same scenes and differ only in the point count (robotwin2_env_manager
+# _seed_group_key). Seeded from the sim_stock_p1024 lists on 2026-10-22.
+scene_seed_group: sim_stock
 save_path: ./data
 clear_cache_freq: 5
 collect_data: true

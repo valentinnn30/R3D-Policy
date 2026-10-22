@@ -58,6 +58,12 @@ def main():
     ap.add_argument("--episodes", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--num-group", type=int, default=128)
     ap.add_argument("--stride", type=int, default=4, help="every n-th frame")
+    ap.add_argument("--num-points", type=int, default=None,
+                    help="show only the first N points (FPS order = the FPS-N cloud the policy sees)")
+    ap.add_argument("--drop-labels", type=int, nargs="*", default=None,
+                    help="oracle cut: remove these classes BEFORE the token FPS, as training with "
+                         "task.drop_point_labels does (e.g. 4 5 = arms, 4 5 6 7 = arms + grippers); "
+                         "the removed points are shown faint grey (toggle)")
     ap.add_argument("--out", default=os.path.join(ROOT, "R3D", "data", "outputs", "sim_view", "clouds"))
     a = ap.parse_args()
 
@@ -76,11 +82,16 @@ def main():
     for ep in a.episodes:
         s, e = int(starts[ep]), int(ends[ep])
         ts = list(range(s, e, a.stride))
-        pc = root["data/point_cloud"][s:e]
-        lab = root["data/point_label"][s:e]
+        pc = root["data/point_cloud"][s:e, :a.num_points]
+        lab = root["data/point_label"][s:e, :a.num_points]
         frames, titles = [], []
         for t in ts:
             p, l = pc[t - s], lab[t - s]
+            if a.drop_labels:
+                cut = np.isin(l, a.drop_labels)
+                removed, p, l = p[cut], p[~cut], l[~cut]
+            else:
+                removed = p[:0]
             c_idx = fps_centres(box_normalize(p[:, :3], bbox), a.num_group, rng)
             rgb = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})" for r, g, b in p[:, 3:6]]
             cls = [PALETTE.get(int(x), "#000") for x in l]
@@ -97,11 +108,14 @@ def main():
                              marker=dict(size=5, color=[PALETTE.get(int(x), "#000") for x in l[c_idx]],
                                          symbol="diamond", line=dict(width=1, color="black")),
                              name=f"{a.num_group} token centres"),
+                go.Scatter3d(x=removed[:, 0], y=removed[:, 1], z=removed[:, 2], mode="markers",
+                             marker=dict(size=1.5, color="#d0d0d0", opacity=0.5),
+                             name=f"cut ({len(removed)} pts, not seen by the policy)"),
             ]))
         fig = go.Figure(data=frames[0].data, frames=frames)
         fig.data[1].visible = False
         legend = "  ".join(f"<span style='color:{PALETTE[k]}'>&#9632;</span> {names[k]}"
-                           for k in (pl.RIGHT_ARM, pl.RIGHT_GRIPPER, pl.OBJECT, pl.TARGET, pl.ROBOT_BODY, pl.LEFT_GRIPPER))
+                           for k in (pl.LEFT_ARM, pl.LEFT_GRIPPER, pl.RIGHT_GRIPPER, pl.OBJECT, pl.TARGET, pl.ROBOT_BODY))
         fig.update_layout(
             title=dict(text=titles[0], font=dict(size=11)), height=850,
             scene=dict(aspectmode="data",
@@ -112,9 +126,10 @@ def main():
                               xref="paper", yref="paper", xanchor="left")],
             updatemenus=[
                 dict(type="buttons", x=0, y=0.98, xanchor="left", direction="right", buttons=[
-                    dict(label="colour: RGB", method="restyle", args=[{"visible": [True, False, True]}]),
-                    dict(label="colour: class", method="restyle", args=[{"visible": [False, True, True]}]),
+                    dict(label="colour: RGB", method="restyle", args=[{"visible": [True, False, True, True]}]),
+                    dict(label="colour: class", method="restyle", args=[{"visible": [False, True, True, True]}]),
                     dict(label="tokens on/off", method="restyle", args=[{"visible": "legendonly"}, [2]]),
+                    dict(label="hide cut points", method="restyle", args=[{"visible": "legendonly"}, [3]]),
                 ]),
                 dict(type="buttons", x=0.45, y=0.98, xanchor="left", direction="right", buttons=[
                     dict(label="play", method="animate",
@@ -127,7 +142,8 @@ def main():
                                       args=[[f.name], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
                                  for f in frames], currentvalue=dict(prefix="frame "))],
         )
-        out = os.path.join(a.out, f"{os.path.basename(a.zarr.rstrip('/'))[:-5]}_ep{ep}_g{a.num_group}.html")
+        npts = f"_p{pc.shape[1]}" + (f"_cut{''.join(map(str, a.drop_labels))}" if a.drop_labels else "")
+        out = os.path.join(a.out, f"{os.path.basename(a.zarr.rstrip('/'))[:-5]}_ep{ep}{npts}_g{a.num_group}.html")
         fig.write_html(out, include_plotlyjs=True, auto_play=False)
         print(f"episode {ep}: {len(ts)} frames -> {out}")
 

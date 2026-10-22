@@ -41,6 +41,7 @@ R3D_DIR = os.path.join(ROOT, "R3D")
 RT_DIR = os.path.join(R3D_DIR, "r3d", "env", "robotwin2")
 OUT_DIR = os.path.join(R3D_DIR, "data", "outputs", "sim_view")
 TASK_CONFIG = "sim_head_p1024"  # default; --task-config overrides
+CRIT_R = 0.03                   # radius around a task's critical_points() (m)
 
 
 # --------------------------------------------------------------------------- collect
@@ -82,7 +83,9 @@ def _view_stats(task, point_labels):
     objs = [e for o in task.point_label_roles().get("object", []) for e in point_labels._entities_of(o)]
     obj_px = [int((ids == e.per_scene_id).sum()) for e in objs]
     obj_inbox = [int(((ids == e.per_scene_id) & inbox).sum()) for e in objs]
+    crit = task.critical_points() if hasattr(task, "critical_points") else {}
     return {
+        "crit_xyz": np.asarray([crit[k] for k in sorted(crit)], dtype=np.float64).reshape(-1, 3),
         "obj_px": np.asarray(obj_px),
         "obj_inbox": np.asarray(obj_inbox),
         "class_px": np.bincount(lab, minlength=C),
@@ -114,6 +117,9 @@ def collect(task_name, n_episodes, task_config=TASK_CONFIG):
             names = [l.get_name() for l in _robot_links(self)]
             with open(os.path.join(self.save_dir, "link_names.json"), "w") as f:
                 json.dump(names, f)
+            if hasattr(self, "critical_points"):
+                with open(os.path.join(self.save_dir, "critical_names.json"), "w") as f:
+                    json.dump(sorted(self.critical_points()), f)
             self._view_links_written = True
         return pkl
 
@@ -194,6 +200,10 @@ def report(task_name, num_group, group_size, n_draws, task_config=TASK_CONFIG):
         bbox = yaml.safe_load(f)["bbox"]
     with open(os.path.join(tdir, "link_names.json")) as f:
         link_names = json.load(f)
+    crit_file = os.path.join(tdir, "critical_names.json")
+    crit_names = json.load(open(crit_file)) if os.path.exists(crit_file) else []
+    crit = {n: {"pts": [], "tok": [], "patch_cm": [], "visible": []} for n in crit_names}
+    all_patch_cm = []
     seeds = [int(s) for s in open(os.path.join(tdir, "seed.txt")).read().split()]
     C = len(CLASS_NAMES)
     names = [CLASS_NAMES[i] for i in range(C)]
@@ -210,7 +220,27 @@ def report(task_name, num_group, group_size, n_draws, task_config=TASK_CONFIG):
         pad_frames += int((ep["label"] == PAD).any(1).sum())
         zmax.append(ep["pc"][..., 2].max(1))
         xyz_n = box_normalize(ep["pc"][..., :3], bbox)
-        tok = [token_allocation(xyz_n, ep["label"], C, num_group, group_size) for _ in range(n_draws)]
+        tok = [token_allocation(xyz_n, ep["label"], C, num_group, group_size, return_idx=bool(crit_names))
+               for _ in range(n_draws)]
+        if crit_names:
+            # critical parts: task-object points (OBJECT/TARGET, never robot) within CRIT_R
+            # of each critical point; tokens = centres on them; patch size in METRES =
+            # max distance from a centre to the 32 points of its patch (patches are
+            # chosen in normalized space, so their metric shape follows the box scaling)
+            rel = np.isin(ep["label"], [OBJECT, TARGET])
+            xyz = ep["pc"][..., :3]
+            t0 = tok[0]
+            for fi in range(T):
+                patch_m = np.linalg.norm(xyz[fi][t0["knn_idx"][fi]] - xyz[fi][t0["centre_idx"][fi]][:, None], axis=-1).max(1)
+                all_patch_cm.append(np.median(patch_m) * 100)
+                for ci, n in enumerate(crit_names):
+                    near = rel[fi] & (np.linalg.norm(xyz[fi] - ep["crit_xyz"][fi, ci], axis=1) < CRIT_R)
+                    on = near[t0["centre_idx"][fi]]
+                    crit[n]["pts"].append(int(near.sum()))
+                    crit[n]["tok"].append(int(on.sum()))
+                    crit[n]["visible"].append(bool(near.any()))
+                    if on.any():
+                        crit[n]["patch_cm"].extend((patch_m[on] * 100).tolist())
         for k in ("centres", "slots", "coverage"):
             acc[k].append(np.nanmean(np.stack([t[k] for t in tok]), 0))
         acc["stored"].append(tok[0]["points"])
@@ -284,6 +314,16 @@ def report(task_name, num_group, group_size, n_draws, task_config=TASK_CONFIG):
         "point_coverage_per_class": by_class(A["coverage"]),
         "per_phase": per_phase,
         "robot_links": links,
+        "critical_parts": {
+            n: {"radius_cm": CRIT_R * 100,
+                "frames_visible_frac": float(np.mean(d["visible"])),
+                "points_mean": float(np.mean(d["pts"])),
+                "tokens_mean": float(np.mean(d["tok"])),
+                "tokens_mean_when_visible": float(np.mean([t for t, v in zip(d["tok"], d["visible"]) if v]) if any(d["visible"]) else 0),
+                "frames_zero_tokens_when_visible": float(np.mean([t == 0 for t, v in zip(d["tok"], d["visible"]) if v]) if any(d["visible"]) else 0),
+                "patch_radius_cm_median": float(np.median(d["patch_cm"])) if d["patch_cm"] else None,
+                } for n, d in crit.items()},
+        "patch_radius_cm_median_all_tokens": float(np.median(all_patch_cm)) if all_patch_cm else None,
     }
     with open(os.path.join(tdir, f"report_g{num_group}.json"), "w") as f:
         json.dump(rep, f, indent=2)
@@ -313,6 +353,14 @@ def _print_report(r, names):
     print("\nper phase (token centres | stored points):")
     for ph, d in r["per_phase"].items():
         print(f"  {ph}: " + "  ".join(f"{k} {d['centres'][k]:.1f}|{d['stored_points'][k]:.0f}" for k in d["centres"]))
+    if r.get("critical_parts"):
+        print(f"\ncritical parts (task-object points within {CRIT_R*100:.0f} cm); median token patch radius over "
+              f"all tokens: {r['patch_radius_cm_median_all_tokens']:.1f} cm")
+        for n, d in r["critical_parts"].items():
+            print(f"  {n:<12} visible {d['frames_visible_frac']:.0%} of frames | points {d['points_mean']:.1f} | "
+                  f"tokens {d['tokens_mean_when_visible']:.2f} when visible, 0 tokens in "
+                  f"{d['frames_zero_tokens_when_visible']:.0%} of those frames | patch radius there "
+                  f"{d['patch_radius_cm_median'] if d['patch_radius_cm_median'] is None else round(d['patch_radius_cm_median'], 1)} cm")
     print("\nrobot links (in image / visible / in box, frac of frames; mean px in box):")
     for n, d in r["robot_links"].items():
         print(f"  {n:<28}{d['frames_in_image_frac']:>6.0%}{d['frames_visible_frac']:>6.0%}"

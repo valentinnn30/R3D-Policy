@@ -15,6 +15,13 @@ Same reasoning as `RealMultiCamDataset.get_normalizer`.
 points are augmented exactly as in the uncut baseline (colour jitter's mean is
 taken over the same full cloud). It adds `point_cloud_len` to the obs. Null =
 no cut, and `point_label` is then not even loaded.
+
+`num_points` keeps the FIRST num_points points of every stored cloud. The
+converter stores RoboTwin's FPS output in selection order and FPS is greedy, so
+the first N points of an FPS-4096 cloud ARE the FPS-N cloud (same start point)
+-- one 4096-point collection serves 4096 / 2048 / 1024. At evaluation RoboTwin
+produces the N-point cloud directly (task config with pcd_down_sample_num = N),
+which is the same set.
 """
 
 import numpy as np
@@ -30,7 +37,7 @@ from r3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNorma
 
 class RobotwinSimDataset(RobotwinDataset):
 
-    def __init__(self, zarr_path, drop_point_labels=None, **kwargs):
+    def __init__(self, zarr_path, drop_point_labels=None, num_points=None, **kwargs):
         super().__init__(zarr_path, **kwargs)
         attrs = zarr.open(zarr_path, mode="r")["meta"].attrs
         if "pcd_crop_bbox" not in attrs:
@@ -49,6 +56,17 @@ class RobotwinSimDataset(RobotwinDataset):
             self.sampler = SequenceSampler(
                 replay_buffer=self.replay_buffer, sequence_length=self.horizon,
                 pad_before=self.pad_before, pad_after=self.pad_after, episode_mask=self.train_mask)
+
+        stored = self.replay_buffer["point_cloud"].shape[1]
+        if num_points is not None and int(num_points) != stored:
+            n = int(num_points)
+            if n > stored:
+                raise ValueError(f"num_points={n} but {zarr_path} stores {stored} points per cloud")
+            # numpy-backed buffer: replace in place; the sampler reads it per sample
+            data = self.replay_buffer.data
+            data["point_cloud"] = np.ascontiguousarray(data["point_cloud"][:, :n])
+            if "point_label" in data:
+                data["point_label"] = np.ascontiguousarray(data["point_label"][:, :n])
 
     def _sample_to_data(self, sample):
         data = super()._sample_to_data(sample)

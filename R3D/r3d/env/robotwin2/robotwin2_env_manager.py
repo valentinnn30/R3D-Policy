@@ -211,11 +211,23 @@ class RoboTwin2EnvManager:
         
         return instruction
     
+    def _seed_group_key(self, st_seed):
+        """Cache key of the validated eval-scene list in seeds_list/<task>.json.
+
+        Default: start seed + task-config name (stock RoboTwin). A task config may
+        set `scene_seed_group` to share ONE list between configs that render the
+        same scenes -- e.g. sim_stock_p1024 / p2048 / p4096 differ only in the
+        point count. Without it each config re-validates its own list with the
+        expert, whose motion planner is not deterministic, so borderline scenes
+        pass in one validation and fail in another (2026-10-22: the p1024 / p2048
+        / p4096 lists shared only ~180 of 200 scenes)."""
+        return str(st_seed) + str(self.args.get('scene_seed_group') or self.args['task_config'])
+
     def save_seed(self, seedlist, episode_info_list=None, st_seed=None):
         """Save valid seeds to file"""
         if st_seed is None:
             st_seed = self.st_seed
-        st_seed_key = str(st_seed) + self.args['task_config']
+        st_seed_key = self._seed_group_key(st_seed)
         
         save_path = os.path.join(current_directory, 'seeds_list')
         file_path = os.path.join(save_path, f'{self.args["task_name"]}.json')
@@ -275,7 +287,7 @@ class RoboTwin2EnvManager:
         """Find or load valid seeds"""
         save_path = os.path.join(current_directory, 'seeds_list')
         file_path = os.path.join(save_path, f'{self.args["task_name"]}.json')
-        st_seed_key = str(self.st_seed) + self.args['task_config']
+        st_seed_key = self._seed_group_key(self.st_seed)
         existing_seeds = []
         existing_episode_info = {}
         
