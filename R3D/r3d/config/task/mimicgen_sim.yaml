@@ -1,0 +1,55 @@
+# MimicGen (robosuite) runs of the sim token-allocation study (docs/sim_token_allocation_learnings.md,
+# "Next task: MimicGen Square D2"). Single Panda arm, agentview head camera only, box crop,
+# num_points points, num_group tokens. Data: scripts/sim/convert_mimicgen_to_zarr.py.
+#
+#   TASK_CFG=mimicgen_sim SETTING=agentview_p4096-200 EPOCHS=251 GRAD_ACCUM=2 CHECKPOINT_EVERY=125 \
+#       TAG=g64 bash scripts/train_robotwin2_sim.sh square_d2 42 0 task.num_group=64
+#
+# No env_runner: evaluation is scripts/sim/eval_mimicgen_ckpt.py (robosuite lives in the
+# r3d_robosuite env; training runs in r3d_sim and never imports it).
+name: ${task_name}-${setting}
+
+num_group: 64
+
+# Points the policy sees: the FIRST num_points of each stored (FPS-ordered) cloud = the
+# FPS-num_points cloud; evaluation builds the num_points cloud directly with the same code.
+num_points: 1024
+
+# Oracle label cut AFTER preprocessing (r3d/common/label_cut.py), training and evaluation.
+# Classes as point_labels.py: [5] = the Panda arm (the gripper, 7, is kept). null = no cut.
+drop_point_labels: null
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: ['${task.num_points}', 6]   # quoted: { inside [ ] is YAML flow syntax
+      type: point_cloud
+    agent_pos:
+      shape: [11]          # eef pos | rot6d | gripper qpos (r3d/common/robosuite_actions.py)
+      type: low_dim
+  action:
+    shape: [10]            # ABSOLUTE OSC goal: pos | rot6d | gripper
+
+env_runner: null
+
+dataset:
+  _target_: r3d.dataset.robotwin_sim_dataset.RobotwinSimDataset
+  zarr_path: R3D/data/${task_name}-${setting}.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  # Same augmentation as the RoboTwin sim runs (stock R3D RoboTwin values).
+  use_data_augmentation: true
+  pc_xyz_noise_std: 0.002
+  pc_rgb_noise_std: 0.0
+  agent_pos_noise_std: 0.0002
+  use_color_jitter: true
+  brightness_range: [-0.125, 0.125]
+  contrast_range: [0.5, 1.5]
+  saturation_range: [0.5, 1.5]
+  use_target_ee: ${policy.use_target_ee}
+  drop_point_labels: ${task.drop_point_labels}
+  num_points: ${task.num_points}
