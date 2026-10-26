@@ -1,0 +1,41 @@
+# Learned link remover v0 (C2) on the r3d_robotwin2 policy -- docs/learned_remover_v0.md.
+# Everything not set here is r3d_robotwin2's. Task: mimicgen_sim_remover (loads point_link).
+#
+#   ALG=r3d_robotwin2_remover TASK_CFG=mimicgen_sim_remover SETTING=agentview_p4096-200 \
+#       EPOCHS=251 GRAD_ACCUM=2 CHECKPOINT_EVERY=125 TAG=g64-remover \
+#       bash scripts/train_robotwin2_sim.sh square_d2 42 0 task.num_points=1024 task.num_group=64
+#
+# Defaults = variant G of the toy drift comparison (2026-10-26): Adam lr 3e-3, 128 windows
+# (both micro-batches at accum 2) x 4 masks per phi step -- drift of no-signal regions
+# <= 0.8 logit over a run, the toy pattern learned within ~15% of the phi budget.
+defaults:
+  - r3d_robotwin2
+  - _self_
+
+policy:
+  _target_: r3d.policy.dp3_link_remover.DP3LinkRemover
+  link_remover:
+    enabled: true
+    region_groups: default      # robosuite_pcd.default_region_groups(): 8 regions, link0-4 never thinned
+    init_keep: 0.8              # removal gate: P(keep region) at init -> each region removed in 20% of draws
+    gate_max: 5.0               # gate logits in [-5, 5]: P(keep) in [0.007, 0.993], a removed region can recover
+    init_rho: 0.8               # density of a kept region (FPS within the region)
+    sigma: 1.0                  # overwritten every batch by the training schedule below
+    mu_min: -9.0                # -8 still kept 1 point of link6 on the largest frames at N = 4096
+    mu_max: 6.0
+    snap_rho_below: 0.05        # inference / fine-tune: rho < 0.05 -> 0 (complete removal)
+    fill_to_min_keep: true      # a draw keeping < num_group points gets region points back
+    k_masks: 4                  # masks per window per phi step (RLOO over K)
+    reward_t: [20, 50, 80]
+
+training:
+  link_remover:
+    lr: 3.0e-3                  # Adam on the gate + density logits (the brief's 1e-5 does not move them)
+    phi_every: 4                # optimizer steps per phi step
+    warmup_frac: 0.2            # theta only, masks from the fixed initial phi
+    finetune_frac: 0.1          # phi frozen, theta on the snapped deterministic rho
+    sigma_start: 1.0
+    sigma_end: 0.2
+    diag_every: 10              # epochs between held-out check + diagnostic B
+    diag_batches: 4             # batch pairs averaged per diagnostic
+    diag_masks: 8               # masks shared by all windows in the diagnostics

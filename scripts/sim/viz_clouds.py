@@ -12,6 +12,11 @@ as in training; `r3d/common/token_allocation.py`). Buttons switch the point
 colouring between RGB and class; the slider steps through frames; the title
 gives per-class point and token counts for the frame.
 
+Learned link remover (needs data/point_link): `--links` colours the class view by remover
+region (robosuite_pcd.default_region_groups; grey = never thinned); `--rho 0.3` or
+`--rho link6=0.05,finger1=1` thins the regions as the remover would (FPS within each
+region, deterministic start) BEFORE the token FPS -- removed points are shown faint grey.
+
 Output: R3D/data/outputs/sim_view/clouds/<zarr stem>_ep<k>_g<G>.html
 """
 
@@ -64,6 +69,10 @@ def main():
                     help="oracle cut: remove these classes BEFORE the token FPS, as training with "
                          "task.drop_point_labels does (e.g. 4 5 = arms, 4 5 6 7 = arms + grippers); "
                          "the removed points are shown faint grey (toggle)")
+    ap.add_argument("--links", action="store_true", help="colour robot points by remover region")
+    ap.add_argument("--rho", default=None,
+                    help="thin the remover regions: one rate for all ('0.3') or per region "
+                         "('link6=0.05,finger1=1'; unnamed regions stay at 1)")
     ap.add_argument("--out", default=os.path.join(ROOT, "R3D", "data", "outputs", "sim_view", "clouds"))
     a = ap.parse_args()
 
@@ -79,17 +88,57 @@ def main():
     names = pl.CLASS_NAMES
     lo, hi = np.asarray(bbox[0]), np.asarray(bbox[1])
 
+    thin = None
+    if a.links or a.rho is not None:
+        import torch
+        from r3d.common import robosuite_pcd as RP
+        from r3d.model.vision.link_remover import region_table, thin_regions
+        if "point_link" not in root["data"]:
+            raise KeyError(f"{a.zarr} has no data/point_link -- scripts/sim/add_link_labels_mimicgen.py")
+        groups = RP.default_region_groups()
+        c2r, rnames = region_table(RP.CELL_NAMES, groups)
+        rho = torch.ones(len(rnames))
+        if a.rho is not None:
+            if "=" not in a.rho:
+                rho[:] = float(a.rho)
+            else:
+                for kv in a.rho.split(","):
+                    k, v = kv.split("=")
+                    rho[rnames.index(k.strip())] = float(v)
+        REGION_COLOURS = ["#1f77b4", "#17becf", "#9edae5", "#ff7f0e", "#ffbb78", "#e377c2", "#8c564b", "#bcbd22"]
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        names = dict(names)
+        for r, nm in enumerate(rnames):
+            PALETTE[100 + r] = REGION_COLOURS[r % len(REGION_COLOURS)]
+            names[100 + r] = nm
+
+        def thin(p, l, cell):
+            """-> kept points, their labels (region-coloured with --links), removed points"""
+            if a.links:
+                reg = np.where(cell >= 0, c2r.numpy()[np.clip(cell, 0, None)], -1)
+                l = np.where(reg >= 0, 100 + reg, l)
+            if a.rho is None:
+                return p, l, p[:0]
+            P = torch.as_tensor(p[None], device=dev)
+            _, n_kept, _, _, _, keep = thin_regions(P, torch.as_tensor(cell[None].astype(np.int64), device=dev),
+                                                    rho[None].to(dev), c2r, return_keep=True)
+            keep = keep[0].cpu().numpy()
+            return p[keep], l[keep], p[~keep]
+
     for ep in a.episodes:
         s, e = int(starts[ep]), int(ends[ep])
         ts = list(range(s, e, a.stride))
         pc = root["data/point_cloud"][s:e, :a.num_points]
         lab = root["data/point_label"][s:e, :a.num_points]
+        link = root["data/point_link"][s:e, :a.num_points] if thin is not None else None
         frames, titles = [], []
         for t in ts:
             p, l = pc[t - s], lab[t - s]
             if a.drop_labels:
                 cut = np.isin(l, a.drop_labels)
                 removed, p, l = p[cut], p[~cut], l[~cut]
+            elif thin is not None:
+                p, l, removed = thin(p, l, link[t - s])
             else:
                 removed = p[:0]
             c_idx = fps_centres(box_normalize(p[:, :3], bbox), a.num_group, rng)
@@ -115,7 +164,8 @@ def main():
         fig = go.Figure(data=frames[0].data, frames=frames)
         fig.data[1].visible = False
         legend = "  ".join(f"<span style='color:{PALETTE[k]}'>&#9632;</span> {names[k]}"
-                           for k in (pl.LEFT_ARM, pl.LEFT_GRIPPER, pl.RIGHT_GRIPPER, pl.OBJECT, pl.TARGET, pl.ROBOT_BODY))
+                           for k in (pl.LEFT_ARM, pl.LEFT_GRIPPER, pl.RIGHT_GRIPPER, pl.OBJECT, pl.TARGET, pl.ROBOT_BODY)
+                           + (tuple(k for k in PALETTE if k >= 100) if a.links else ()))
         fig.update_layout(
             title=dict(text=titles[0], font=dict(size=11)), height=850,
             scene=dict(aspectmode="data",
@@ -143,6 +193,8 @@ def main():
                                  for f in frames], currentvalue=dict(prefix="frame "))],
         )
         npts = f"_p{pc.shape[1]}" + (f"_cut{''.join(map(str, a.drop_labels))}" if a.drop_labels else "")
+        if thin is not None:
+            npts += ("_links" if a.links else "") + (f"_rho{a.rho.replace('=', '').replace(',', '_')}" if a.rho else "")
         out = os.path.join(a.out, f"{os.path.basename(a.zarr.rstrip('/'))[:-5]}_ep{ep}{npts}_g{a.num_group}.html")
         fig.write_html(out, include_plotlyjs=True, auto_play=False)
         print(f"episode {ep}: {len(ts)} frames -> {out}")

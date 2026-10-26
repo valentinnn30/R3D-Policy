@@ -1,0 +1,9 @@
+# mimicgen_sim + the per-point link cells for the learned link remover
+# (policy config r3d_robotwin2_remover; docs/learned_remover_v0.md). Data: the zarr must
+# carry data/point_link (scripts/sim/add_link_labels_mimicgen.py).
+defaults:
+  - mimicgen_sim
+  - _self_
+
+dataset:
+  load_point_link: true         # obs point_link (T, N): link cell per point, -1 = not robot

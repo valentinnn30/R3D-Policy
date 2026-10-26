@@ -16,6 +16,12 @@ points are augmented exactly as in the uncut baseline (colour jitter's mean is
 taken over the same full cloud). It adds `point_cloud_len` to the obs. Null =
 no cut, and `point_label` is then not even loaded.
 
+`load_point_link` adds `point_link` (T, N) int8 to the obs -- plus `point_label` (T, N) int8, read
+only by the remover's analytics (nut vs peg coverage) -- `point_link` being the per-point link cell
+(robosuite_pcd.CELL_NAMES, -1 = not robot) written by scripts/sim/add_link_labels_mimicgen.py,
+windowed and prefix-sliced together with the clouds. The learned link remover
+(DP3LinkRemover) consumes it before the normalizer. Off = not even loaded.
+
 `num_points` keeps the FIRST num_points points of every stored cloud. The
 converter stores RoboTwin's FPS output in selection order and FPS is greedy, so
 the first N points of an FPS-4096 cloud ARE the FPS-N cloud (same start point)
@@ -37,7 +43,7 @@ from r3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNorma
 
 class RobotwinSimDataset(RobotwinDataset):
 
-    def __init__(self, zarr_path, drop_point_labels=None, num_points=None, **kwargs):
+    def __init__(self, zarr_path, drop_point_labels=None, num_points=None, load_point_link=False, **kwargs):
         super().__init__(zarr_path, **kwargs)
         attrs = zarr.open(zarr_path, mode="r")["meta"].attrs
         if "pcd_crop_bbox" not in attrs:
@@ -46,13 +52,27 @@ class RobotwinSimDataset(RobotwinDataset):
         self.pcd_crop_bbox = np.asarray(attrs["pcd_crop_bbox"], dtype=np.float64)
 
         self.drop_point_labels = None if drop_point_labels is None else [int(c) for c in drop_point_labels]
-        if self.drop_point_labels:
+        self.load_point_link = bool(load_point_link)
+        if self.load_point_link:
+            if self.drop_point_labels:
+                raise ValueError("load_point_link (learned link remover) with drop_point_labels (oracle cut)")
             if self.use_target_ee:
+                raise NotImplementedError("load_point_link with use_target_ee")
+            if "point_link" not in zarr.open(zarr_path, mode="r")["data"]:
+                raise KeyError(f"{zarr_path} has no data/point_link -- run scripts/sim/add_link_labels_mimicgen.py")
+            from r3d.common.robosuite_pcd import CELL_NAMES
+            if list(attrs.get("point_link_names", [])) != list(CELL_NAMES):
+                raise ValueError(f"{zarr_path}: point_link_names differ from robosuite_pcd.CELL_NAMES")
+        # the remover also gets point_label: its analytics tell nut from peg (never a model input)
+        extra = (["point_label"] if self.drop_point_labels or self.load_point_link else []) \
+            + (["point_link"] if self.load_point_link else [])
+        if extra:
+            if self.drop_point_labels and self.use_target_ee:
                 raise NotImplementedError("drop_point_labels with use_target_ee")
-            # reload WITH point_label and rebuild the sampler on the parent's own
+            # reload WITH the per-point labels and rebuild the sampler on the parent's own
             # episode masks, so the labels are windowed together with the clouds
             self.replay_buffer = ReplayBuffer.copy_from_path(
-                zarr_path, keys=["state", "action", "point_cloud", "point_label"])
+                zarr_path, keys=["state", "action", "point_cloud"] + extra)
             self.sampler = SequenceSampler(
                 replay_buffer=self.replay_buffer, sequence_length=self.horizon,
                 pad_before=self.pad_before, pad_after=self.pad_after, episode_mask=self.train_mask)
@@ -65,13 +85,17 @@ class RobotwinSimDataset(RobotwinDataset):
             # numpy-backed buffer: replace in place; the sampler reads it per sample
             data = self.replay_buffer.data
             data["point_cloud"] = np.ascontiguousarray(data["point_cloud"][:, :n])
-            if "point_label" in data:
-                data["point_label"] = np.ascontiguousarray(data["point_label"][:, :n])
+            for key in ("point_label", "point_link"):
+                if key in data:
+                    data[key] = np.ascontiguousarray(data[key][:, :n])
 
     def _sample_to_data(self, sample):
         data = super()._sample_to_data(sample)
         if self.drop_point_labels:
             data["_point_label"] = sample["point_label"]
+        if self.load_point_link:
+            data["obs"]["point_link"] = sample["point_link"].astype(np.int8)   # .long() in the policy
+            data["obs"]["point_label"] = sample["point_label"].astype(np.int8)  # analytics only
         return data
 
     def __getitem__(self, idx):

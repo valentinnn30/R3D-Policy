@@ -1,20 +1,34 @@
 """Learned link remover v0 (C2) -- docs/learned_remover_v0.md.
 
 Thins the robot's points PER REGION before the encoder's token FPS; the token budget,
-kNN and FPS itself are unchanged. One logit mu_l per region (a group of the stored link
-cells, `robosuite_pcd.CELL_NAMES`); per training window one draw
+kNN and FPS itself are unchanged. Per region l (a group of the stored link cells,
+`robosuite_pcd.CELL_NAMES`) one draw per training window of TWO random variables:
 
-    z_l ~ N(mu_l, sigma^2),   rho_l = sigmoid(z_l)     (keep rate in (0, 1))
+    g_l ~ Bernoulli(pi_l),  pi_l = sigmoid(a_l)         REMOVAL GATE: keep the region at all?
+    z_l ~ N(mu_l, sigma^2), rho_l = sigmoid(z_l)        DENSITY of a kept region
 
-and region l keeps round(rho_l * n_l) of its n_l points, chosen by FPS WITHIN the region
-(the kept part looks like that region in a sparser cloud). Points outside every region
-(object, scene, cells excluded from all groups) are always kept. Both observation frames of
-a window share the draw. Inference is deterministic: rho_l = sigmoid(mu_l).
+and region l keeps g_l * round(rho_l * n_l) of its n_l points, chosen by FPS WITHIN the
+region. Why two: FPS places the encoder's tokens by surface EXTENT, and FPS thinning keeps a
+region's extent -- measured on Square D2 (N = 4096, 64 tokens), thinning link5-7 to 2% (47
+points) still leaves them 28.3 of their 34.6 tokens (patches 2 -> 14 cm) and nut coverage
+0.55, against 0.81 only at complete removal. So density is a PATCH-SIZE lever and only
+removal moves tokens; the gate explores removal directly instead of needing a draw at
+rho ~ 0 (z ~ -7) to find it. Points outside every region (object, scene, cells in no
+group) are always kept. Both observation frames of a window share the draw.
 
-mu gets no backprop gradient (selection is discrete); it is trained by REINFORCE with a
-leave-one-out baseline (`rloo_surrogate`) on log P(z) = sum_l log N(z_l; mu_l, sigma^2).
-mu is clamped to [mu_min, mu_max] after every step -- bound mu, never rho: a rho floor
-would forbid complete removal, an unbounded mu could drift to -inf and never come back.
+phi = (a, mu) gets no backprop gradient (selection is discrete); REINFORCE with a
+leave-one-out baseline (`rloo_surrogate`) on
+
+    log P(g, z) = sum_l [ log Bern(g_l; pi_l) + g_l * log N(z_l; mu_l, sigma^2) ]
+
+(z_l is irrelevant to the reward when the gate is closed, so it is left out -- a valid
+density of the mixed variable, with less variance). Bounds after every step: mu in
+[mu_min, mu_max] (default [-9, 6]: -9 keeps 0 points of any region below ~4050 points), a in
+[-gate_max, gate_max] (default 5: pi in [0.007, 0.993], so a closed region is still reopened
+now and then and can recover). Bound the logits, never rho / pi.
+
+Inference is deterministic: gate = 1[pi_l >= 0.5], density = sigmoid(mu_l), snapped to 0
+below `snap_rho_below`.
 
 The thinned cloud is compacted (kept points first, in their original order) and padded
 with copies of the first kept point; the valid count is returned as `point_cloud_len`,
@@ -26,7 +40,6 @@ import math
 
 import torch
 import torch.nn as nn
-from pytorch3d.ops import sample_farthest_points
 
 NOT_THINNED = -1
 FPS_MIN_WIDTH = 8
@@ -52,8 +65,25 @@ def region_table(cell_names, region_groups):
     return table, names
 
 
+def region_of(cells, cell_to_region):
+    """per-point region id (C, N), NOT_THINNED (-1) for points in no region."""
+    c2r = cell_to_region.to(cells.device)
+    return torch.where(cells >= 0, c2r[cells.clamp(min=0)], torch.full_like(cells, NOT_THINNED))
+
+
+def _fps_from(xyz, lengths, K, u):
+    """pytorch3d FPS with an explicit start: the floor(u * length)-th point of each cloud.
+    xyz (R, P, 3) with P >= FPS_MIN_WIDTH, lengths / K (R,) long with 1 <= K <= length,
+    u (R,) in [0, 1). Same kernel as `sample_farthest_points`, whose random start is a
+    per-cloud .item() loop and cannot be shared between masks. -> idx (R, max K), -1 padded."""
+    from pytorch3d import _C
+    start = torch.minimum((u.to(xyz.device, torch.float64) * lengths).long(), lengths - 1).clamp(min=0)
+    return _C.sample_farthest_points(xyz.float().contiguous(), lengths, K, start)
+
+
 def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None,
-                 fill_to_min_keep=False, random_start=False):
+                 fill_to_min_keep=False, random_start=False, u_region=None, u_fill=None,
+                 return_keep=False):
     """Keep round(rho[c, l] * n[c, l]) points of region l in cloud c, by FPS within the region.
 
     points (C, N, D) (xyz first), cells (C, N) long link-cell id or -1, rho (C, L) in [0, 1],
@@ -62,8 +92,16 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
     or with fill_to_min_keep gets removed region points back, chosen by FPS over the removed
     points, until it holds M (a deterministic function of the draw, so log P(z) and
     REINFORCE are unchanged; `filled` reports how often it fires).
+
+    FPS start points: u_region (C, L) / u_fill (C,) uniforms in [0, 1) pick the start as the
+    floor(u * n)-th member. Given by the caller, they are SHARED between masks of one window
+    (common random numbers): a region's members do not depend on the mask, so every mask
+    starts at the same physical point, and FPS being greedy, a mask keeping k1 < k2 points
+    of a region keeps exactly the first k1 of the k2 (nested masks). Not given: drawn here
+    (random_start) or 0 (deterministic).
     -> points (C, N, D) compacted + padded, lengths (C,) long, n (C, L) points per region
-       before thinning, k (C, L) kept per region by the draw, filled (C,) points added back.
+       before thinning, k (C, L) kept per region by the draw, filled (C,) points added back
+       [, keep (C, N) bool over the INPUT points if return_keep].
     """
     C, N, _ = points.shape
     L = rho.shape[1]
@@ -79,9 +117,11 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
         raise ValueError(f"link cell ids outside [-1, {n_cells - 1}]")
     if int(cell_to_region.max()) >= L:
         raise ValueError(f"cell_to_region names region {int(cell_to_region.max())} but rho has {L}")
+    for name, u, shape in (("u_region", u_region, (C, L)), ("u_fill", u_fill, (C,))):
+        if u is not None and (tuple(u.shape) != shape or bool((u < 0).any()) or bool((u >= 1).any())):
+            raise ValueError(f"{name} must be {shape} uniforms in [0, 1)")
 
-    cell_to_region = cell_to_region.to(dev)
-    region = torch.where(cells >= 0, cell_to_region[cells.clamp(min=0)], torch.full_like(cells, NOT_THINNED))
+    region = region_of(cells, cell_to_region)
     valid = torch.ones(C, N, dtype=torch.bool, device=dev) if lengths is None else \
         torch.arange(N, device=dev)[None] < lengths.to(dev)[:, None]
     in_region = valid & (region >= 0)
@@ -94,9 +134,10 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
 
     keep = valid & ~in_region
     if n.max() > 0:
-        # gather every region of every cloud into its own padded cloud: (C*L, n_max)
-        # >= 8: pytorch3d 0.7.8's CUDA FPS makes an illegal memory access on a tensor with
-        # fewer than 8 points (seen once the caching allocator is warm); `lengths` masks the rest
+        # gather every region of every cloud into its own padded cloud: (C*L, n_max), members
+        # in their original order. >= 8: pytorch3d 0.7.8's CUDA FPS makes an illegal memory
+        # access on a tensor with fewer than 8 points (seen once the caching allocator is
+        # warm); `lengths` masks the rest
         n_max = max(int(n.max()), FPS_MIN_WIDTH)
         order = torch.argsort(onehot_idx * (N + 1) + torch.arange(N, device=dev)[None], dim=1)   # stable by region
         sorted_region = torch.gather(onehot_idx, 1, order)
@@ -111,9 +152,10 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
         xyz = torch.gather(points[..., :3], 1, member.clamp(min=0).view(C, L * n_max, 1).expand(-1, -1, 3))
         xyz = xyz.view(C * L, n_max, 3)
         kk = k.reshape(-1)
-        _, sel = sample_farthest_points(xyz, lengths=n.reshape(-1), K=kk.clamp(min=1),
-                                        random_start_point=random_start)
-        # pytorch3d returns index 0 even for K = 0 or an empty cloud: mask by slot < K
+        u = u_region.reshape(-1) if u_region is not None else (
+            torch.rand(C * L, device=dev) if random_start else torch.zeros(C * L, device=dev))
+        # pytorch3d needs K >= 1 and length >= 1 per row; those rows are masked by slot < K
+        sel = _fps_from(xyz, n.reshape(-1).clamp(min=1), kk.clamp(min=1), u)
         sel_ok = torch.arange(sel.shape[1], device=dev)[None] < kk[:, None]
         chosen = torch.gather(member, 1, sel.clamp(min=0))                           # point index in cloud
         rows = torch.arange(C, device=dev).repeat_interleave(L)[:, None].expand_as(chosen)
@@ -132,8 +174,10 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
         n_rem = removed.sum(1)
         w = max(int(n_rem.max()), FPS_MIN_WIDTH)
         idx = torch.argsort((~removed).long() * (N + 1) + torch.arange(N, device=dev)[None], dim=1)[:, :w]
-        xyz = torch.gather(points[rd][..., :3], 1, idx[..., None].expand(-1, -1, 3)).contiguous()
-        _, sel = sample_farthest_points(xyz, lengths=n_rem, K=deficit[rd], random_start_point=random_start)
+        xyz = torch.gather(points[rd][..., :3], 1, idx[..., None].expand(-1, -1, 3))
+        u = u_fill[rd] if u_fill is not None else (
+            torch.rand(len(rd), device=dev) if random_start else torch.zeros(len(rd), device=dev))
+        sel = _fps_from(xyz, n_rem, deficit[rd], u)
         sel_ok = torch.arange(sel.shape[1], device=dev)[None] < deficit[rd][:, None]
         chosen = torch.gather(idx, 1, sel.clamp(min=0))
         keep[rd[:, None].expand_as(chosen)[sel_ok], chosen[sel_ok]] = True
@@ -147,25 +191,36 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
     out = torch.gather(points, 1, order[..., None].expand_as(points))
     pad = torch.arange(N, device=dev)[None] >= out_len[:, None]
     out = torch.where(pad[..., None], out[:, :1].expand_as(out), out)
+    if return_keep:
+        return out, out_len, n, k, filled, keep
     return out, out_len, n, k, filled
 
 
-def thin_window(points, cells, rho, cell_to_region, lengths=None, **kw):
+def thin_window(points, cells, rho, cell_to_region, lengths=None, u_region=None, u_fill=None,
+                return_keep=False, **kw):
     """points (B, To, N, D), cells (B, To, N), rho (B, L): ONE draw per window, applied to
-    each of its To frames (each frame's FPS runs on its own points).
-    -> points (B, To, N, D), lengths (B, To), n (B, To, L), k (B, To, L), filled (B, To)."""
+    each of its To frames (each frame's FPS runs on its own points). u_region (B, To, L) /
+    u_fill (B, To): shared FPS-start uniforms (see thin_regions).
+    -> points (B, To, N, D), lengths (B, To), n (B, To, L), k (B, To, L), filled (B, To)
+       [, keep (B, To, N)]."""
     B, To = points.shape[:2]
-    flat = lambda x: x.reshape(B * To, *x.shape[2:])
-    out, ln, n, k, filled = thin_regions(flat(points), flat(cells), rho.repeat_interleave(To, 0),
-                                         cell_to_region, None if lengths is None else flat(lengths), **kw)
-    return out.view(points.shape), ln.view(B, To), n.view(B, To, -1), k.view(B, To, -1), filled.view(B, To)
+    flat = lambda x: None if x is None else x.reshape(B * To, *x.shape[2:])
+    res = thin_regions(flat(points), flat(cells), rho.repeat_interleave(To, 0), cell_to_region,
+                       flat(lengths), u_region=flat(u_region), u_fill=flat(u_fill),
+                       return_keep=return_keep, **kw)
+    out, ln, n, k, filled = res[:5]
+    res_w = (out.view(points.shape), ln.view(B, To), n.view(B, To, -1), k.view(B, To, -1), filled.view(B, To))
+    return res_w + ((res[5].view(B, To, -1),) if return_keep else ())
 
 
 class LinkRemover(nn.Module):
-    """The remover's parameters phi = mu (one logit per region) and its sampling."""
+    """phi = (a: removal-gate logit, mu: density logit) per region, and its sampling.
 
-    def __init__(self, cell_names, region_groups, init_rho=0.8, sigma=1.0, mu_min=-8.0, mu_max=6.0,
-                 snap_rho_below=None):
+    A draw is ONE tensor (..., 2L): [z (L) | g (L)], g in {0., 1.} -- so a batch of draws
+    moves through sample / log_prob / rho without a second container."""
+
+    def __init__(self, cell_names, region_groups, init_rho=0.8, init_keep=0.8, sigma=1.0,
+                 mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None):
         super().__init__()
         table, self.region_names = region_table(cell_names, region_groups)
         self.cell_names = list(cell_names)
@@ -173,16 +228,19 @@ class LinkRemover(nn.Module):
         L = len(self.region_names)
         if L == 0:
             raise ValueError("link remover with no regions")
-        if not 0.0 < init_rho < 1.0:
-            raise ValueError("init_rho must be in (0, 1)")
-        self.mu_min, self.mu_max = float(mu_min), float(mu_max)
+        for name, v in (("init_rho", init_rho), ("init_keep", init_keep)):
+            if not 0.0 < v < 1.0:
+                raise ValueError(f"{name} must be in (0, 1)")
+        self.mu_min, self.mu_max, self.gate_max = float(mu_min), float(mu_max), float(gate_max)
         # post-training snap: deterministic rho below this -> 0 (complete removal). Inference
         # only -- training draws are never snapped, so no region can get stuck at rho = 0;
         # sparse remnants of a mostly-removed region would otherwise be FPS magnets.
         if snap_rho_below is not None and not 0.0 < float(snap_rho_below) < 1.0:
             raise ValueError("snap_rho_below must be in (0, 1) or None")
         self.snap_rho_below = None if snap_rho_below is None else float(snap_rho_below)
-        self.mu = nn.Parameter(torch.full((L,), math.log(init_rho / (1 - init_rho))))
+        logit = lambda p: math.log(p / (1 - p))
+        self.mu = nn.Parameter(torch.full((L,), logit(init_rho)))
+        self.gate = nn.Parameter(torch.full((L,), logit(init_keep)))
         self.register_buffer("sigma", torch.tensor(float(sigma)))
         self.clamp_()
 
@@ -193,30 +251,49 @@ class LinkRemover(nn.Module):
     @torch.no_grad()
     def clamp_(self):
         self.mu.clamp_(self.mu_min, self.mu_max)
+        self.gate.clamp_(-self.gate_max, self.gate_max)
 
     @torch.no_grad()
     def set_sigma(self, sigma):
         self.sigma.fill_(float(sigma))
 
+    def keep_prob(self):
+        return torch.sigmoid(self.gate.detach())
+
     def sample(self, n):
-        """-> z (n, L), detached."""
+        """-> draws (n, 2L) = [z | g], detached."""
         with torch.no_grad():
-            return self.mu[None] + self.sigma * torch.randn(n, self.n_regions, device=self.mu.device)
+            L, dev = self.n_regions, self.mu.device
+            z = self.mu[None] + self.sigma * torch.randn(n, L, device=dev)
+            g = (torch.rand(n, L, device=dev) < torch.sigmoid(self.gate)[None]).to(z.dtype)
+            return torch.cat([z, g], -1)
 
-    def log_prob(self, z):
-        """sum_l log N(z_l; mu_l, sigma^2) -> (...,); gradient reaches mu only."""
+    def split(self, draw):
+        L = self.n_regions
+        if draw.shape[-1] != 2 * L:
+            raise ValueError(f"a draw is (..., 2L = {2 * L}), got {tuple(draw.shape)}")
+        return draw[..., :L], draw[..., L:]
+
+    def log_prob(self, draw):
+        """sum_l [log Bern(g_l; sigmoid(a_l)) + g_l log N(z_l; mu_l, sigma^2)] -> (...,);
+        the gradient reaches a and mu only."""
+        z, g = self.split(draw.detach())
         s = self.sigma
-        return (-0.5 * ((z.detach() - self.mu) / s) ** 2 - torch.log(s) - 0.5 * math.log(2 * math.pi)).sum(-1)
+        lp_z = -0.5 * ((z - self.mu) / s) ** 2 - torch.log(s) - 0.5 * math.log(2 * math.pi)
+        lp_g = g * torch.nn.functional.logsigmoid(self.gate) + (1 - g) * torch.nn.functional.logsigmoid(-self.gate)
+        return (lp_g + g * lp_z).sum(-1)
 
-    def rho(self, z=None):
-        """keep rates: sigmoid(z) for a training draw (never snapped); without a draw the
-        deterministic inference rates sigmoid(mu), with rates below `snap_rho_below` set to 0."""
-        if z is not None:
-            return torch.sigmoid(z)
+    def rho(self, draw=None):
+        """effective keep rates g * sigmoid(z) for a training draw (never snapped); without a
+        draw the deterministic inference rates 1[pi >= 0.5] * sigmoid(mu), the density snapped
+        to 0 below `snap_rho_below`."""
+        if draw is not None:
+            z, g = self.split(draw)
+            return g * torch.sigmoid(z)
         rho = torch.sigmoid(self.mu.detach())
         if self.snap_rho_below is not None:
             rho = torch.where(rho < self.snap_rho_below, torch.zeros_like(rho), rho)
-        return rho
+        return torch.where(self.keep_prob() >= 0.5, rho, torch.zeros_like(rho))
 
 
 def rloo_surrogate(log_prob, loss):

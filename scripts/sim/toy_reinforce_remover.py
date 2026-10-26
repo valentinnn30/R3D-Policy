@@ -2,43 +2,36 @@
 """Step 0.3 of the learned link remover (docs/learned_remover_v0.md): toy REINFORCE test.
 No policy, no GPU, seconds.  Run in r3d_sim.
 
-    python scripts/sim/toy_reinforce_remover.py                    # full sweep + pass/fail
-    python scripts/sim/toy_reinforce_remover.py --lrs 1e-2 --noise 3
+    python scripts/sim/toy_reinforce_remover.py                    # sweep + controls + pass/fail
+    python scripts/sim/toy_reinforce_remover.py --compare          # drift vs learning over a run's budget
 
-The diffusion loss is replaced by a synthetic per-draw reward with a KNOWN answer:
+The remover draws, per region l, a removal gate g_l ~ Bern(sigmoid(a_l)) and a density
+z_l ~ N(mu_l, sigma^2); the region keeps k_l = g_l * round(sigmoid(z_l) * n_l) points. The
+diffusion loss is replaced by a synthetic per-draw reward with a KNOWN answer, shaped like
+the measured mechanism (FPS puts tokens by surface extent, so only REMOVAL moves tokens;
+thinning only changes patch size -- link_remover.py header):
 
-    L_ik = b_i + sum_l w_l * f_l(rho_ik) + eps_ik
-    f_l   = round(rho_l * n_l) / n_l       (the kept FRACTION, discretised as the real remover)
-    b_i   ~ N(0, window_spread^2)          per window, shared by its K draws (RLOO cancels it)
-    eps   ~ N(0, (noise * effect)^2)       per draw (the part of the real loss that is not the
-                                            mask: encoder FPS start, thinning FPS start, ...)
+    L_ik = b_i + sum_l w_l * 1[k_l > 0] + sum_l v_l * k_l / n_l + eps_ik
 
-w = +effect on --cut (default link6: keeping it RAISES the loss -> thin it to 0) and
-w = -effect on --keep (default the four finger regions) (thinning them raises the loss -> keep everything); all other
-regions w = 0. n_l are the region sizes measured by link_stats.py (mean at --num-points)
-when the report exists, else a stated guess.
+    w = +effect on --cut (default link6: keeping it at all RAISES the loss -> remove it),
+        -effect on --keep (default both fingers: removing them raises it), 0 elsewhere
+    v = --density-effect * effect on every region (default 0: density is a pure nuisance)
+    b_i ~ N(0, (10 effect)^2) per window, shared by its K draws (RLOO cancels it)
+    eps ~ N(0, (noise * effect)^2) per draw
 
-Everything else is the real training machinery: LinkRemover (logit-normal, clamp to
-[-8, 6]), K = 2 draws per window, rloo_surrogate, Adam on mu, sigma annealed 1.0 -> 0.2.
+n_l are the region sizes measured by link_stats.py (mean at --num-points). Everything else
+is the real machinery: LinkRemover (bounds mu [-9, 6], gate [-5, 5]), K draws per window,
+rloo_surrogate, Adam on (gate, mu), sigma annealed 1.0 -> 0.2.
 
-Two criteria per run (neutral regions' mu must stay within 1 logit for both):
-  PATTERN  rho_cut < 0.1 and every finger rho > 0.9
-  COMPLETE the --cut region keeps 0 points (deterministic) and every finger keeps >= 98%
-COMPLETE is expected to be slow: the score-function signal for region l scales with
-w_l * rho_l (1 - rho_l), which vanishes as the sigmoid saturates. PASS = the PATTERN is
-learned on every seed at some Adam lr, the mirrored weights give the mirrored result, and
-plain REINFORCE (no baseline: adv = L) does worse. A last run over a real run's phi budget
-(--budget) reports how far the --cut region gets and how far the zero-signal regions random-walk
-(Adam steps ~lr per update whatever the gradient's size).
-
-The brief proposes lr_phi = 0.1 * lr_theta = 1e-5. With Adam, mu moves at most ~lr per
-update, and a Square run gives ~14k phi updates (251 epochs x 224 optimizer steps / 4):
-<= 0.14 logit in total. The sweep therefore reports updates-to-pass per lr.
+PATTERN = keep prob of --cut < 0.1, of every --keep > 0.9, and no neutral region's gate
+logit moved by more than 1. PASS = the PATTERN is learned on every seed at some Adam lr,
+the mirrored weights give the mirrored result, and plain REINFORCE (no baseline) does
+worse. Drift is reported for both logits: a neutral GATE that drifts closed removes a
+region by noise; the density logits are all neutral here (v = 0) and show pure drift.
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 
@@ -50,177 +43,184 @@ sys.path.insert(0, os.path.join(ROOT, "R3D"))
 from r3d.common import robosuite_pcd as RP  # noqa: E402
 from r3d.model.vision.link_remover import LinkRemover, rloo_surrogate  # noqa: E402
 
-GOOD_TO_CUT = "link6"      # set by --cut: present in every frame, the largest region
-FINGERS = ("finger1_prox", "finger1_dist", "finger2_prox", "finger2_dist")   # set by --keep
+OUT = os.path.join(ROOT, "R3D", "data", "outputs", "sim", "link_labels")
 
 
 def region_sizes(names, num_points):
-    p = os.path.join(ROOT, "R3D", "data", "outputs", "sim", "link_labels", "square_d2-agentview_p4096-200_stats.json")
+    p = os.path.join(OUT, "square_d2-agentview_p4096-200_stats_v0.json")
     if os.path.exists(p):
         reg = json.load(open(p))["per_N"][str(num_points)]["regions"]
         return np.array([max(1.0, round(reg[nm]["mean"])) for nm in names]), p
     return np.full(len(names), 100.0), "guess: 100 points per region"
 
 
-def run(names, n_l, w, lr, noise, effect, updates, B=64, K=2, baseline=True, seed=0,
-        sigma0=1.0, sigma1=0.2, anneal=None, window_spread=None, opt="adam"):
-    """-> (first update with the PATTERN, first update with COMPLETE removal, final state, history)"""
+class Toy:
+    def __init__(self, names, n_l, cut, keep, effect, density_effect):
+        self.names, self.cut, self.keep = names, cut, keep
+        self.ic, self.ik = names.index(cut), [names.index(k) for k in keep]
+        self.neutral = [i for i in range(len(names)) if i != self.ic and i not in self.ik]
+        self.n = torch.as_tensor(n_l, dtype=torch.float64)
+        self.w = torch.zeros(len(names), dtype=torch.float64)
+        self.w[self.ic] = effect
+        self.w[self.ik] = -effect
+        self.v = torch.full((len(names),), density_effect * effect, dtype=torch.float64)
+        self.effect = effect
+
+    def loss(self, rem, draw, noise, spread):
+        B, K = draw.shape[:2]
+        k = torch.floor(rem.rho(draw).double() * self.n + 0.5)
+        return (spread * torch.randn(B, 1, dtype=torch.float64) + ((k > 0).double() * self.w).sum(-1)
+                + (k / self.n * self.v).sum(-1) + noise * self.effect * torch.randn(B, K, dtype=torch.float64))
+
+    def state(self, rem, a0, mu0):
+        kp = rem.keep_prob().double()
+        dg = (rem.gate.detach() - a0)[self.neutral].abs()
+        dm = (rem.mu.detach() - mu0).abs()
+        pattern = kp[self.ic] < 0.1 and all(kp[i] > 0.9 for i in self.ik) and dg.max() <= 1.0
+        return {"pattern": bool(pattern), "keep_cut": kp[self.ic].item(),
+                "keep_kept": [kp[i].item() for i in self.ik],
+                "neutral_gate_drift_max": dg.max().item(), "neutral_gate_drift_med": dg.median().item(),
+                "neutral_keep_prob": kp[self.neutral].tolist(),
+                "mu_drift_max": dm.max().item(), "gate": rem.gate.detach().tolist(), "mu": rem.mu.detach().tolist()}
+
+
+def run(toy, lr, noise, updates, B=64, K=2, baseline=True, seed=0, sigma0=1.0, sigma1=0.2,
+        anneal=None, accum=1, mirror=False):
+    """-> (first step with the PATTERN, final state, history)."""
     torch.manual_seed(seed)
-    rem = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), init_rho=0.8, sigma=sigma0)
-    assert rem.region_names == names
-    if opt == "adam":
-        optim = torch.optim.Adam([rem.mu], lr=lr)
-    elif opt == "sgd_norm":      # SGD on the surrogate with the advantage divided by its batch std
-        optim = torch.optim.SGD([rem.mu], lr=lr)
-    else:
-        raise ValueError(opt)
-    n_t, w_t = torch.as_tensor(n_l, dtype=torch.float64), torch.as_tensor(w, dtype=torch.float64)
-    spread = 10 * effect if window_spread is None else window_spread
+    rem = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), init_rho=0.8, init_keep=0.8, sigma=sigma0)
+    assert rem.region_names == toy.names
+    opt = torch.optim.Adam([rem.gate, rem.mu], lr=lr)
+    a0, mu0 = rem.gate.detach().clone(), rem.mu.detach().clone()
     anneal = min(updates // 2, 2000) if anneal is None else anneal
-    mu0 = rem.mu.detach().clone()
-    pattern_at = complete_at = None
-    hist = []
+    sign = -1.0 if mirror else 1.0
+    pattern_at, hist = None, []
     for u in range(updates):
         rem.set_sigma(sigma0 + (sigma1 - sigma0) * min(1.0, u / max(1, anneal)))
-        z = rem.sample(B * K).view(B, K, -1)
-        rho = torch.sigmoid(z).double()
-        frac = torch.floor(rho * n_t + 0.5) / n_t
-        loss = (spread * torch.randn(B, 1, dtype=torch.float64) + (frac * w_t).sum(-1)
-                + noise * effect * torch.randn(B, K, dtype=torch.float64))
-        lp = rem.log_prob(z)
+        draw = rem.sample(B * K).view(B, K, -1)
+        loss = sign * toy.loss(rem, draw, noise, 10 * toy.effect)
+        lp = rem.log_prob(draw)
         if baseline:
-            surr, adv = rloo_surrogate(lp, loss.float())
+            surr, _ = rloo_surrogate(lp, loss.float())
         else:
-            adv = loss.float()
-        if opt == "sgd_norm":
-            adv = adv / adv.std().clamp(min=1e-12)
-        surr = (adv * lp).mean()
-        optim.zero_grad()
-        surr.backward()
-        optim.step()
-        rem.clamp_()
-        st = state(rem, names, n_t, mu0)
+            surr = (loss.float() * lp).mean()
+        (surr / accum).backward()
+        if (u + 1) % accum == 0:
+            opt.step()
+            opt.zero_grad()
+            rem.clamp_()
+        st = toy.state(rem, a0, mu0)
         hist.append(st)
         if pattern_at is None and st["pattern"]:
             pattern_at = u + 1
-        if complete_at is None and st["complete"]:
-            complete_at = u + 1
-    return pattern_at, complete_at, hist[-1], hist
+    return pattern_at, hist[-1], hist
 
 
-def state(rem, names, n_t, mu0):
-    """PATTERN: rho_cut < 0.1, every finger rho > 0.9, neutral |d mu| <= 1.
-    COMPLETE: the --cut region keeps 0 points (deterministic), fingers >= 98%, neutral |d mu| <= 1."""
-    rho = rem.rho().double()
-    keep = torch.floor(rho * n_t + 0.5)
-    i3 = names.index(GOOD_TO_CUT)
-    fi = [names.index(f) for f in FINGERS]
-    neutral = [i for i in range(len(names)) if i != i3 and i not in fi]
-    drift = (rem.mu.detach() - mu0)[neutral].abs().max().item()
-    pattern = rho[i3].item() < 0.1 and all(rho[i].item() > 0.9 for i in fi) and drift <= 1.0
-    complete = keep[i3].item() == 0 and all(keep[i].item() >= 0.98 * n_t[i].item() for i in fi) and drift <= 1.0
-    return {"pattern": pattern, "complete": complete, "mu": rem.mu.detach().tolist(),
-            "rho_cut": rho[i3].item(), "keep_cut": keep[i3].item(),
-            "finger_rho_min": min(rho[i].item() for i in fi), "neutral_max_drift": drift}
+VARIANTS = [   # name, kwargs -- reward compute per phi step relative to B=64, K=2 in brackets
+    ("A adam 3e-2 B64 K2", dict(lr=3e-2, B=64, K=2)),                  # [1x]
+    ("B adam 1e-2 B64 K2", dict(lr=1e-2, B=64, K=2)),                  # [1x]
+    ("C adam 1e-2 B128 K2", dict(lr=1e-2, B=128, K=2)),                # [2x]
+    ("D adam 1e-2 B64 K4", dict(lr=1e-2, B=64, K=4)),                  # [2x]
+    ("F adam 1e-2 B128 K4", dict(lr=1e-2, B=128, K=4)),                # [4x]
+    ("G adam 3e-3 B128 K4", dict(lr=3e-3, B=128, K=4)),                # [4x]  config default
+    ("I adam 1e-3 B128 K4", dict(lr=1e-3, B=128, K=4)),                # [4x]
+]
+
+
+def compare(a, toy):
+    print(f"\nover {a.budget} phi steps, {a.seeds} seeds; cut {toy.cut} / keep {toy.keep} / "
+          f"{len(toy.neutral)} neutral gates; density effect {a.density_effect}")
+    print(f"{'variant':24s} {'noise':>5s} | {'pattern@':>16s} | {'keep prob cut':>17s} | {'keep prob kept min':>18s} | "
+          f"{'neutral gate drift max/med':>27s} | {'neutral gates closed':>20s} | {'mu drift max':>14s}")
+    rows = []
+    for nm, kw in VARIANTS:
+        for nz in a.noise:
+            res = [run(toy, noise=nz, updates=a.budget, seed=sd, **kw) for sd in range(a.seeds)]
+            last = [r[1] for r in res]
+            f = lambda vals, p=3: " ".join(f"{v:.{p}f}" for v in vals)
+            closed = [sum(k < 0.5 for k in L["neutral_keep_prob"]) for L in last]
+            print(f"{nm:24s} {nz:4g}x | {' '.join('-' if r[0] is None else str(r[0]) for r in res):>16s} | "
+                  f"{f([L['keep_cut'] for L in last]):>17s} | {f([min(L['keep_kept']) for L in last], 2):>18s} | "
+                  f"{f([L['neutral_gate_drift_max'] for L in last], 1)} / {f([L['neutral_gate_drift_med'] for L in last], 1)} | "
+                  f"{' '.join(map(str, closed)):>20s} | {f([L['mu_drift_max'] for L in last], 1):>14s}", flush=True)
+            rows.append({"variant": nm, "noise": nz, "pattern_at": [r[0] for r in res], "final": last})
+    with open(os.path.join(OUT, "toy_reinforce_compare.json"), "w") as fh:
+        json.dump({"regions": toy.names, "budget": a.budget, "rows": rows}, fh, indent=1)
 
 
 def main():
-    global GOOD_TO_CUT, FINGERS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lrs", type=float, nargs="+", default=[1e-5, 1e-3, 3e-3, 1e-2, 3e-2])
     ap.add_argument("--noise", type=float, nargs="+", default=[1.0, 3.0, 10.0],
-                    help="per-draw noise std in units of the full effect size")
-    ap.add_argument("--effect", type=float, default=0.01, help="loss change for rho 0 -> 1 of one region")
+                    help="per-draw noise std in units of the effect size")
+    ap.add_argument("--effect", type=float, default=0.01, help="loss change when a region is removed")
+    ap.add_argument("--density-effect", type=float, default=0.0,
+                    help="loss change for density 0 -> 1, in units of --effect (0: density is a nuisance)")
     ap.add_argument("--updates", type=int, default=1000)
-    ap.add_argument("--num-points", type=int, default=4096)
+    ap.add_argument("--num-points", type=int, default=1024)
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--cut", default=GOOD_TO_CUT, help="region whose removal lowers the loss")
-    ap.add_argument("--keep", nargs="+", default=list(FINGERS), help="regions whose thinning raises it")
-    ap.add_argument("--sgd-lrs", type=float, nargs="+", default=[0.1, 0.3, 1.0],
-                    help="SGD with the advantage normalised by its batch std (comparison to Adam)")
-    ap.add_argument("--budget", type=int, default=14000, help="phi updates of a real Square run")
+    ap.add_argument("--cut", default="link6", help="region whose removal lowers the loss")
+    ap.add_argument("--keep", nargs="+", default=["finger1", "finger2"], help="regions whose removal raises it")
+    ap.add_argument("--budget", type=int, default=14000, help="phi steps of a real Square run")
+    ap.add_argument("--compare", action="store_true", help="only the drift-vs-learning comparison of VARIANTS")
     a = ap.parse_args()
-    GOOD_TO_CUT, FINGERS = a.cut, tuple(a.keep)
 
     names = [g["name"] for g in RP.default_region_groups()]
     n_l, src = region_sizes(names, a.num_points)
     print(f"{len(names)} regions; sizes from {src}:\n  " + ", ".join(f"{nm} {int(n)}" for nm, n in zip(names, n_l)))
-    w = np.zeros(len(names))
-    w[names.index(GOOD_TO_CUT)] = a.effect
-    for f in FINGERS:
-        w[names.index(f)] = -a.effect
+    toy = Toy(names, n_l, a.cut, a.keep, a.effect, a.density_effect)
+    os.makedirs(OUT, exist_ok=True)
+    if a.compare:
+        return compare(a, toy)
 
-    # 0. gradient sign, analytically: d/dmu of the surrogate = mean(adv * (z - mu) / sigma^2)
+    # gradient sign, analytically: d/da = mean(adv (g - pi)), d/dmu = mean(adv g (z - mu)) / sigma^2
     rem = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), sigma=0.5)
-    z = rem.sample(8).view(4, 2, -1)
+    draw = rem.sample(8).view(4, 2, -1)
     loss = torch.randn(4, 2)
-    surr, adv = rloo_surrogate(rem.log_prob(z), loss)
+    surr, adv = rloo_surrogate(rem.log_prob(draw), loss)
     surr.backward()
-    expect = (adv[..., None] * (z - rem.mu.detach()) / 0.25).mean((0, 1))
-    assert torch.allclose(rem.mu.grad, expect, atol=1e-6), "surrogate gradient != (z - mu) / sigma^2 * adv"
+    z, g = rem.split(draw)
+    pi = torch.sigmoid(rem.gate.detach())
+    assert torch.allclose(rem.gate.grad, (adv[..., None] * (g - pi)).mean((0, 1)), atol=1e-6)
+    assert torch.allclose(rem.mu.grad, (adv[..., None] * g * (z - rem.mu.detach()) / 0.25).mean((0, 1)), atol=1e-6)
     assert torch.allclose(adv[:, 0], loss[:, 0] - loss[:, 1]) and torch.allclose(adv[:, 1], -adv[:, 0])
-    print("gradient check: d surrogate / d mu = mean(adv (z - mu) / sigma^2); K=2 adv = L1 - L2: OK")
+    print("gradient check: d/da = mean(adv (g - pi)), d/dmu = mean(adv g (z - mu)) / sigma^2, "
+          "K=2 adv = L1 - L2: OK")
 
     results = {"regions": names, "sizes": n_l.tolist(), "effect": a.effect, "updates": a.updates, "runs": []}
-    fmt = lambda v: "-" if v is None else str(v)
-    print(f"\nupdates to PATTERN / COMPLETE (of {a.updates}; '-' = never), {a.seeds} seeds, RLOO, B=64, K=2;"
-          f" then final rho_cut | finger rho min | neutral drift (seed 0)")
-    for opt, lrs in (("adam", a.lrs), ("sgd_norm", a.sgd_lrs)):
-        for lr in lrs:
-            for nz in a.noise:
-                pats, comps = [], []
-                for s in range(a.seeds):
-                    p, c, last, _ = run(names, n_l, w, lr, nz, a.effect, a.updates, seed=s, opt=opt)
-                    pats.append(p)
-                    comps.append(c)
-                    results["runs"].append({"opt": opt, "lr": lr, "noise": nz, "seed": s, "pattern_at": p,
-                                            "complete_at": c, "final": last})
-                    if s == 0:
-                        last0 = last
-                print(f"{opt:8s} lr {lr:7.0e} noise {nz:4g}x | pattern {' '.join(map(fmt, pats)):18s} | complete "
-                      f"{' '.join(map(fmt, comps)):18s} | {last0['rho_cut']:.3f} | {last0['finger_rho_min']:.3f} | "
-                      f"{last0['neutral_max_drift']:.2f}", flush=True)
-
-    # choose the Adam lr whose PATTERN arrives on every seed at the highest noise, fastest
+    print(f"\nsteps to PATTERN (of {a.updates}; '-' = never), {a.seeds} seeds, RLOO, B=64, K=2; then final "
+          f"keep prob cut | keep prob kept min | neutral gate drift max (seed 0)")
     by = {}
-    for r in results["runs"]:
-        if r["opt"] == "adam" and r["pattern_at"] is not None:
-            by.setdefault((r["lr"], r["noise"]), []).append(r["pattern_at"])
-    good = sorted([k for k, v in by.items() if len(v) == a.seeds], key=lambda k: (-k[1], np.median(by[k])))
-    if not good:
-        raise SystemExit("toy REINFORCE FAILED: no Adam lr learns the pattern on every seed")
-    lr, nz = good[0]
+    for lr in a.lrs:
+        for nz in a.noise:
+            ps, last0 = [], None
+            for s in range(a.seeds):
+                p, last, _ = run(toy, lr, nz, a.updates, seed=s)
+                ps.append(p)
+                last0 = last0 or last
+                results["runs"].append({"lr": lr, "noise": nz, "seed": s, "pattern_at": p, "final": last})
+            if all(p is not None for p in ps):
+                by[(lr, nz)] = ps
+            print(f"adam lr {lr:7.0e} noise {nz:4g}x | {' '.join('-' if p is None else str(p) for p in ps):18s} | "
+                  f"{last0['keep_cut']:.3f} | {min(last0['keep_kept']):.3f} | {last0['neutral_gate_drift_max']:.2f}",
+                  flush=True)
+    if not by:
+        raise SystemExit("toy REINFORCE FAILED: no lr learns the pattern on every seed")
+    lr, nz = sorted(by, key=lambda k: (-k[1], np.median(by[k])))[0]
     print(f"\ncontrols at Adam lr {lr:g}, noise {nz:g}x:")
-    _, _, last_m, _ = run(names, n_l, -w, lr, nz, a.effect, a.updates, seed=0)
-    i3 = names.index(GOOD_TO_CUT)
-    fi = [names.index(f) for f in FINGERS]
-    rho_m = 1 / (1 + np.exp(-np.array(last_m["mu"])))
-    mirror_ok = rho_m[i3] > 0.9 and all(rho_m[i] < 0.1 for i in fi)
-    print(f"  mirrored weights: rho {GOOD_TO_CUT} {rho_m[i3]:.3f}, keep regions {np.round(rho_m[fi], 3).tolist()} -> "
-          f"{'mirrored OK' if mirror_ok else 'NOT MIRRORED'}")
-    p_b, _, last_b, _ = run(names, n_l, w, lr, nz, a.effect, a.updates, seed=0, baseline=False)
+    _, last_m, _ = run(toy, lr, nz, a.updates, mirror=True)
+    mirror_ok = last_m["keep_cut"] > 0.9 and max(last_m["keep_kept"]) < 0.1
+    print(f"  mirrored weights: keep prob {toy.cut} {last_m['keep_cut']:.3f}, {toy.keep} "
+          f"{np.round(last_m['keep_kept'], 3).tolist()} -> {'mirrored OK' if mirror_ok else 'NOT MIRRORED'}")
+    p_b, last_b, _ = run(toy, lr, nz, a.updates, baseline=False)
     p_r = int(np.median(by[(lr, nz)]))
     base_ok = p_b is None or p_b > p_r
-    print(f"  plain REINFORCE (no baseline): pattern at {p_b} vs RLOO median {p_r}; final rho_cut "
-          f"{last_b['rho_cut']:.3f}, drift {last_b['neutral_max_drift']:.2f} -> "
-          f"{'baseline helps OK' if base_ok else 'BASELINE DOES NOT HELP'}")
-    # a real run's phi budget: neutral drift and how far the --cut region gets
-    long = {}
-    for opt, l in (("adam", lr), ("sgd_norm", a.sgd_lrs[len(a.sgd_lrs) // 2])):
-        p, c, last_l, h = run(names, n_l, w, l, nz, a.effect, a.budget, seed=0, opt=opt)
-        long[opt] = {"lr": l, "pattern_at": p, "complete_at": c, "final": last_l,
-                     "neutral_drift_at": {str(u): h[u - 1]["neutral_max_drift"] for u in (1000, 5000, a.budget) if u <= a.budget}}
-        print(f"  {a.budget} updates ({opt}, lr {l:g}): pattern {fmt(p)}, complete {fmt(c)}, final rho_cut "
-              f"{last_l['rho_cut']:.4f} (keeps {int(last_l['keep_cut'])}), fingers min {last_l['finger_rho_min']:.3f}, "
-              f"neutral drift " + ", ".join(f"{k}: {v:.2f}" for k, v in long[opt]["neutral_drift_at"].items()), flush=True)
-    results["controls"] = {"lr": lr, "noise": nz, "mirrored_ok": bool(mirror_ok), "mirrored_final": last_m,
-                           "no_baseline_pattern_at": p_b, "rloo_pattern_at_median": p_r, "baseline_ok": bool(base_ok),
-                           "long_run": long}
-    out = os.path.join(ROOT, "R3D", "data", "outputs", "sim", "link_labels", "toy_reinforce.json")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "w") as fh:
+    print(f"  plain REINFORCE (no baseline): pattern at {p_b} vs RLOO median {p_r}; final keep prob cut "
+          f"{last_b['keep_cut']:.3f} -> {'baseline helps OK' if base_ok else 'BASELINE DOES NOT HELP'}")
+    results["controls"] = {"lr": lr, "noise": nz, "mirrored_ok": bool(mirror_ok), "no_baseline_pattern_at": p_b,
+                           "rloo_pattern_at_median": p_r, "baseline_ok": bool(base_ok)}
+    with open(os.path.join(OUT, "toy_reinforce.json"), "w") as fh:
         json.dump(results, fh, indent=1)
-    print(f"report: {out}")
     if not (mirror_ok and base_ok):
         raise SystemExit("toy REINFORCE controls FAILED")
     print("toy REINFORCE: PASS (pattern learned, mirrored, baseline helps)")

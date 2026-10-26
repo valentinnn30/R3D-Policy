@@ -9,7 +9,7 @@ Checks (`r3d/model/vision/link_remover.py`), at N = 1024 and 4096:
     points = FPS within the region), every non-robot point is kept, order is preserved
   2 one draw per window: both observation frames are thinned with the same rho
   3 rho = 1 everywhere returns the input unchanged, length N
-  4 rho = 0 everywhere == label_cut.cut_points_by_label(arm + gripper), bit for bit
+  4 rho = 0 everywhere == label_cut.cut_points_by_label of the region points, bit for bit
   5 already-padded input (lengths < N): padding never enters a region or the output
   6 the encoder (DP3Encoder, deterministic FPS) on padded cloud + point_cloud_len equals
     the encoder on the trimmed cloud, bit for bit -- the R1 padding contract
@@ -17,6 +17,15 @@ Checks (`r3d/model/vision/link_remover.py`), at N = 1024 and 4096:
     clouds already >= M are untouched
   8 contract violations raise: N_kept < M (without fill), unknown cell id, rho outside
     [0, 1], shape; mu bounds; inference rho = sigmoid(mu), snapped below snap_rho_below
+  9 shared within-region FPS starts (CRN): masks are nested -- with rho1 <= rho2 the k1
+    kept points of a region are exactly the first k1 of the k2 selection
+
+Policy checks (DP3LinkRemover, N = 1024, 64 tokens; skip with --no-policy):
+ 10 remover off: compute_loss and predict_action bit-identical to baseline DP3
+ 11 common-random-numbers reward: the same mask twice -> reward difference exactly 0;
+    the same (masks, seeds) twice -> identical rewards; other seeds -> other rewards
+ 12 the theta pass keeps independent random starts: the encoder's token FPS draws its own
+    start / shuffle and the within-region FPS its own starts (nothing shared is passed)
 """
 
 import os
@@ -125,9 +134,10 @@ def main():
         same = True
         for b in range(B):
             for f in range(2):
-                ref, nref = cut_points_by_label(pc[b, f], lab[b, f], [RP.RIGHT_ARM, RP.RIGHT_GRIPPER])
+                in_reg = (cell[b, f] >= 0) & (reg_np[np.clip(cell[b, f], 0, None)] >= 0)
+                ref, nref = cut_points_by_label(pc[b, f], in_reg.astype(np.int64), [1])
                 same &= nref == int(l0[b, f]) and np.array_equal(ref, o0[b, f].cpu().numpy())
-        check("rho = 0 == cut_points_by_label([5, 7]), padded arrays bit-identical", same,
+        check("rho = 0 == label cut of every region point (link0-4 stay), padded arrays bit-identical", same,
               f"kept {int(l0.min())}..{int(l0.max())} of {N}")
 
         # 5: padded input
@@ -152,8 +162,9 @@ def main():
                 o = of[b, f, :lf[b, f]].cpu().numpy()
                 src = o[:, 7].astype(np.int64)
                 okf &= bool(np.all(np.diff(src) > 0))
-                okf &= bool(np.isin(np.flatnonzero(cell[b, f] < 0), src).all())          # non-robot all kept
-                okf &= int((cell[b, f][src] >= 0).sum()) == int(filled[b, f])          # added = robot pts
+                in_reg = (cell[b, f] >= 0) & (reg_np[np.clip(cell[b, f], 0, None)] >= 0)
+                okf &= bool(np.isin(np.flatnonzero(~in_reg), src).all())                # non-region all kept
+                okf &= int(in_reg[src].sum()) == int(filled[b, f])                     # added = region pts
                 if int(filled[b, f]) == 0:
                     okf &= torch.equal(of[b, f, :, :6], o0[b, f])
         check("fill-up: clouds below M refilled with removed robot points to exactly M, others untouched", okf,
@@ -162,6 +173,47 @@ def main():
         # 6: encoder padded + lengths == trimmed (the R1 contract), deterministic FPS
         enc_out_ok, detail = encoder_check(o0.reshape(B * 2, N, 6), l0.reshape(-1), z["meta"].attrs["pcd_crop_bbox"], N)
         check("encoder: padded + point_cloud_len == trimmed cloud, bit for bit", enc_out_ok, detail)
+
+    # 9: nested masks under shared within-region starts
+    print("\n=== shared within-region FPS starts (CRN) ===")
+    pc, cell, lab = load_windows(z, 4096, n_win=8, seed=3)
+    P, Cc = torch.as_tensor(pc, device=DEV), torch.as_tensor(cell, device=DEV)
+    Bn, L = len(P), rem.n_regions
+    u_reg = torch.rand(Bn, 2, L, device=DEV)
+    rho2 = torch.rand(Bn, L, device=DEV)
+    rho1 = rho2 * torch.rand(Bn, L, device=DEV)
+    reg = c2r.to(DEV)[Cc.clamp(min=0)].masked_fill(Cc < 0, -1)
+    nested, strict = True, 0
+    keeps = []
+    for r_ in (rho1, rho2):
+        *_, kp = thin_window(P, Cc, r_, c2r, u_region=u_reg, return_keep=True)
+        keeps.append(kp)
+    in_reg = reg >= 0
+    nested = bool(((keeps[0] & in_reg) <= (keeps[1] & in_reg)).all())
+    strict = int(((keeps[1] & ~keeps[0]) & in_reg).sum())
+    # and the k1 points ARE the first k1 of the FPS-k2 order (prefix, not just a subset)
+    from r3d.model.vision.link_remover import _fps_from
+    prefix_ok = True
+    for b in range(Bn):
+        for l in (0, 1, 3):
+            members = torch.nonzero(reg[b, 0] == l).squeeze(1)
+            nl = len(members)
+            k1, k2 = int(np.floor(rho1[b, l].item() * nl + 0.5)), int(np.floor(rho2[b, l].item() * nl + 0.5))
+            if nl == 0 or k2 == 0:
+                continue
+            x = P[b, 0, members, :3][None]
+            if x.shape[1] < FPS_MIN_WIDTH:
+                x = torch.cat([x, x[:, :1].expand(1, FPS_MIN_WIDTH - x.shape[1], 3)], 1)
+            seq = _fps_from(x, torch.tensor([nl], device=DEV), torch.tensor([k2], device=DEV), u_reg[b, 0, l:l + 1])[0]
+            first = set(members[seq[:k1]].tolist())
+            prefix_ok &= first == set(torch.nonzero(keeps[0][b, 0] & (reg[b, 0] == l)).squeeze(1).tolist())
+    check("nested masks: rho1 <= rho2 with shared starts -> kept1 subset of kept2", nested,
+          f"{strict} extra points in the larger masks")
+    check("nested masks: kept1 == first k1 points of the shared-start FPS-k2 order", prefix_ok)
+    a1 = thin_window(P, Cc, rho2, c2r, u_region=u_reg, return_keep=True)[5]
+    a2 = thin_window(P, Cc, rho2, c2r, u_region=torch.rand_like(u_reg), return_keep=True)[5]
+    check("different shared starts -> different selections (the start is really used)",
+          bool((a1 != a2).any()))
 
     # 7: contract violations
     print("\n=== contract violations ===")
@@ -190,18 +242,49 @@ def main():
     with torch.no_grad():
         r2.mu.copy_(torch.linspace(-20, 20, r2.n_regions))
     r2.clamp_()
-    check("mu clamped to [-8, 6]", float(r2.mu.min()) == -8.0 and float(r2.mu.max()) == 6.0)
-    check("inference rho = sigmoid(mu), no sampling", torch.equal(r2.rho(), torch.sigmoid(r2.mu.detach())))
+    with torch.no_grad():
+        r2.gate.copy_(torch.linspace(-20, 20, r2.n_regions))
+    r2.clamp_()
+    check("mu clamped to [-9, 6], gate logits to [-5, 5]", float(r2.mu.min()) == -9.0 and float(r2.mu.max()) == 6.0
+          and float(r2.gate.min()) == -5.0 and float(r2.gate.max()) == 5.0)
+    det = torch.where(torch.sigmoid(r2.gate.detach()) >= 0.5, torch.sigmoid(r2.mu.detach()), torch.zeros(r2.n_regions))
+    check("inference rho = 1[keep prob >= 0.5] * sigmoid(mu), no sampling", torch.equal(r2.rho(), det)
+          and bool((r2.rho() == 0).any()))
 
-    r3 = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), snap_rho_below=0.05)
+    # removal gate: sampling, log P, closed gate -> region gone and its density not in log P
+    print("\n=== removal gate ===")
+    r4 = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), init_keep=0.8, sigma=0.7)
+    torch.manual_seed(0)
+    dr = r4.sample(20000)
+    zz, gg = r4.split(dr)
+    check("gates open with P(keep) = init_keep", abs(gg.mean().item() - 0.8) < 0.01, f"{gg.mean().item():.3f}")
+    check("draw rho = g * sigmoid(z): a closed gate removes the whole region",
+          torch.equal(r4.rho(dr), gg * torch.sigmoid(zz)) and bool((r4.rho(dr)[gg == 0] == 0).all()))
+    lp = r4.log_prob(dr[:5])
+    a_, m_, s_ = r4.gate.detach(), r4.mu.detach(), r4.sigma
+    ref = (gg[:5] * torch.log(torch.sigmoid(a_)) + (1 - gg[:5]) * torch.log(1 - torch.sigmoid(a_))
+           + gg[:5] * torch.distributions.Normal(m_, s_).log_prob(zz[:5])).sum(-1)
+    check("log P = sum[log Bern(g) + g log N(z)]", torch.allclose(lp, ref, atol=1e-5))
+    closed = dr[:1].clone()
+    closed[0, r4.n_regions:] = 0.0                      # every gate closed
+    r4.zero_grad()
+    r4.log_prob(closed).sum().backward()
+    check("closed gates: no gradient on the density logits, gradient on the gate logits",
+          bool((r4.mu.grad == 0).all()) and bool((r4.gate.grad != 0).all()))
+
+    r3 = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), snap_rho_below=0.05, init_keep=0.99)
     with torch.no_grad():
         r3.mu.copy_(torch.linspace(-6, 4, r3.n_regions))
     det = torch.sigmoid(r3.mu.detach())
     snapped = r3.rho()
     zs = r3.sample(4096)
+    z3, g3 = r3.split(zs)
     check("snap: deterministic rho < 0.05 -> 0, the rest unchanged; training draws never snapped",
           torch.equal(snapped, torch.where(det < 0.05, torch.zeros_like(det), det)) and bool((snapped == 0).any())
-          and torch.equal(r3.rho(zs), torch.sigmoid(zs)) and bool((r3.rho(zs) < 0.05).any()))
+          and torch.equal(r3.rho(zs), g3 * torch.sigmoid(z3)) and bool(((r3.rho(zs) < 0.05) & (g3 > 0)).any()))
+
+    if "--no-policy" not in sys.argv:
+        policy_checks(z)
 
     print(f"\n{'ALL CHECKS PASSED' if not FAILS else 'FAILED: ' + ', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
@@ -242,6 +325,219 @@ def encoder_check(clouds, lengths, bbox, N):
             if not (torch.equal(fa, fb) and torch.equal(pa, pb)):
                 worst = max(worst, float((fa - fb).abs().max()), float((pa - pb).abs().max()))
     return worst == 0.0, f"{len(x)} clouds" + ("" if worst == 0.0 else f", max |diff| {worst:.3g}")
+
+
+def make_normalizer(z):
+    """RobotwinSimDataset.get_normalizer on the zarr's own arrays, without loading the clouds."""
+    from r3d.dataset.robotwin_sim_dataset import RobotwinSimDataset
+    ds = RobotwinSimDataset.__new__(RobotwinSimDataset)
+    ds.use_target_ee = False
+    ds.replay_buffer = {"action": z["data/action"][:], "state": z["data/state"][:], "point_cloud": z["data/point_cloud"]}
+    ds.pcd_crop_bbox = np.asarray(z["meta"].attrs["pcd_crop_bbox"], dtype=np.float64)
+    return ds.get_normalizer()
+
+
+def make_batch(z, N, B, horizon=16, To=2, seed=0):
+    """B training-style windows straight from the zarr (no augmentation)."""
+    rng = np.random.default_rng(seed)
+    ends = z["meta/episode_ends"][:]
+    starts = np.concatenate([[0], ends[:-1]])
+    eps = rng.choice(len(ends), B, replace=False)
+    t0 = [int(rng.integers(starts[e], ends[e] - horizon)) for e in eps]
+    obs_idx = [t + i for t in t0 for i in range(To)]
+    pc = z["data/point_cloud"].get_orthogonal_selection((obs_idx, slice(0, N))).reshape(B, To, N, 6)
+    link = z["data/point_link"].get_orthogonal_selection((obs_idx, slice(0, N))).reshape(B, To, N)
+    plab = z["data/point_label"].get_orthogonal_selection((obs_idx, slice(0, N))).reshape(B, To, N)
+    state = z["data/state"].get_orthogonal_selection((obs_idx,)).reshape(B, To, -1)
+    act = np.stack([z["data/action"][t:t + horizon] for t in t0])
+    t = lambda x, dt=torch.float32: torch.as_tensor(np.ascontiguousarray(x), dtype=dt, device=DEV)
+    return {"obs": {"point_cloud": t(pc), "agent_pos": t(state), "point_link": t(link, torch.long),
+                    "point_label": t(plab, torch.int8)},
+            "action": t(act)}
+
+
+def policy_checks(z):
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    import r3d.model.vision.pointnet_extractor as PE
+    import r3d.policy.dp3_link_remover as DLR
+    if not OmegaConf.has_resolver("eval"):
+        OmegaConf.register_new_resolver("eval", eval, replace=True)
+    N = 1024
+    with initialize_config_dir(config_dir=str(ROOT / "R3D" / "r3d" / "config"), version_base=None):
+        cfg = compose(config_name="r3d_robotwin2", overrides=[
+            "task=mimicgen_sim", "task_name=square_d2", "setting=agentview_p4096-200",
+            f"task.num_points={N}", "task.num_group=64"])
+    pcfg = OmegaConf.to_container(cfg.policy, resolve=True)
+    normalizer = make_normalizer(z)
+
+    def build(target, link_remover="absent"):
+        c = dict(pcfg, _target_=target)
+        if link_remover != "absent":
+            c["link_remover"] = link_remover
+        torch.manual_seed(123)
+        cwd = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            pol = hydra.utils.instantiate(c)
+        finally:
+            os.chdir(cwd)
+        pol.set_normalizer(normalizer)
+        return pol.to(DEV)
+
+    print("\n=== policy: remover off == baseline DP3 ===")
+    base = build("r3d.policy.dp3.DP3")
+    off = build("r3d.policy.dp3_link_remover.DP3LinkRemover", None)
+    off.load_state_dict(base.state_dict())
+    batch = make_batch(z, N, B=4)
+    plain = {"obs": {k: v for k, v in batch["obs"].items() if k not in ("point_link", "point_label")},
+             "action": batch["action"]}
+    same = True
+    for mode in ("train", "eval"):
+        base.train(mode == "train")
+        off.train(mode == "train")
+        torch.manual_seed(7)
+        la, da = base.compute_loss(plain)
+        torch.manual_seed(7)
+        lb, db = off.compute_loss(plain)
+        same &= torch.equal(la, lb) and da == db
+    check("remover off: compute_loss bit-identical to DP3 (train and eval mode)", same, f"loss {la.item():.6f}")
+    base.eval()
+    off.eval()
+    with torch.no_grad():
+        torch.manual_seed(8)
+        pa = base.predict_action(plain["obs"])
+        torch.manual_seed(8)
+        pb = off.predict_action(plain["obs"])
+    check("remover off: predict_action bit-identical to DP3",
+          all(torch.equal(pa[k], pb[k]) for k in pa) and pa.keys() == pb.keys())
+    try:
+        off.compute_loss(batch)
+        check("remover off: an obs carrying point_link raises (config mismatch)", False)
+    except ValueError:
+        check("remover off: an obs carrying point_link raises (config mismatch)", True)
+    del base, off
+    torch.cuda.empty_cache()
+
+    print("\n=== policy: common-random-numbers reward ===")
+    pol = build("r3d.policy.dp3_link_remover.DP3LinkRemover", {"enabled": True, "k_masks": 2})
+    pol.train()
+    rem = pol.link_remover
+    B, L = 6, rem.n_regions
+    batch = make_batch(z, N, B=B, seed=1)
+    torch.manual_seed(0)
+    zd = rem.sample(B * 3).view(B, 3, -1)
+    zd[:, 1] = zd[:, 0]                                      # mask 1 == mask 0, mask 2 differs
+    seeds = torch.randint(0, 2 ** 62, (B,))
+    r1 = pol.crn_reward(batch, zd, seeds)
+    r2 = pol.crn_reward(batch, zd, seeds)
+    r3 = pol.crn_reward(batch, zd, torch.randint(0, 2 ** 62, (B,)))
+    diff_same = (r1[:, 0] - r1[:, 1]).abs().max().item()
+    check("same mask twice -> reward difference exactly 0", diff_same == 0.0, f"max |diff| {diff_same}")
+    check("same masks + seeds twice -> identical rewards", torch.equal(r1, r2))
+    check("different masks -> different rewards (the mask is seen)", bool((r1[:, 0] != r1[:, 2]).all()),
+          f"|diff| mean {(r1[:, 0] - r1[:, 2]).abs().mean().item():.2e}")
+    check("other seeds -> other rewards (the shared draws are random, not fixed)", not torch.equal(r1, r3))
+    check("reward pass leaves the training flag as it was", pol.training)
+    # the shared token-FPS start: a NON-ROBOT point (cell -1), the same physical point in every mask
+    draws = pol.crn_draws(seeds, B, 2, batch["action"].shape[1], DEV)
+    cells = batch["obs"]["point_link"]
+    obs_ = {k: v for k, v in batch["obs"].items() if k not in ("point_link", "point_label")}
+    starts_xyz, start_ok = [], True
+    for k in range(3):
+        tobs, res = pol._thin_obs(obs_, cells, rem.rho(zd[:, k]), u_region=draws["u_region"],
+                                  u_fill=draws["u_fill"], return_keep=True)
+        st = pol._encoder_start(cells[:, :2], res[5], draws["u_enc"]).view(B, 2)
+        xyz = torch.stack([tobs["point_cloud"][b, f, st[b, f], :3] for b in range(B) for f in range(2)])
+        starts_xyz.append(xyz)
+        for b in range(B):
+            for f in range(2):
+                orig = (batch["obs"]["point_cloud"][b, f, :, :3] == xyz[b * 2 + f]).all(-1)
+                start_ok &= bool((cells[b, f][orig] < 0).all()) and bool(orig.any())
+    check("CRN token-FPS start: a non-robot point (not link0-4), identical physical point in every mask",
+          start_ok and all(torch.equal(starts_xyz[0], x) for x in starts_xyz[1:]))
+
+    print("\n=== policy: theta pass keeps independent random starts ===")
+    seen = {"fps": [], "thin": []}
+    orig_fps, orig_thin = PE.fps, DLR.thin_window
+
+    def rec_fps(*a, **kw):
+        seen["fps"].append((kw.get("start_indices"), kw.get("perm")))
+        return orig_fps(*a, **kw)
+
+    def rec_thin(*a, **kw):
+        seen["thin"].append((kw.get("u_region"), kw.get("u_fill"), kw.get("random_start")))
+        return orig_thin(*a, **kw)
+
+    PE.fps, DLR.thin_window = rec_fps, rec_thin
+    try:
+        torch.manual_seed(1)
+        pol.compute_loss(batch)
+        theta = dict(seen)
+        seen["fps"], seen["thin"] = [], []
+        pol.crn_reward(batch, zd[:, :2], seeds)
+        reward = dict(seen)
+    finally:
+        PE.fps, DLR.thin_window = orig_fps, orig_thin
+    check("theta pass: token FPS gets no shared start / shuffle (draws its own)",
+          len(theta["fps"]) > 0 and all(s is None and p is None for s, p in theta["fps"]))
+    check("theta pass: within-region FPS gets no shared starts, random_start=True",
+          len(theta["thin"]) == 1 and theta["thin"][0] == (None, None, True))
+    check("reward pass: token FPS and within-region FPS DO get the shared draws",
+          all(s is not None and p is not None for s, p in reward["fps"])
+          and all(u is not None for u, _, _ in reward["thin"]))
+    # and the theta pass's random draws really differ between calls
+    torch.manual_seed(1)
+    l1, d1 = pol.compute_loss(batch)
+    torch.manual_seed(2)
+    l2, d2 = pol.compute_loss(batch)
+    torch.manual_seed(1)
+    l3, _ = pol.compute_loss(batch)
+    check("theta pass: other RNG state -> other loss; same RNG state -> same loss",
+          not torch.equal(l1, l2) and torch.equal(l1, l3))
+    # held-out memorisation check: with the SAME seeds, the same batch must agree with itself exactly
+    sd = torch.randint(0, 2 ** 62, (B,))
+    hc_self = pol.heldout_check(batch, batch, n_masks=6, seeds=[sd, sd, sd])
+    check("heldout_check: same batch + same seeds -> rank 1, grad cosine 1, signs agree (floor and held-out)",
+          all(abs(hc_self[f"remover_check/{t}_mask_rank_spearman"] - 1) < 1e-6
+              and abs(hc_self[f"remover_check/{t}_grad_cosine"] - 1) < 1e-4
+              and hc_self[f"remover_check/{t}_grad_sign_agreement"] == 1.0 for t in ("floor", "heldout")))
+    hc = pol.heldout_check(batch, make_batch(z, N, B=B, seed=9), n_masks=6)
+    check("heldout_check: fresh seeds, another batch -> finite metrics (untrained policy: noise)",
+          all(np.isfinite(v) for v in hc.values()),
+          ", ".join(f"{k.split('/')[1]} {v:+.2f}" for k, v in hc.items()))
+    # diagnostic B: full DDIM sampling under the same shared draws; identical masks -> identical scores
+    ab_same = pol.rank_check_ab(batch, z=rem.sample(1).expand(3, -1).contiguous())
+    ab = pol.rank_check_ab(batch, n_masks=4)
+    check("diagnostic B: identical masks -> identical A and identical B scores; otherwise finite",
+          len(set(ab_same["a_scores"])) == 1 and len(set(ab_same["b_scores"])) == 1
+          and np.isfinite(ab["ab_rank_spearman"]),
+          f"untrained: A/B rank corr {ab['ab_rank_spearman']:+.2f}")
+    # mechanism readout: 64 tokens per cloud; with every gate closed no token sits on a region
+    mech = pol.mechanism_check(batch, masks=("none", "deterministic"))
+    G = int(pol.num_tokens)
+    tok = lambda m: sum(v for k, v in mech.items() if k.startswith(f"mech/{m}/tokens/"))
+    gate_save = rem.gate.detach().clone()
+    with torch.no_grad():
+        rem.gate.fill_(-5.0)
+    closed = pol.mechanism_check(batch, masks=("deterministic",))
+    with torch.no_grad():
+        rem.gate.copy_(gate_save)
+    reg_tok = sum(closed[f"mech/deterministic/tokens/{n}"] for n in rem.region_names)
+    check("mechanism_check: tokens per cloud sum to num_group; all gates closed -> 0 region tokens",
+          abs(tok("none") - G) < 1e-6 and abs(tok("deterministic") - G) < 1e-6 and reg_tok == 0.0,
+          f"uncut nut cov {mech.get('mech/none/coverage/nut', float('nan')):.2f}, all-closed nut cov "
+          f"{closed.get('mech/deterministic/coverage/nut', float('nan')):.2f}")
+    surr, stats = pol.remover_loss(batch)
+    check("remover_loss: per-region effect stats (gate effect, density slope, counts) logged",
+          all(f"remover_n_closed/{n}" in stats for n in rem.region_names)
+          and any(k.startswith("remover_effect_gate/") for k in stats))
+    surr.backward()
+    grads = {n: p.grad for n, p in pol.named_parameters() if p.grad is not None}
+    check("remover_loss: gradient reaches phi (density mu, gate logits) only",
+          sorted(grads) == ["link_remover.gate", "link_remover.mu"]
+          and all(bool((g != 0).any()) for g in grads.values()))
 
 
 if __name__ == "__main__":

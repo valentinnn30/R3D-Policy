@@ -54,7 +54,9 @@ def main():
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--group-size", type=int, default=32)
     ap.add_argument("--token-stride", type=int, default=10)
-    ap.add_argument("--mu-min", type=float, default=-8.0)
+    ap.add_argument("--mu-min", type=float, default=-9.0)
+    ap.add_argument("--groups", choices=["v0", "per_link"], default="per_link",
+                    help="v0 = the learned regions (default_region_groups); per_link = 15-region table")
     a = ap.parse_args()
 
     z = zarr.open(a.zarr, "r")
@@ -63,7 +65,7 @@ def main():
     if list(z["meta"].attrs["point_link_names"]) != list(RP.CELL_NAMES):
         raise ValueError("zarr point_link_names differ from robosuite_pcd.CELL_NAMES")
     bbox = z["meta"].attrs["pcd_crop_bbox"]
-    groups = RP.default_region_groups()
+    groups = RP.default_region_groups() if a.groups == "v0" else RP.per_link_region_groups()
     rnames = [g["name"] for g in groups]
     c2r = region_of_cells(groups)
     print("loading point_link / point_label ...", flush=True)
@@ -134,7 +136,7 @@ def main():
                   f"{tk['centres_mean']:7.2f} {'' if cv is None else f'{cv:5.2f}'}")
 
     out = os.path.join(ROOT, "R3D", "data", "outputs", "sim", "link_labels",
-                       os.path.basename(a.zarr.rstrip("/")).replace(".zarr", "") + "_stats.json")
+                       os.path.basename(a.zarr.rstrip("/")).replace(".zarr", "") + f"_stats_{a.groups}.json")
     with open(out, "w") as fh:
         json.dump(rep, fh, indent=1)
     print(f"\nreport: {out}")

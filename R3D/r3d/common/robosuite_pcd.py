@@ -81,8 +81,20 @@ HAND_GEOM, FINGER_GEOMS = "gripper0_hand_visual", ("gripper0_finger1_visual", "g
 
 
 def default_region_groups():
-    """v0 grouping of the stored cells (15 regions): one per arm link, hand
-    f1side / centre / f2side (wrist + front), each finger proximal / distal (in + out)."""
+    """v0 grouping (user decision 2026-10-26), 8 LEARNED regions: link5, link6, link7, hand
+    f1side / centre / f2side (wrist + front), finger1, finger2 (prox + dist, in + out).
+    link0-4 are NOT in any region (never thinned, always kept): on Square D2 they average
+    0-5 points per frame at N = 1024 (link3/4 in view in ~5% of frames, link0's points
+    mostly silhouette mislabels), so a learned rho for them would only drift on noise."""
+    g = [{"name": f"link{i}", "cells": [f"link{i}"]} for i in (5, 6, 7)]
+    g += [{"name": f"hand_{s}", "cells": [f"hand_{s}_wrist", f"hand_{s}_front"]} for s in ("f1side", "centre", "f2side")]
+    g += [{"name": f"finger{f}", "cells": [f"finger{f}_{p}_{side}" for p in ("prox", "dist") for side in ("in", "out")]}
+          for f in (1, 2)]
+    return g
+
+
+def per_link_region_groups():
+    """The fine 15-region table (every link, hand x3, fingers prox / dist) -- for stats only."""
     g = [{"name": f"link{i}", "cells": [f"link{i}"]} for i in range(8)]
     g += [{"name": f"hand_{s}", "cells": [f"hand_{s}_wrist", f"hand_{s}_front"]} for s in ("f1side", "centre", "f2side")]
     g += [{"name": f"finger{f}_{p}", "cells": [f"finger{f}_{p}_in", f"finger{f}_{p}_out"]}

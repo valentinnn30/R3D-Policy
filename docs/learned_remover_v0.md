@@ -4,6 +4,24 @@ This document is the brief for implementing and testing the learned point remove
 
 **Scope of v0:** one learnable density per robot link, trained jointly with the policy in one run. The voxel/MLP version (v1) is described at the end. Do not implement it in the first version.
 
+> **Implementation status (2026-10-26): built; first sweep launched.** The final design is in
+> `docs/learned_remover_design.md`. Deviations from this brief, each decided with the user
+> after a measurement:
+> - **Removal gate + density** instead of a density only. FPS thinning keeps a region's
+>   extent, so tokens barely move until ρ = 0 (link5–7 at ρ = 0.02 still hold 28 of 35
+>   tokens at N = 4096). Each region gets a Bernoulli keep gate plus the logit-normal density.
+> - **8 regions**, not ~10 links: link0–4 are never thinned (0–5 points/frame, rarely in
+>   view). The hand is split 3 ways, each finger is one region.
+> - **μ ∈ [−9, 6]** (−8 still kept 1 point of link6 at N = 4096). Gate logits ∈ [−5, 5].
+> - **lr_φ = 3e-3** (Adam), K = 4 masks × 128 windows: the brief's 0.1 × lr_θ = 1e-5 does
+>   not move φ at all (toy test).
+> - **Common random numbers** in the reward pass (shared per-window seeds), and the reward
+>   pass runs in eval mode.
+> - **N_kept < M:** fill back up to M instead of failing (0.2–1.2% of frames).
+> - **Post-training snap** (ρ < 0.05 → 0) plus a **φ-frozen fine-tune** in the last 10%.
+> - **Held-out check with a noise floor** (the same windows under new seeds), and the
+>   mechanism logging of §6.
+
 ---
 
 ## 1. Remover v0: spec

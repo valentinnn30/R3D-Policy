@@ -199,6 +199,7 @@ class DP3Encoder(nn.Module):
         # input (and a rank-2 (10, 3) key would raise there).
         self.fingertip_key = 'fingertip_anchors'
         self.lengths_key = 'point_cloud_len'   # robot-cut run: valid points per cloud
+        self.fps_start_key, self.fps_perm_key = 'fps_start_idx', 'fps_perm'   # link remover CRN
         self.use_fingertips = self.fingertip_key in observation_space.keys()
         ignored_obs_keys = {self.point_cloud_key, self.rgb_image_key, self.imagination_key,
                             self.fingertip_key, self.lengths_key}
@@ -336,6 +337,13 @@ class DP3Encoder(nn.Module):
             if self.pointnet_type not in ("uni3d", "uni3d_pretrained") or self.use_imagined_robot:
                 raise ValueError("point_cloud_len needs the uni3d encoder without imagined robot")
             extra["lengths"] = observations[self.lengths_key]
+        # Learned link remover, reward pass only: shared-seed token-FPS start / shuffle
+        # (`fps_start_idx` (B,), `fps_perm` (B, G)); never in shape_meta, never normalized.
+        for key, arg in ((self.fps_start_key, "fps_start"), (self.fps_perm_key, "fps_perm")):
+            if key in observations:
+                if self.pointnet_type not in ("uni3d", "uni3d_pretrained") or self.use_imagined_robot:
+                    raise ValueError(f"{key} needs the uni3d encoder without imagined robot")
+                extra[arg] = observations[key]
         if not self.pc_encoder_extract_global_feature:
             pn_feat, pc_pe = self.extractor(points, eval, **extra)
         else:
@@ -370,7 +378,7 @@ class DP3Encoder(nn.Module):
 # =============================================================================
 
 def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, shuffle_output=True,
-        lengths=None):
+        lengths=None, start_indices=None, perm=None):
     '''
     Enhanced FPS with randomness options
     Args:
@@ -383,6 +391,11 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
         random_start: bool, whether to use random starting point
         random_noise_scale: float, scale of random noise added to distances
         shuffle_output: bool, whether to randomly shuffle the output order
+        start_indices: optional (B,) long -- the start point instead of a random one;
+            perm: optional (B, number) long -- the output shuffle instead of a random one.
+            Both are drawn by the CALLER from a shared seed (learned link remover's
+            common-random-numbers reward pass, docs/learned_remover_v0.md); None -> the
+            original random draws, consuming the RNG exactly as before.
     '''
     xyz_coordinates = data[:, :, :3]
     B, N, _ = xyz_coordinates.shape
@@ -391,6 +404,8 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
         lengths = lengths.to(device=data.device, dtype=torch.long).reshape(-1)
         if lengths.shape[0] != B or bool((lengths < 1).any()) or bool((lengths > N).any()):
             raise ValueError(f"fps lengths must be (B,) in [1, N], got {lengths}")
+    if (start_indices is not None or perm is not None) and not (use_random and random_start):
+        raise ValueError("fps start_indices / perm need fps_random_config use_random and random_start")
     if not use_random:
         # Original deterministic FPS
         _, fps_idx = sample_farthest_points(xyz_coordinates, lengths=lengths, K=number)
@@ -398,7 +413,12 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
         # Enhanced FPS with randomness
         if random_start:
             # Randomly select starting points for each batch
-            if lengths is None:
+            if start_indices is not None:
+                start_indices = start_indices.to(device=data.device, dtype=torch.long).reshape(-1)
+                hi = lengths if lengths is not None else torch.full_like(start_indices, N)
+                if start_indices.shape[0] != B or bool((start_indices < 0).any()) or bool((start_indices >= hi).any()):
+                    raise ValueError("fps start_indices must be (B,) valid point indices")
+            elif lengths is None:
                 start_indices = torch.randint(0, N, (B,), device=data.device)
             else:   # a valid point
                 start_indices = (torch.rand(B, device=data.device) * lengths).long()
@@ -434,9 +454,13 @@ def fps(data, number, use_random=True, random_start=True, random_noise_scale=0, 
         
         if shuffle_output:
             # Randomly shuffle the order of selected indices
+            if perm is not None:
+                perm = perm.to(device=data.device, dtype=torch.long)
+                if perm.shape != (B, number):
+                    raise ValueError(f"fps perm must be (B, {number}), got {tuple(perm.shape)}")
             for b in range(B):
-                perm = torch.randperm(number, device=data.device)
-                fps_idx[b] = fps_idx[b][perm]
+                p_b = torch.randperm(number, device=data.device) if perm is None else perm[b]
+                fps_idx[b] = fps_idx[b][p_b]
     
     if lengths is not None:
         # fewer valid points than `number`: pytorch3d pads with -1 -> point 0
@@ -524,7 +548,7 @@ class KNNGrouper(nn.Module):
         cprint(f"[Group] FPS randomness config: {fps_random_config}", "cyan")
 
     def forward(self, xyz: torch.Tensor, features: torch.Tensor, use_fps=True,
-                num_groups=None, lengths=None):
+                num_groups=None, lengths=None, fps_start=None, fps_perm=None):
         """
         Args:
             xyz: [B, N, 3]. Input point clouds.
@@ -549,7 +573,9 @@ class KNNGrouper(nn.Module):
         G = self.num_groups if num_groups is None else int(num_groups)
         with torch.no_grad():
             # `lengths` (B,): valid points per cloud, the rest is padding (robot cut)
-            centers = fps(xyz, G, lengths=lengths, **self.fps_random_config) # B G 3
+            # fps_start / fps_perm: shared-seed draws of the link remover's reward pass only
+            centers = fps(xyz, G, lengths=lengths, start_indices=fps_start, perm=fps_perm,
+                          **self.fps_random_config) # B G 3
             _, knn_idx = knn_points(centers, xyz, self.group_size,
                                     key_lengths=lengths)  # [B, G, K]
 
@@ -632,8 +658,9 @@ class PatchEmbed(nn.Module):
         self.fps_random_config = fps_random_config or {}
 
     def forward(self, coords: torch.Tensor, features: torch.Tensor,
-                num_groups=None, lengths=None):
-        patches = self.grouper(coords, features, num_groups=num_groups, lengths=lengths)
+                num_groups=None, lengths=None, fps_start=None, fps_perm=None):
+        patches = self.grouper(coords, features, num_groups=num_groups, lengths=lengths,
+                               fps_start=fps_start, fps_perm=fps_perm)
         patch_features = patches["features"]  # [B, L, K, C_in]
         x = self.patch_encoder(patch_features)
         patches["embeddings"] = x
@@ -1037,7 +1064,8 @@ class Uni3DPointcloudEncoder(nn.Module):
 
         cprint(f"[Uni3DPointcloudEncoder] Pretrained weights loaded: {load_weight_path}", "red")
 
-    def forward(self, pcd, eval, num_groups=None, anchors=None, lengths=None):
+    def forward(self, pcd, eval, num_groups=None, anchors=None, lengths=None,
+                fps_start=None, fps_perm=None):
         """`anchors` [B, 10, 3] (normalized) -- fingertip-token run only.
 
         The fingertip tokens are APPENDED after the FPS tokens of this frame, so
@@ -1066,7 +1094,9 @@ class Uni3DPointcloudEncoder(nn.Module):
         # Group points into patches and get embeddings
         # `lengths` (B,): valid points; padding sits AFTER them, so the dropout's
         # "move onto point 0" target is always a valid point
-        patches = self.patch_embed(pts, colors, num_groups=num_groups, lengths=lengths)
+        # fps_start / fps_perm: the link remover's common-random-numbers reward pass only
+        fps_kw = {} if fps_start is None and fps_perm is None else dict(fps_start=fps_start, fps_perm=fps_perm)
+        patches = self.patch_embed(pts, colors, num_groups=num_groups, lengths=lengths, **fps_kw)
         if isinstance(patches, list):
             patch_embed = patches[-1]["embeddings"]
             centers = patches[-1]["centers"]

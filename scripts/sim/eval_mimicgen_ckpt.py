@@ -12,7 +12,9 @@ Observation = exactly the training data: the agentview cloud from `robosuite_pcd
 (same box, read from the training zarr's attrs, and asserted), first `num_points` of an FPS
 with deterministic start, agent_pos / action from `robosuite_actions`, absolute OSC
 (control_delta=False). With `task.drop_point_labels` the oracle label cut is applied as in
-training. Episode cap 400 steps (EquiDiff's `max_steps['square_d2']`); success =
+training. A learned-link-remover checkpoint (DP3LinkRemover) gets `point_link` -- the link
+cells from `robosuite_pcd.LinkCells`, the same code that labelled the training zarr -- and
+thins with its deterministic, snapped rho; the rho table goes into the json. Episode cap 400 steps (EquiDiff's `max_steps['square_d2']`); success =
 env._check_success() at any step.
 
 Output per checkpoint: <run>/eval/<ckpt>_<episodes>ep_block<b>.json with per-scene seed,
@@ -70,6 +72,7 @@ def run_scenes(args):
     task, N = zattrs["task"], int(cfg.task.num_points)
     drop = cfg.task.get("drop_point_labels", None)
     n_obs = int(cfg.n_obs_steps)
+    remover = getattr(policy, "link_remover", None) is not None
 
     import h5py
     with h5py.File(R3D_DIR / "data" / "mimicgen" / "core" / f"{task}.hdf5", "r") as f:
@@ -91,16 +94,22 @@ def run_scenes(args):
         if not np.allclose(bbox, zattrs["pcd_crop_bbox"]):
             raise RuntimeError(f"crop box {bbox} != training {zattrs['pcd_crop_bbox']}")
         cb = RP.CloudBuilder(env.sim, cam, res, res, bbox, N, RP.geom_label_lut(env.sim, env_args["env_name"]))
+        cells = RP.LinkCells(env.sim) if remover else None
         layout = _layout(env, task)
 
         def observe(o):
-            pc, lab, _ = cb.build(o)
+            if remover:
+                pc, lab, _, cell = cb.build(o, cells=cells)
+            else:
+                pc, lab, _ = cb.build(o)
             item = {"agent_pos": torch.from_numpy(RA.state_vector(o["robot0_eef_pos"], o["robot0_eef_quat"],
                                                                   o["robot0_gripper_qpos"]))}
             if drop:
                 pc, n = cut_points_by_label(pc, lab, list(drop))
                 item["point_cloud_len"] = torch.tensor(n, dtype=torch.int64)
             item["point_cloud"] = torch.from_numpy(pc)
+            if remover:
+                item["point_link"] = torch.from_numpy(cell.astype(np.int64))
             return item
 
         hist = [observe(obs)] * n_obs
@@ -118,7 +127,10 @@ def run_scenes(args):
                     break
                 if steps >= MAX_STEPS[task]:
                     break
-        rows.append({"seed": int(seed), "success": bool(success), "steps": steps, "layout": layout.tolist()})
+        row = {"seed": int(seed), "success": bool(success), "steps": steps, "layout": layout.tolist()}
+        if remover:
+            row["remover_rho"] = dict(zip(policy.link_remover.region_names, policy.link_remover.rho().tolist()))
+        rows.append(row)
         print(f"[{os.getpid()}] scene {seed}: {'SUCCESS' if success else 'FAIL'} ({steps} steps)", flush=True)
     return rows
 
@@ -146,8 +158,9 @@ def main():
         rows = sorted([r for part in res for r in part], key=lambda r: r["seed"])
         sr = float(np.mean([r["success"] for r in rows]))
         out.parent.mkdir(parents=True, exist_ok=True)
+        extra = {"remover_rho": rows[0]["remover_rho"]} if "remover_rho" in rows[0] else {}
         with open(out, "w") as fh:
-            json.dump({"ckpt": ck, "episodes": a.episodes, "block": a.block, "success_rate": sr,
+            json.dump({"ckpt": ck, "episodes": a.episodes, "block": a.block, "success_rate": sr, **extra,
                        "minutes": (time.time() - t0) / 60, "scenes": rows}, fh, indent=1)
         print(f"ckpt: {ck}  success {sr:.3f} ({sum(r['success'] for r in rows)}/{len(rows)})  "
               f"{(time.time() - t0) / 60:.1f} min -> {out}", flush=True)

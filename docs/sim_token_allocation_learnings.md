@@ -288,6 +288,52 @@ user reports R1 ≈ K on the robot ⇒ above ~90% coverage more tokens mostly ad
 overlap (saturation). Supports "small patches + imperfect coverage" as the
 regime, but coverage was not "bad".
 
+## Learned link remover v0 (built 2026-10-26)
+
+Design and tunable knobs: `docs/learned_remover_design.md`; brief: `docs/learned_remover_v0.md`.
+
+**Labels.** Every Square D2 frame was re-rendered from its hdf5 state with per-point link cells
+(22 cells; the gripper is split geometrically in its mesh frames). The cloud and labels are
+bit-identical to the stored zarr (200/200 demos). Kinematics-based labels (nearest mesh
+surface, sampled at 1.5 mm) vs segmentation: 99.9% of robot points within 5 mm, 98.7% the
+same cell; 0.7% of nut/peg points come within 5 mm of a robot mesh.
+
+**Per-link statistics** (mean points per frame, N = 1024 / 4096): link5 207 / 825, link6
+261 / 1083, link7 114 / 457, hand f1side / centre / f2side 67 / 46 / 77 (×4 at 4096),
+finger 9.5 / 33 each. link0–4 total ~9 / 29, mostly silhouette mislabels or the elbow in ~5%
+of frames. Robot share 78%. On 1.2% / 0.24% of frames (1024 / 4096) fewer than 64 non-robot
+points remain.
+
+**FPS thinning does not reallocate tokens** (64 tokens, link5–7 thinned to ρ, 511 frames):
+
+| ρ arm (N = 4096) | 1 | 0.5 | 0.2 | 0.05 | 0.02 | 0 |
+|---|---|---|---|---|---|---|
+| FPS thinning: arm tokens / nut coverage | 34.6 / 0.49 | 34.2 / 0.49 | 33.3 / 0.50 | 30.8 / 0.53 | 28.3 / 0.55 | 0 / 0.81 |
+| nearest-to-EE thinning: arm tokens / nut coverage | 34.5 / 0.48 | 27.0 / 0.58 | 17.2 / 0.69 | 8.9 / 0.76 | 6.2 / 0.78 | 0 / 0.81 |
+
+Under FPS thinning the arm becomes a few huge patches (2 → 14 cm) and holds its tokens; only
+complete removal frees them. **Decision (user): removal gate + FPS density** (not
+nearest-to-EE, which would bake in a "near the gripper first" prior).
+
+**Toy REINFORCE** (synthetic reward with the measured cliff; region sizes from the stats):
+- The brief's lr 1e-5 does not move φ.
+- Adam 3e-2 learns "remove link6, keep the fingers" within ~150 steps even at 10× noise,
+  but closes 0–3 neutral gates by noise over a run.
+- **3e-3 with 128 windows × 4 masks** learns it by step ~1350–2000 of ~9.8k with no neutral
+  gate closed and drift ≤ 0.9 logit.
+- Key insight: under Adam a zero-signal parameter drifts by ~lr per step **whatever the noise
+  level**, so less noise buys learning speed and only a lower lr buys less drift.
+
+**Cost** (4090, bf16): the θ step with the remover is +2% (1024) / +20% (4096). The reward
+pass at 128 × 4 is 184 / 259 ms per φ step, so a run takes ~2.5 h at 1024 and ~4.4 h at 4096
+(vs 1.9 / 3.3 h).
+
+**First sweep (launched 2026-10-26):** N ∈ {4096, 1024, 2048}, 64 tokens, seed 42, defaults
+(G), checkpoints 50–250 all evaluated on the 200 scenes. Driver
+`scripts/sim/run_remover_sweep.sh`, queue `R3D/data/outputs/sim/mimicgen/remover_queue.txt`,
+reports `<run>/analysis/report.md` and `R3D/data/outputs/sim/mimicgen/remover_sweep/`.
+Purpose: as many diagnostics as possible to set up the tuning sweep.
+
 ## Method plan and positioning
 
 **Implementation brief for the learned remover: `docs/learned_remover_v0.md`** (user's plan,

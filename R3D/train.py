@@ -110,6 +110,22 @@ class TrainDP3Workspace:
         self.optimizer = hydra.utils.instantiate(
             cfg.optimizer, params=self.model.parameters())
 
+        # Learned link remover (docs/learned_remover_v0.md): its mu is phi, trained by
+        # REINFORCE with its own optimizer -- theta's optimizer must not see it. None for
+        # every other policy: nothing below runs and training is the baseline.
+        self.remover = None
+        self.phi_optimizer = None
+        if getattr(self.model, "link_remover", None) is not None:
+            from r3d.common.link_remover_training import RemoverController, theta_parameters
+            if self.use_ddp:
+                raise NotImplementedError("link remover training under DDP")
+            self.optimizer = hydra.utils.instantiate(
+                cfg.optimizer, params=theta_parameters(self.model))
+            self.remover = RemoverController(self.model, cfg.training.link_remover,
+                                             cfg.training.num_epochs)
+            self.phi_optimizer = self.remover.optimizer   # saved / resumed with the checkpoint
+            self.remover.set_output_dir(self.output_dir)
+
         # configure training state
         self.global_step = 0
         self.epoch = 0
@@ -264,6 +280,11 @@ class TrainDP3Workspace:
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+        if self.phi_optimizer is not None:
+            optimizer_to(self.phi_optimizer, device)
+        amp = None
+        if self.remover is not None:
+            amp = self.remover.amp_context(self.use_bfloat16, self.autocast_dtype)
 
         # Wrap model with DDP
         if self.use_ddp:
@@ -300,6 +321,9 @@ class TrainDP3Workspace:
 
                 if train_sampling_batch is None:
                     train_sampling_batch = batch
+                if self.remover is not None:
+                    self.remover.begin_batch(self.model, self.epoch, batch_idx / len(train_dataloader))
+                    self.remover.remember(batch, self.model.n_obs_steps)
             
                 # compute loss
                 t1_1 = time.time()
@@ -333,6 +357,13 @@ class TrainDP3Workspace:
                         ema.step(self.model.module)
                     else:
                         ema.step(self.model)
+                if self.remover is not None:
+                    self.remover.record_batch(loss_dict)
+                if self.remover is not None and stepped:
+                    loss_dict.update(self.remover.after_opt_step(
+                        self.model, self.global_step // cfg.training.gradient_accumulate_every, amp))
+                    if cfg.training.use_ema:
+                        self.remover.sync_ema(self.ema_model)
                 t1_4 = time.time()
                 # logging
                 raw_loss_cpu = raw_loss.item()
@@ -466,6 +497,12 @@ class TrainDP3Workspace:
 
             if env_runner is None:
                 step_log['test_mean_score'] = - train_loss
+
+            # learned link remover: epoch record + (every diag_every epochs) held-out check,
+            # diagnostic B and mechanism, on the LIVE model (the one phi learns from)
+            if self.remover is not None and is_main_process():
+                step_log.update(self.remover.end_epoch(self.model, val_dataloader, device, amp,
+                                                       self.epoch, step_log))
                 
             # checkpoint (only save on main process)
             # epoch > 0: epochs count from 0, so without it every run also saves
