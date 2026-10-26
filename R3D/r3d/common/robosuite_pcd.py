@@ -60,6 +60,113 @@ def geom_label_lut(sim, env_name):
     return lut
 
 
+# ---- per-link cells for the learned link remover (docs/learned_remover_v0.md) ----------
+# A FINE partition of the Panda's visible surface is stored per point (`point_link`); the
+# remover config groups cells into regions, so a coarser or finer grouping needs no
+# re-render. The arm is one cell per body. The gripper renders as three visual meshes only
+# (hand, two fingers; the pads are invisible collision boxes), so it is split
+# GEOMETRICALLY in each mesh's own geom frame: p_local = R_geom^T (p - x_geom), with equal
+# bins of the mesh's local bounding box -- analytic, identical at evaluation.
+# Axes (measured on Square D2, asserted by `check_gripper_axes` whenever cells are built):
+#   hand   geom frame: z = finger-opening axis (finger1 at z < 0), y = approach axis
+#          (fingers at y ~ +0.05, link7 at y ~ -0.13)
+#   finger geom frame: +z = towards the fingertip, -x = towards the other finger (inner face)
+NO_CELL = -1
+CELL_NAMES = (
+    [f"link{i}" for i in range(8)]
+    + [f"hand_{s}_{a}" for s in ("f1side", "centre", "f2side") for a in ("wrist", "front")]
+    + [f"finger{f}_{p}_{side}" for f in (1, 2) for p in ("prox", "dist") for side in ("in", "out")])
+N_CELLS = len(CELL_NAMES)   # 22
+HAND_GEOM, FINGER_GEOMS = "gripper0_hand_visual", ("gripper0_finger1_visual", "gripper0_finger2_visual")
+
+
+def default_region_groups():
+    """v0 grouping of the stored cells (15 regions): one per arm link, hand
+    f1side / centre / f2side (wrist + front), each finger proximal / distal (in + out)."""
+    g = [{"name": f"link{i}", "cells": [f"link{i}"]} for i in range(8)]
+    g += [{"name": f"hand_{s}", "cells": [f"hand_{s}_wrist", f"hand_{s}_front"]} for s in ("f1side", "centre", "f2side")]
+    g += [{"name": f"finger{f}_{p}", "cells": [f"finger{f}_{p}_in", f"finger{f}_{p}_out"]}
+          for f in (1, 2) for p in ("prox", "dist")]
+    return g
+
+
+def _mesh_bounds(m, gid):
+    mid = m.geom_dataid[gid]
+    v = m.mesh_vert[m.mesh_vertadr[mid]:m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+    return v.min(0).astype(np.float64), v.max(0).astype(np.float64)
+
+
+def _local(d, gid, p):
+    return (p - d.geom_xpos[gid]) @ d.geom_xmat[gid].reshape(3, 3)
+
+
+def check_gripper_axes(sim):
+    """The axis convention above is a contract of the gripper split; fail loudly if a
+    different gripper model / mesh frame breaks it."""
+    m, d = sim.model, sim.data
+    h = m.geom_name2id(HAND_GEOM)
+    f1, f2 = (m.geom_name2id(n) for n in FINGER_GEOMS)
+    l7 = d.body_xpos[m.body_name2id("robot0_link7")]
+    p1, p2, pl = (_local(d, h, x) for x in (d.geom_xpos[f1], d.geom_xpos[f2], l7))
+    ok = p1[1] > 0.02 and p2[1] > 0.02 and pl[1] < -0.05 and p1[2] < 0 < p2[2]
+    for fa, fb, tip in ((f1, f2, "gripper0_finger_joint1_tip"), (f2, f1, "gripper0_finger_joint2_tip")):
+        other = _local(d, fa, d.geom_xpos[fb])
+        t = _local(d, fa, d.body_xpos[m.body_name2id(tip)])
+        ok &= other[0] < -0.02 and t[2] > 0.01
+    if not ok:
+        raise RuntimeError("gripper geom frames do not match the axis convention of robosuite_pcd "
+                           "(hand: z opening, y approach; finger: +z tip, -x inner)")
+
+
+class LinkCells:
+    """geom id + world point -> cell id (CELL_NAMES index, NO_CELL for non-robot)."""
+
+    def __init__(self, sim):
+        m = sim.model
+        self.sim = sim
+        self.base = np.full(m.ngeom + 1, NO_CELL, dtype=np.int16)   # +1: seg value -1 = no geom
+        for g in range(m.ngeom):
+            body = m.body_id2name(m.geom_bodyid[g]) or ""
+            if m.geom_group[g] != 1:      # only visual geoms are ever rendered
+                continue
+            if body.startswith("robot0_link"):
+                self.base[g] = int(body[len("robot0_link"):])
+            elif body.startswith(("robot0_", "gripper0_")) and m.geom_id2name(g) not in (HAND_GEOM,) + FINGER_GEOMS:
+                raise RuntimeError(f"visual robot geom {m.geom_id2name(g)} on body {body} has no cell")
+        self.hand = m.geom_name2id(HAND_GEOM)
+        self.fingers = [m.geom_name2id(n) for n in FINGER_GEOMS]
+        self.hand_bounds = _mesh_bounds(m, self.hand)
+        self.finger_bounds = _mesh_bounds(m, self.fingers[0])
+        if not np.allclose(self.finger_bounds, _mesh_bounds(m, self.fingers[1])):
+            raise RuntimeError("the two finger meshes differ")
+
+    @staticmethod
+    def _bin(x, lo, hi, n):
+        return np.clip(((x - lo) / (hi - lo) * n).astype(np.int64), 0, n - 1)
+
+    def __call__(self, pw, seg):
+        """pw (P, 3) world points, seg (P,) geom ids of the same pixels -> (P,) int8."""
+        check_gripper_axes(self.sim)
+        d = self.sim.data
+        out = self.base[seg].astype(np.int8)
+        sel = seg == self.hand
+        if sel.any():
+            q = _local(d, self.hand, pw[sel])
+            lo, hi = self.hand_bounds
+            s = self._bin(q[:, 2], lo[2], hi[2], 3)                    # f1side / centre / f2side
+            a = (q[:, 1] >= (lo[1] + hi[1]) / 2).astype(np.int64)      # wrist / front
+            out[sel] = 8 + 2 * s + a
+        lo, hi = self.finger_bounds
+        for f, gid in enumerate(self.fingers):
+            sel = seg == gid
+            if sel.any():
+                q = _local(d, gid, pw[sel])
+                p = (q[:, 2] >= (lo[2] + hi[2]) / 2).astype(np.int64)  # prox / dist
+                o = (q[:, 0] >= (lo[0] + hi[0]) / 2).astype(np.int64)  # in (-x) / out
+                out[sel] = 14 + 4 * f + 2 * p + o
+        return out
+
+
 def default_bbox(sim, margin_y=0.15, margin_x_robot=0.0):
     """From the table top (+3 mm, so the table itself is cut) to 0.5 m above it.
     x/y: the table footprint, widened by `margin_y` on both sides and by
@@ -89,9 +196,11 @@ class CloudBuilder:
         self._ray = np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u, float)], -1).reshape(-1, 3)
         self._CU = CU
 
-    def build(self, obs, device="cuda"):
+    def build(self, obs, device="cuda", cells=None):
         """-> cloud (num_points, 6) float32 xyz + rgb[0,1], labels (num_points,) int16,
-        n_valid (points in the box before FPS / padding)."""
+        n_valid (points in the box before FPS / padding).
+        With `cells` (a LinkCells): also -> per-point link cell (num_points,) int8, carried
+        through the same keep / FPS / pad indices (pad = NO_CELL); the cloud is unchanged."""
         import torch
         from pytorch3d.ops import sample_farthest_points
         CU, cam = self._CU, self.camera
@@ -109,6 +218,7 @@ class CloudBuilder:
         keep &= ~np.isin(self.lut[seg], (TABLE, BACKGROUND))
         pts = np.concatenate([pw[keep], rgb[keep]], 1).astype(np.float32)
         lab = self.lut[seg[keep]]
+        cell = None if cells is None else cells(pw[keep], seg[keep])
         n = len(pts)
         if n == 0:
             raise RuntimeError("crop box removed every point")
@@ -117,11 +227,15 @@ class CloudBuilder:
             _, idx = sample_farthest_points(x, K=self.num_points, random_start_point=False)
             idx = idx[0].cpu().numpy()
             pts, lab = pts[idx], lab[idx]
+            cell = None if cell is None else cell[idx]
         elif n < self.num_points:   # pad with copies of the first point, labelled PAD
             pad = self.num_points - n
             pts = np.concatenate([pts, np.repeat(pts[:1], pad, 0)])
             lab = np.concatenate([lab, np.full(pad, PAD, np.int16)])
-        return pts, lab, n
+            cell = None if cell is None else np.concatenate([cell, np.full(pad, NO_CELL, np.int8)])
+        if cells is None:
+            return pts, lab, n
+        return pts, lab, n, cell
 
     def class_pixels(self, obs):
         """valid pixels per class in the whole image and inside the box (view check)."""
