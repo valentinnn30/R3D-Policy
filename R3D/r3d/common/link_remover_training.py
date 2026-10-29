@@ -79,7 +79,7 @@ class RemoverController:
         self.diag_every = int(cfg.diag_every)
         self.diag_batches = int(cfg.diag_batches)
         self.diag_masks = int(cfg.diag_masks)
-        self.optimizer = torch.optim.Adam([self.rem.gate, self.rem.mu], lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.rem.phi_parameters(), lr=self.lr)
         self.pending, self.recent = [], []
         self.phase = None
         self._epoch_frac = 0.0
@@ -95,7 +95,7 @@ class RemoverController:
                 fh.write(json.dumps(rec) + "\n")
 
     def _phi_state(self):
-        rho, kp, det = torch.sigmoid(self.rem.mu.detach()), self.rem.keep_prob(), self.rem.rho()
+        rho, kp, det = self.rem.density(), self.rem.keep_prob(), self.rem.rho()
         return {name: {"mu": self.rem.mu[l].item(), "gate": self.rem.gate[l].item(), "rho": rho[l].item(),
                        "keep_prob": kp[l].item(), "det_rho": det[l].item()}
                 for l, name in enumerate(self.rem.region_names)}
@@ -138,7 +138,8 @@ class RemoverController:
         surr.backward()
         for l, name in enumerate(self.rem.region_names):
             log[f"remover_grad_gate/{name}"] = self.rem.gate.grad[l].item()
-            log[f"remover_grad_mu/{name}"] = self.rem.mu.grad[l].item()
+            if self.rem.mu.grad is not None:
+                log[f"remover_grad_mu/{name}"] = self.rem.mu.grad[l].item()
         self.optimizer.step()
         self.rem.clamp_()
         log.update(stats)

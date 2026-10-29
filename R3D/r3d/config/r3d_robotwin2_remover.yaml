@@ -20,6 +20,7 @@ policy:
     init_keep: 0.8              # removal gate: P(keep region) at init -> each region removed in 20% of draws
     gate_max: 5.0               # gate logits in [-5, 5]: P(keep) in [0.007, 0.993], a removed region can recover
     init_rho: 0.8               # density of a kept region (FPS within the region)
+    learn_density: true         # false = gates only: a kept region keeps all its points, mu frozen
     sigma: 1.0                  # overwritten every batch by the training schedule below
     mu_min: -9.0                # -8 still kept 1 point of link6 on the largest frames at N = 4096
     mu_max: 6.0

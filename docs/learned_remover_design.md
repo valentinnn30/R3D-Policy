@@ -41,6 +41,7 @@ leave-one-out baseline. The reward is the policy's own action-prediction error.
 | windows per φ step / `phi_every` | 128 / 4 | more windows = less noise. `phi_every` 2 doubles the updates (and the cost) |
 | `policy.link_remover.init_keep` | 0.8 | exploration of removal (each region removed in 20% of draws). 0.6–0.9 |
 | `policy.link_remover.init_rho` | 0.8 | starting density |
+| `policy.link_remover.learn_density` | true | false = **gates only**: ρ = g, so a kept region keeps every point and μ gets no gradient. First tuning step after sweep 1, where the density slopes were weak and ρ drifted to 0.6–0.75 |
 | `training.link_remover.warmup_frac` / `finetune_frac` | 0.2 / 0.1 | user: start with 20%, tune afterwards |
 | `sigma_start` / `sigma_end` | 1.0 / 0.2 | toy: ending at 0.5 learned no worse. Untested on the real task |
 | `policy.link_remover.snap_rho_below` | 0.05 | 0.02–0.1. Can also be applied afterwards to a trained checkpoint (inference only) |

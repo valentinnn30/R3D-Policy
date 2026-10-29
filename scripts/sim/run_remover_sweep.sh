@@ -30,6 +30,8 @@ ckpt_every=${CKPT_EVERY:-50}
 final=${FINAL_CKPT:-250}
 mids=${MID_CKPTS:-"50 100 150 200"}
 episodes=${EVAL_EPISODES:-200}         # the knobs above only for testing the driver itself
+keep_only_evaluated=${KEEP_ONLY_EVALUATED:-0}   # 1: after pass 2, delete checkpoints not in FINAL_CKPT / MID_CKPTS
+sweep_out=${SWEEP_OUT:-R3D/data/outputs/sim/mimicgen/remover_sweep}   # cross-run report dir (one per sweep)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date '+%F %T')] $*"; }
 run_dir() { echo "${here}/R3D/data/outputs/sim/mimicgen_sim_remover-${task}-p$1-g64-rm-$3-$2"; }
@@ -94,6 +96,16 @@ while read -r p s t rest; do
     # shellcheck disable=SC2086
     evaluate "${run}" ${mids}
     analyze "${run}"
+    if [ "${keep_only_evaluated}" = 1 ]; then
+        for f in "${run}"/checkpoints/*.ckpt; do
+            e=$(basename "${f}" .ckpt)
+            [[ "${e}" =~ ^[0-9]+$ ]] || continue                              # never latest.ckpt etc.
+            [ -f "${run}/eval/${e}_${episodes}ep_block1.json" ] && continue    # has a result: keep
+            [[ " ${final} ${mids} " == *" ${e} "* ]] && continue               # meant to be evaluated: keep
+            log "delete $(basename "${run}")/checkpoints/${e}.ckpt (not evaluated)"; rm -f "${f}"
+        done
+    fi
 done < <(lines)
-[ ${#runs[@]} -gt 0 ] && analyze "${runs[@]}"
-log "sweep done: ${#runs[@]} runs -> R3D/data/outputs/sim/mimicgen/remover_sweep/sweep_report.md"
+[[ "${sweep_out}" = /* ]] || sweep_out="${here}/${sweep_out}"
+[ ${#runs[@]} -gt 0 ] && analyze "${runs[@]}" --sweep-out "${sweep_out}"
+log "sweep done: ${#runs[@]} runs -> ${sweep_out}/sweep_report.md"

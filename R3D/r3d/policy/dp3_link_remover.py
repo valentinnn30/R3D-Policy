@@ -65,7 +65,8 @@ class DP3LinkRemover(DP3):
         self.link_remover = LinkRemover(
             RP.CELL_NAMES, groups, init_rho=cfg.get("init_rho", 0.8), init_keep=cfg.get("init_keep", 0.8),
             sigma=cfg.get("sigma", 1.0), mu_min=cfg.get("mu_min", -9.0), mu_max=cfg.get("mu_max", 6.0),
-            gate_max=cfg.get("gate_max", 5.0), snap_rho_below=cfg.get("snap_rho_below", None))
+            gate_max=cfg.get("gate_max", 5.0), snap_rho_below=cfg.get("snap_rho_below", None),
+            learn_density=cfg.get("learn_density", True))
         self.fill_to_min_keep = bool(cfg.get("fill_to_min_keep", True))
         self.reward_t = [int(t) for t in cfg.get("reward_t", [20, 50, 80])]
         self.k_masks = int(cfg.get("k_masks", 2))
@@ -232,7 +233,7 @@ class DP3LinkRemover(DP3):
         keep = rem.keep_prob()
         for l, name in enumerate(rem.region_names):
             stats[f"remover_mu/{name}"] = rem.mu[l].item()
-            stats[f"remover_rho/{name}"] = torch.sigmoid(rem.mu[l]).item()
+            stats[f"remover_rho/{name}"] = rem.density()[l].item()
             stats[f"remover_gate/{name}"] = rem.gate[l].item()
             stats[f"remover_keep_prob/{name}"] = keep[l].item()
         return surr, stats
@@ -268,8 +269,8 @@ class DP3LinkRemover(DP3):
             scores[name] = r.mean(0)
             adv = r - (r.sum(1, keepdim=True) - r) / (n_masks - 1)          # leave-one-out
             with torch.enable_grad():
-                ga, gm = torch.autograd.grad((adv * rem.log_prob(zb)).mean(), [rem.gate, rem.mu])
-            grads[name] = torch.cat([ga, gm]).float()
+                g_phi = torch.autograd.grad((adv * rem.log_prob(zb)).mean(), rem.phi_parameters())
+            grads[name] = torch.cat(g_phi).float()
 
         def rank(x):
             r = torch.argsort(torch.argsort(x)).float()
@@ -349,7 +350,7 @@ class DP3LinkRemover(DP3):
             out[f"remover_n_closed/{name}"] = n_c
             if n_c and n_o:
                 out[f"remover_effect_gate/{name}"] = (a[closed].mean() - a[~closed].mean()).item()
-            if n_o > 2:
+            if n_o > 2 and rem.learn_density:
                 zo, ao = zz[..., l][~closed].float(), a[~closed]
                 zc = zo - zo.mean()
                 if float((zc ** 2).sum()) > 0:

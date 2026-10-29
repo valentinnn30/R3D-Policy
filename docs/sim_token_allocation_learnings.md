@@ -334,6 +334,89 @@ pass at 128 × 4 is 184 / 259 ms per φ step, so a run takes ~2.5 h at 1024 and 
 reports `<run>/analysis/report.md` and `R3D/data/outputs/sim/mimicgen/remover_sweep/`.
 Purpose: as many diagnostics as possible to set up the tuning sweep.
 
+**Sweep 1 result (2026-10-27; 200 paired scenes, seed 42).** No gate closed at any N
+(keep prob 0.97–0.99 at the end); ρ drifted from 0.8 to 0.6–0.78. At inference the cloud was
+therefore uncut except for thinner robot regions, and thinning moves no tokens
+(4096: link5/6/7 11.6/17.8/6.6 tokens uncut vs 11.6/17.7/6.4).
+
+| N | 50 | 100 | 150 | 200 | 250 | uncut s42 | arm cut s42 |
+|---|---|---|---|---|---|---|---|
+| 4096 | 8.5 | 12.0 | 13.5 | 11.5 | 12.5 | 8.5 (p = 0.19) | 20.0 (p = 0.05) |
+| 1024 | 16.0 | 23.5 | – | 26.5 | 24.0 | 23.0 (p = 0.88) | 17.5 |
+| 2048 | – | – | – | 19.0 | 19.5 | 14.0 | 19.0 |
+
+- **The removal effect is positive (removal raises the loss) for every region**, from the
+  first φ steps on. It grows ~3× as removals get rarer (4096 link6: 1.3 → 3.7e-4 while closed
+  draws per step fall 58 → 3.5). That is the co-adaptation loop: θ sees fewer removals, gets
+  worse at them, and the gates rise further.
+- **The density slope is weak but has a consistent sign** (22 of 24 region × N positive,
+  t ≈ 2–3): slightly sparser is preferred, at ~2–3% of the size of a removal effect. Success
+  shows no "sparser is better" (1024 remover = uncut).
+- The fine-tune phase could not help: with every gate open, θ was fine-tuned on an
+  unreallocated token layout (user's reading, confirmed by the mechanism table).
+
+**Tuning round 1: gates only (2026-10-28; `learn_density: false`, 4096, seed 42).**
+
+| run | gates at the end | 200 | 250 | vs uncut at 250 |
+|---|---|---|---|---|
+| GO (gates only) | 0.98–0.99, all open | 12.0 | 8.5 | 15 vs 15, p = 1.0 |
+| GOgm2 (gates only, gate_max 2) | 0.88 = the bound, all open | 13.0 | 10.0 | 14 vs 11, p = 0.69 |
+
+With θ still seeing each region removed in ≥ 12% of draws (GOgm2), the reward says removal
+hurts for every region, now very clearly (t = 12–22, link6 +1.2e-4 vs +1.75e-4 in GO).
+**Conclusion: the reward of one shared θ is the obstacle**, not the density variable and not
+too little exploration. User's framing: removal is out of distribution for the shared
+network, and training one network on very different input types is worse than specialising.
+
+**Validation loss of networks trained on their own fixed cloud** (last 25 epochs, ×1e-3):
+the sign flips relative to the shared-θ reward. 4096 uncut 14.51 vs arm cut 11.66 (seed 43:
+11.59); success 8.5 vs 20.0. Over 12 Square runs, Spearman(success, −val loss) = 0.63. Loss
+gets the large 4096 effect right and is mixed at 1024 (favours the cut in both seeds; success
+−5.5 / +1.5 points). Seed-to-seed noise in the loss (1024 uncut 11.5 vs 12.9) is far larger
+than its epoch-to-epoch SE. Both 4096 baselines overfit in the second half (uncut 11.9 → 14.5,
+cut 10.6 → 11.7, from epoch 125 to 250).
+
+**Branch test (2026-10-28, `scripts/sim/run_branch_test.sh`):** the uncut 4096 run resumed
+from its 125.ckpt with the arm cut on the same schedule.
+
+| epoch | 150 | 175 | 200 | 250 | success 175 / 250 |
+|---|---|---|---|---|---|
+| uncut | 12.47 | 13.20 | 13.99 | 14.51 | – / 8.5 |
+| arm cut from 125 | 11.30 | 11.75 | 12.84 | 13.75 | 8.5 / 13.0 |
+| arm cut from scratch | 10.44 | 10.94 | 11.47 | 11.66 | – / 20.0 |
+
+The ranking is right from the first loss window on; the level is not. After a late branch
+the network keeps overfitting like the uncut run and recovers about half of the benefit
+(vs uncut 16 vs 7, p = 0.09; vs the full cut 16 vs 30, p = 0.05), and 50 epochs are not
+visible in success.
+
+**Early branch (2026-10-29, `scripts/sim/run_early_branch.sh`, report
+`R3D/data/outputs/sim/mimicgen/early_branch/`):** the same with the branch at epoch 50. The
+uncut trunk reproduced the baseline's val loss for epochs 0–50 bit for bit (training is
+deterministic), so the baseline is the matched control.
+
+| val loss ×1e-3 (last 25 ep) | 75 | 100 | 150 | 200 | 250 | success |
+|---|---|---|---|---|---|---|
+| uncut | 12.23 | 11.87 | 12.47 | 13.99 | 14.51 | 250: 8.5 |
+| arm cut from scratch | 10.95 | 10.29 | 10.44 | 11.47 | 11.66 | 250: 20.0 |
+| branch at 125 | – | – | 11.30 | 12.84 | 13.75 | 175: 8.5, 250: 13.0 |
+| **branch at 50** | 10.92 | 10.91 | 11.18 | 12.43 | 13.28 | 150: 11.0, 250: 10.0 |
+
+25 epochs after the branch the loss equals the cut from scratch; after that it rises faster and
+ends between the two. Success at 250: vs uncut 15 vs 12 (p = 0.70), vs the cut from scratch
+13 vs 33 (p = 0.005), vs the branch at 125 15 vs 21 (p = 0.41). The early branch did NOT
+recover the cut's benefit, and did no better than the late one.
+
+**The resume is not exact, but shows no bias.** Trunk 50.ckpt → uncut continuation, 25 epochs:
+val loss differs from the baseline from epoch 51 on (0/25 identical, per-epoch differences up
+to 2.4e-3), with equal means (12.27 vs 12.23 ×1e-3). So a resumed run is a different noise
+realisation of the remaining training, comparable to a seed change, and every branch result
+carries seed-level variance. Square success varies a lot between seeds (arm cut 20.0 / 16.5;
+1024 uncut 23.0 / 19.0), and the 20.0% reference is a single realisation. **Open:** is "branches
+fall short of the cut from scratch" real, or seed noise? It needs seed repeats (e.g. uncut 4096
+seed 43; a second resume of each branch) before branch-and-prune is built on it.
+The arm + gripper cut cannot be a candidate at 4096: it leaves as few as 38 points (< 64 tokens).
+
 ## Method plan and positioning
 
 **Implementation brief for the learned remover: `docs/learned_remover_v0.md`** (user's plan,

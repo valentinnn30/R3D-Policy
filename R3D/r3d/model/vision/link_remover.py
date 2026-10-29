@@ -220,8 +220,11 @@ class LinkRemover(nn.Module):
     moves through sample / log_prob / rho without a second container."""
 
     def __init__(self, cell_names, region_groups, init_rho=0.8, init_keep=0.8, sigma=1.0,
-                 mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None):
+                 mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None, learn_density=True):
         super().__init__()
+        # learn_density False = gates only: a kept region keeps ALL its points (rho = g), mu is
+        # not learned (no gradient, left at logit(init_rho) for checkpoint compatibility)
+        self.learn_density = bool(learn_density)
         table, self.region_names = region_table(cell_names, region_groups)
         self.cell_names = list(cell_names)
         self.register_buffer("cell_to_region", table)
@@ -239,7 +242,7 @@ class LinkRemover(nn.Module):
             raise ValueError("snap_rho_below must be in (0, 1) or None")
         self.snap_rho_below = None if snap_rho_below is None else float(snap_rho_below)
         logit = lambda p: math.log(p / (1 - p))
-        self.mu = nn.Parameter(torch.full((L,), logit(init_rho)))
+        self.mu = nn.Parameter(torch.full((L,), logit(init_rho)), requires_grad=self.learn_density)
         self.gate = nn.Parameter(torch.full((L,), logit(init_keep)))
         self.register_buffer("sigma", torch.tensor(float(sigma)))
         self.clamp_()
@@ -257,6 +260,13 @@ class LinkRemover(nn.Module):
     def set_sigma(self, sigma):
         self.sigma.fill_(float(sigma))
 
+    def phi_parameters(self):
+        return [self.gate, self.mu] if self.learn_density else [self.gate]
+
+    def density(self):
+        """deterministic density of a kept region, unsnapped: sigmoid(mu), or 1 gates-only."""
+        return torch.sigmoid(self.mu.detach()) if self.learn_density else torch.ones_like(self.mu.detach())
+
     def keep_prob(self):
         return torch.sigmoid(self.gate.detach())
 
@@ -264,7 +274,8 @@ class LinkRemover(nn.Module):
         """-> draws (n, 2L) = [z | g], detached."""
         with torch.no_grad():
             L, dev = self.n_regions, self.mu.device
-            z = self.mu[None] + self.sigma * torch.randn(n, L, device=dev)
+            z = self.mu[None] + self.sigma * torch.randn(n, L, device=dev) if self.learn_density \
+                else torch.zeros(n, L, device=dev)
             g = (torch.rand(n, L, device=dev) < torch.sigmoid(self.gate)[None]).to(z.dtype)
             return torch.cat([z, g], -1)
 
@@ -276,11 +287,13 @@ class LinkRemover(nn.Module):
 
     def log_prob(self, draw):
         """sum_l [log Bern(g_l; sigmoid(a_l)) + g_l log N(z_l; mu_l, sigma^2)] -> (...,);
-        the gradient reaches a and mu only."""
+        the gradient reaches a and mu only. Gates only: the Bernoulli term alone."""
         z, g = self.split(draw.detach())
+        lp_g = g * torch.nn.functional.logsigmoid(self.gate) + (1 - g) * torch.nn.functional.logsigmoid(-self.gate)
+        if not self.learn_density:
+            return lp_g.sum(-1)
         s = self.sigma
         lp_z = -0.5 * ((z - self.mu) / s) ** 2 - torch.log(s) - 0.5 * math.log(2 * math.pi)
-        lp_g = g * torch.nn.functional.logsigmoid(self.gate) + (1 - g) * torch.nn.functional.logsigmoid(-self.gate)
         return (lp_g + g * lp_z).sum(-1)
 
     def rho(self, draw=None):
@@ -289,9 +302,9 @@ class LinkRemover(nn.Module):
         to 0 below `snap_rho_below`."""
         if draw is not None:
             z, g = self.split(draw)
-            return g * torch.sigmoid(z)
-        rho = torch.sigmoid(self.mu.detach())
-        if self.snap_rho_below is not None:
+            return g * torch.sigmoid(z) if self.learn_density else g
+        rho = self.density()
+        if self.snap_rho_below is not None and self.learn_density:
             rho = torch.where(rho < self.snap_rho_below, torch.zeros_like(rho), rho)
         return torch.where(self.keep_prob() >= 0.5, rho, torch.zeros_like(rho))
 

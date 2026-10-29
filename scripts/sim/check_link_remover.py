@@ -283,6 +283,31 @@ def main():
           torch.equal(snapped, torch.where(det < 0.05, torch.zeros_like(det), det)) and bool((snapped == 0).any())
           and torch.equal(r3.rho(zs), g3 * torch.sigmoid(z3)) and bool(((r3.rho(zs) < 0.05) & (g3 > 0)).any()))
 
+    print("\n=== gates only (learn_density: false) ===")
+    r5 = LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), init_keep=0.8, snap_rho_below=0.05,
+                     learn_density=False)
+    torch.manual_seed(0)
+    d5 = r5.sample(2000)
+    z5, g5 = r5.split(d5)
+    check("gates only: draw rho == g (a kept region keeps every point), z unused",
+          torch.equal(r5.rho(d5), g5) and bool((z5 == 0).all()))
+    with torch.no_grad():
+        r5.gate.copy_(torch.linspace(-3, 3, r5.n_regions))
+    check("gates only: inference rho = 1[keep prob >= 0.5], no snap of the density",
+          torch.equal(r5.rho(), (r5.keep_prob() >= 0.5).float()))
+    lp5 = r5.log_prob(d5[:5])
+    a5 = r5.gate.detach()
+    ref5 = (g5[:5] * torch.nn.functional.logsigmoid(a5) + (1 - g5[:5]) * torch.nn.functional.logsigmoid(-a5)).sum(-1)
+    r5.zero_grad()
+    lp5.sum().backward()
+    check("gates only: log P = sum log Bern(g); gradient on the gate logits only, mu frozen",
+          torch.allclose(lp5, ref5, atol=1e-6) and r5.mu.grad is None and not r5.mu.requires_grad
+          and bool((r5.gate.grad != 0).all()) and r5.phi_parameters() == [r5.gate])
+    P5 = torch.as_tensor(np.asarray(z["data"]["point_cloud"][:1, :1024]), device=DEV)
+    C5 = torch.as_tensor(np.asarray(z["data"]["point_link"][:1, :1024]), device=DEV).long()
+    o5, l5 = thin_regions(P5, C5, torch.ones(1, r5.n_regions, device=DEV), r5.cell_to_region.to(DEV))[:2]
+    check("gates only: an open gate (rho = 1) keeps the cloud unchanged", torch.equal(o5, P5) and int(l5[0]) == 1024)
+
     if "--no-policy" not in sys.argv:
         policy_checks(z)
 
@@ -538,6 +563,31 @@ def policy_checks(z):
     check("remover_loss: gradient reaches phi (density mu, gate logits) only",
           sorted(grads) == ["link_remover.gate", "link_remover.mu"]
           and all(bool((g != 0).any()) for g in grads.values()))
+
+    print("\n=== policy: gates only (learn_density: false) ===")
+    del pol
+    torch.cuda.empty_cache()
+    pg = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+               {"enabled": True, "k_masks": 4, "learn_density": False})
+    pg.train()
+    rg = pg.link_remover
+    batch = make_batch(z, N, B=B, seed=1)
+    surr, stats = pg.remover_loss(batch)
+    surr.backward()
+    grads = {n: p.grad for n, p in pg.named_parameters() if p.grad is not None}
+    check("gates only: remover_loss gradient on the gate logits only, no density slope logged",
+          sorted(grads) == ["link_remover.gate"] and bool((grads["link_remover.gate"] != 0).any())
+          and not any(k.startswith("remover_effect_density/") for k in stats)
+          and all(stats[f"remover_rho/{n}"] == 1.0 for n in rg.region_names))
+    hg = pg.heldout_check(batch, make_batch(z, N, B=B, seed=9), n_masks=6)
+    check("gates only: heldout_check runs (gradient over the gate logits)",
+          all(np.isfinite(v) for v in hg.values()))
+    from r3d.common.link_remover_training import RemoverController
+    ctl = RemoverController(pg, OmegaConf.create(dict(
+        lr=3e-3, phi_every=4, warmup_frac=0.2, finetune_frac=0.1, sigma_start=1.0, sigma_end=0.2,
+        diag_every=10, diag_batches=4, diag_masks=8)), num_epochs=10)
+    ps = [p for g in ctl.optimizer.param_groups for p in g["params"]]
+    check("gates only: the phi optimizer holds the gate logits only", len(ps) == 1 and ps[0] is rg.gate)
 
 
 if __name__ == "__main__":
