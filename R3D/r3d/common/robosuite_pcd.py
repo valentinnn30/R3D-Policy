@@ -33,6 +33,8 @@ ROBOT_PREFIXES = {"robot0_": RIGHT_ARM, "gripper0_": RIGHT_GRIPPER, "mount0_": R
 TASK_ROLES = {
     # Square: square nut onto the square peg; the round nut / round peg are unused
     "Square": {"object": ["SquareNut"], "target": ["peg1"], "other": ["RoundNut", "peg2"]},
+    # Threading: the needle through the tripod's ring
+    "Threading": {"object": ["needle_obj"], "target": ["tripod_obj"], "other": []},
 }
 
 
@@ -91,6 +93,14 @@ def default_region_groups():
     g += [{"name": f"finger{f}", "cells": [f"finger{f}_{p}_{side}" for p in ("prox", "dist") for side in ("in", "out")]}
           for f in (1, 2)]
     return g
+
+
+def all_links_region_groups():
+    """default_region_groups() plus one LEARNED gate per base link link0..link4 (13 regions; user,
+    2026-11-04). The v0 grouping left link0-4 unremovable, but link3 / link4 come into view in ~4-5% of
+    frames with up to ~460 / ~980 of 4096 points -- without them no mask can reproduce the arm cut
+    (label 5 == cells link0..link7 exactly)."""
+    return [{"name": f"link{i}", "cells": [f"link{i}"]} for i in range(5)] + default_region_groups()
 
 
 def per_link_region_groups():

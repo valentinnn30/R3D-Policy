@@ -21,6 +21,15 @@ after every step. theta's optimizer never sees them (`theta_parameters`). The EM
 the LIVE remover state after every EMA step: evaluation = EMA theta + the current
 deterministic gates and rho, not an average of phi.
 
+Fixed mask (`link_remover.fixed_removed`, the round-3 specialist): no phi optimizer and no
+phi steps; the phase is "fixed" throughout and theta trains on the deterministic mask. The
+epoch records and the mechanism readout stay; the held-out check and diagnostic B compare
+masks and are skipped.
+
+`finetune_mask` (round 4 branches, default null): a list of regions to remove (`[]` = keep all). On
+entering the fine-tune the gates are set to exactly that mask (+-gate_max), so theta fine-tunes -- and
+the checkpoint evaluates -- on it instead of on phi's learned gates. Gates-only remover.
+
 Diagnostics (every `diag_every` epochs, on the live model, logged under remover_check/ and
 mech/): the held-out memorisation check (`heldout_check`: recent training windows vs held-out
 demos, against the same windows under fresh seeds as the noise floor), diagnostic B
@@ -70,16 +79,26 @@ class RemoverController:
         self.lr = float(cfg.lr)
         self.phi_every = int(cfg.phi_every)
         self.num_epochs = int(num_epochs)
+        self.fixed = self.rem.fixed_removed is not None
         self.warmup_end = int(round(float(cfg.warmup_frac) * num_epochs))
         self.finetune_start = num_epochs - int(round(float(cfg.finetune_frac) * num_epochs))
-        if not 0 <= self.warmup_end < self.finetune_start <= num_epochs:
+        if not self.fixed and not 0 <= self.warmup_end < self.finetune_start <= num_epochs:
             raise ValueError(f"remover phases: warm-up ends at epoch {self.warmup_end}, fine-tune "
                              f"starts at {self.finetune_start} of {num_epochs} -- no phi phase")
         self.sigma_start, self.sigma_end = float(cfg.sigma_start), float(cfg.sigma_end)
         self.diag_every = int(cfg.diag_every)
         self.diag_batches = int(cfg.diag_batches)
         self.diag_masks = int(cfg.diag_masks)
-        self.optimizer = torch.optim.Adam(self.rem.phi_parameters(), lr=self.lr)
+        fm = cfg.get("finetune_mask", None)
+        if fm is not None:
+            fm = [str(r) for r in fm]
+            bad = [r for r in fm if r not in self.rem.region_names]
+            if bad:
+                raise KeyError(f"finetune_mask: unknown regions {bad} (known: {self.rem.region_names})")
+            if self.fixed or self.rem.learn_density or not self.rem.learn_gates:
+                raise ValueError("finetune_mask needs a learned gates-only remover")
+        self.finetune_mask, self._finetune_mask_set = fm, False
+        self.optimizer = None if self.fixed else torch.optim.Adam(self.rem.phi_parameters(), lr=self.lr)
         self.pending, self.recent = [], []
         self.phase = None
         self._epoch_frac = 0.0
@@ -102,6 +121,8 @@ class RemoverController:
 
     # ---- per batch / per optimizer step ---------------------------------------------------
     def phase_of(self, epoch):
+        if self.fixed:
+            return "fixed"
         if epoch < self.warmup_end:
             return "warmup"
         return "finetune" if epoch >= self.finetune_start else "phi"
@@ -115,7 +136,12 @@ class RemoverController:
             self.rem.set_sigma(self.sigma_start + (self.sigma_end - self.sigma_start) * min(max(prog, 0.0), 1.0))
         elif self.phase == "warmup":
             self.rem.set_sigma(self.sigma_start)
-        model.remover_mode = "deterministic" if self.phase == "finetune" else "sample"
+        if self.phase == "finetune" and self.finetune_mask is not None and not self._finetune_mask_set:
+            with torch.no_grad():
+                self.rem.gate.copy_(torch.tensor([-self.rem.gate_max if r in self.finetune_mask else self.rem.gate_max
+                                                  for r in self.rem.region_names], device=self.rem.gate.device))
+            self._finetune_mask_set = True
+        model.remover_mode = "deterministic" if self.phase in ("finetune", "fixed") else "sample"
 
     def remember(self, batch, To):
         """Keep this micro-batch for the next phi step (phi phase) and the diagnostics."""
@@ -129,7 +155,7 @@ class RemoverController:
         phi phase, on the windows of this optimizer step. -> log dict."""
         pending, self.pending = self.pending, []
         log = {"remover_sigma": self.rem.sigma.item(),
-               "remover_phase": {"warmup": 0, "phi": 1, "finetune": 2}[self.phase]}
+               "remover_phase": {"warmup": 0, "phi": 1, "finetune": 2, "fixed": 3}[self.phase]}
         if self.phase != "phi" or opt_step % self.phi_every != 0 or not pending:
             return log
         with amp():
@@ -137,7 +163,8 @@ class RemoverController:
         self.optimizer.zero_grad(set_to_none=True)
         surr.backward()
         for l, name in enumerate(self.rem.region_names):
-            log[f"remover_grad_gate/{name}"] = self.rem.gate.grad[l].item()
+            if self.rem.gate.grad is not None:
+                log[f"remover_grad_gate/{name}"] = self.rem.gate.grad[l].item()
             if self.rem.mu.grad is not None:
                 log[f"remover_grad_mu/{name}"] = self.rem.mu.grad[l].item()
         self.optimizer.step()
@@ -184,14 +211,15 @@ class RemoverController:
                 break
         acc = {}
         with amp():
-            for tr, ho in zip(self.recent, val):
+            for tr, ho in ([] if self.fixed else zip(self.recent, val)):
                 for k, v in model.heldout_check(tr, ho, n_masks=self.diag_masks).items():
                     acc.setdefault(k, []).append(v)
-            for ho in val:
+            for ho in ([] if self.fixed else val):
                 acc.setdefault("remover_check/ab_rank_spearman", []).append(
                     model.rank_check_ab(ho, n_masks=self.diag_masks)["ab_rank_spearman"])
             for ho in val[:2]:
-                for k, v in model.mechanism_check(ho).items():
+                masks = ("none", "deterministic") if self.fixed else ("none", "deterministic", "sampled")
+                for k, v in model.mechanism_check(ho, masks=masks).items():
                     acc.setdefault(k, []).append(v)
         log = {k: float(np.nanmean(v)) for k, v in acc.items()}
         log["remover_check/n_batches"] = len(val)

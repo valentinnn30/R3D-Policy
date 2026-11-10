@@ -41,6 +41,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ckpts", nargs="+")
     ap.add_argument("--episodes", type=int, default=100)
+    ap.add_argument("--tag", default="", help="suffix for the result json (e.g. a re-evaluation on another scene list)")
+    ap.add_argument("--drop-point-labels", default=None,
+                    help="evaluate with this label cut instead of the checkpoint's (e.g. 4,5 = both arms; 'none' = no cut); "
+                         "output gets _cut-<labels>")
     ap.add_argument("--seed", type=int, default=0, help="eval seed block (not the training seed)")
     ap.add_argument("--noise-offset", type=int, default=0,
                     help="k > 0: re-seed torch per episode with scene seed + k*1000003 after the scene is "
@@ -69,12 +73,16 @@ def main():
         # RoboTwin names the video dir "<epoch>-<basename(output_dir)>-<task_config>"
         # (robotwin2/eval_video/), so the basename must be the RUN, not the epoch
         tag = (ck.parent.parent.name + (f"_seed{a.seed}" if a.seed else "")
-               + (f"_noise{a.noise_offset}" if a.noise_offset else ""))
+               + (f"_noise{a.noise_offset}" if a.noise_offset else "") + (f"_{a.tag}" if a.tag else "")
+               + (f"_cut-{a.drop_point_labels.replace(',', '')}" if a.drop_point_labels is not None else ""))
         out_dir = ck.parent.parent / "eval" / tag   # basename names the video dir
         with open_dict(cfg):
             cfg.task.env_runner.output_dir = str(out_dir)
             cfg.task.env_runner.eval_episodes = a.episodes
             cfg.task.env_runner.seed = a.seed
+            if a.drop_point_labels is not None:   # a mask override at evaluation only (runner._policy_obs)
+                cut = [] if a.drop_point_labels == "none" else [int(c) for c in a.drop_point_labels.split(",")]
+                cfg.task.env_runner.drop_point_labels = cut or None
 
         policy = hydra.utils.instantiate(cfg.policy)
         key = "ema_model" if cfg.training.use_ema else "model"
@@ -120,7 +128,9 @@ def main():
             "episodes": a.episodes, "eval_seed": a.seed, "noise_offset": a.noise_offset, "minutes": round((time.time() - t0) / 60, 1),
             "success_rate": float(log["test_mean_score"]), "runner_log": log,
         }
-        suffix = f"_noise{a.noise_offset}" if a.noise_offset else ""
+        suffix = (f"_noise{a.noise_offset}" if a.noise_offset else "") + (f"_{a.tag}" if a.tag else "")
+        if a.drop_point_labels is not None:
+            suffix += f"_cut-{a.drop_point_labels.replace(',', '')}"
         path = ck.with_name(f"{ck.stem}.eval_{a.episodes}ep_seed{a.seed}{suffix}.json")
         path.write_text(json.dumps(res, indent=2))
         print(f"{ck.name}: success {res['success_rate']:.1%} over {a.episodes} episodes -> {path}")

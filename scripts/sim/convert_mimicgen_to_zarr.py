@@ -13,7 +13,12 @@ Every frame is re-rendered from the stored simulator state (no planning) with
     state[t]        (11,)            eef pos | rot6d | gripper qpos      (robosuite_actions)
     action[t]       (10,)            ABSOLUTE OSC goal of the recorded delta action t:
                                      pos | rot6d | gripper (EquiDiff's conversion)
-    meta/init_layout (n_ep, 14)      nut pos+quat(xyzw), peg pos+quat at t=0 (distance analysis)
+    meta/init_layout (n_ep, 14)      object pos+quat(xyzw), target pos+quat at t=0 (ROLE_BODIES)
+
+`--window <name>` (r3d/common/robosuite_tasks.py WINDOWS, e.g. threading_d1n): keep only demos whose
+initial target pose lies in that window, the FIRST `--demos` of them in file order; the ids and the
+window go into the zarr attrs (`demos`, `init_window`, `eval_env_name`) and the evaluation resets
+from the matching narrowed env.
 
 `--verify K` replays the absolute actions of K demos under control_delta=False from
 the recorded initial state and reports task success and end-effector tracking error
@@ -36,7 +41,7 @@ R3D_DIR = os.path.join(ROOT, "R3D")
 sys.path.insert(0, R3D_DIR)
 sys.path.insert(0, os.path.dirname(__file__))
 
-ROLE_BODIES = {"square": ("SquareNut_main", "peg1")}
+ROLE_BODIES = {"square": ("SquareNut_main", "peg1"), "threading": ("needle_obj_root", "tripod_obj_root")}
 
 
 def hdf5_path(task):
@@ -147,6 +152,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--output", default=None)
     ap.add_argument("--verify", type=int, default=0, help="only check the action conversion on K demos")
+    ap.add_argument("--window", default=None, help="robosuite_tasks.WINDOWS key: first --demos demos inside it")
     a = ap.parse_args()
 
     with h5py.File(hdf5_path(a.task), "r") as f:
@@ -157,7 +163,16 @@ def main():
     out = a.output or os.path.join(R3D_DIR, "data", f"{a.task}-{a.camera}_p{a.num_points}-{a.demos}.zarr")
     tmp = out + ".parts"
     os.makedirs(tmp, exist_ok=True)
-    eps = list(range(a.demos))
+    window = None
+    if a.window:
+        from r3d.common import robosuite_tasks as RT
+        window = RT.WINDOWS[a.window]
+        eps, n_in, n_all = RT.select_demos(hdf5_path(a.task), env_args, window, a.demos)
+        print(f"window {a.window}: {n_in}/{n_all} demos inside, using the first {len(eps)} (last id {eps[-1]})", flush=True)
+        if len(eps) < a.demos:
+            raise RuntimeError(f"only {len(eps)} demos inside window {a.window}")
+    else:
+        eps = list(range(a.demos))
     chunks = [eps[i::a.workers] for i in range(a.workers)]
     t0 = time.time()
     ctx = mp.get_context("spawn")
@@ -185,11 +200,13 @@ def main():
         "point_label_classes": {str(k): v for k, v in RP.CLASS_NAMES.items()},
         "state_layout": "eef pos (3) | eef rot6d (6, first two rows) | gripper finger qpos (2)",
         "action_layout": "ABSOLUTE OSC goal: pos (3) | rot6d (6) | gripper (1); eval: control_delta=False",
-        "init_layout": "nut pos(3) quat_xyzw(4) | peg pos(3) quat_xyzw(4)",
+        "init_layout": " | ".join(f"{b} pos(3) quat_xyzw(4)" for b in ROLE_BODIES[a.task.rsplit("_d", 1)[0]]),
         "controller_configs": env_args["env_kwargs"]["controller_configs"],
         "points_in_box_min": int(nval.min()), "points_in_box_p10": float(np.percentile(nval, 10)),
         "state_dim": RA.STATE_DIM, "action_dim": RA.ACTION_DIM,
     })
+    if window is not None:
+        root["meta"].attrs.update({"init_window": {"name": a.window, **window}, "eval_env_name": window["env_name"]})
     print(f"wrote {out}: {int(root['meta/episode_ends'][-1])} frames; points in box min {nval.min()}, "
           f"frames padded at {N}: {(nval < N).sum()}")
 

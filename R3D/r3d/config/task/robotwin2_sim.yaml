@@ -25,6 +25,10 @@ num_points: 1024
 # envs/utils/point_labels.py: [5] = right arm (the gripper, 7, is kept).
 # null = no cut. E.g. task.drop_point_labels=[5]
 drop_point_labels: null
+# Robot-part dropout in TRAINING only (robotwin_sim_dataset.py): per window each listed class is removed with
+# probability 1 - dropout_keep; validation and evaluation see the full cloud. E.g. [4, 5, 6, 7]. null = off.
+dropout_point_labels: null
+dropout_keep: 0.5
 
 shape_meta: &shape_meta
   obs:
@@ -79,4 +83,6 @@ dataset:
   saturation_range: [0.5, 1.5]
   use_target_ee: ${policy.use_target_ee}
   drop_point_labels: ${task.drop_point_labels}
+  dropout_point_labels: ${task.dropout_point_labels}
+  dropout_keep: ${task.dropout_keep}
   num_points: ${task.num_points}

@@ -16,11 +16,18 @@ policy:
   _target_: r3d.policy.dp3_link_remover.DP3LinkRemover
   link_remover:
     enabled: true
-    region_groups: default      # robosuite_pcd.default_region_groups(): 8 regions, link0-4 never thinned
+    region_groups: default      # robosuite_pcd.default_region_groups(): 8 regions, link0-4 never thinned; all_links: 13 (+ link0..4)
     init_keep: 0.8              # removal gate: P(keep region) at init -> each region removed in 20% of draws
     gate_max: 5.0               # gate logits in [-5, 5]: P(keep) in [0.007, 0.993], a removed region can recover
     init_rho: 0.8               # density of a kept region (FPS within the region)
     learn_density: true         # false = gates only: a kept region keeps all its points, mu frozen
+    learn_gates: true           # false = density only: every gate open, phi = mu
+    scene_rho_min: 0.1          # region_groups=default+scene: floor of the scene's density
+    theta_rho: null             # e.g. [0.1, 1.0]: density-only theta pass draws rho ~ U[lo, hi] per region (phi still learns)
+    theta_keep: null            # e.g. 0.5: theta pass draws gates at this fixed keep prob (phi still learns)
+    mix_eps: 0.0                # > 0: with this prob a draw is one of mix_masks (structured exploration)
+    mix_masks: null             # lists of removed regions, or "all"
+    fixed_removed: null         # e.g. [link5, link6]: SPECIALIST, fixed mask, nothing learned (needs learn_density: false)
     sigma: 1.0                  # overwritten every batch by the training schedule below
     mu_min: -9.0                # -8 still kept 1 point of link6 on the largest frames at N = 4096
     mu_max: 6.0
@@ -34,6 +41,7 @@ training:
     lr: 3.0e-3                  # Adam on the gate + density logits (the brief's 1e-5 does not move them)
     phi_every: 4                # optimizer steps per phi step
     warmup_frac: 0.2            # theta only, masks from the fixed initial phi
+    finetune_mask: null         # e.g. [link5, link6] or []: fine-tune (and evaluate) on this mask instead of phi's gates
     finetune_frac: 0.1          # phi frozen, theta on the snapped deterministic rho
     sigma_start: 1.0
     sigma_end: 0.2

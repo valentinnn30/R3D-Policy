@@ -417,6 +417,398 @@ fall short of the cut from scratch" real, or seed noise? It needs seed repeats (
 seed 43; a second resume of each branch) before branch-and-prune is built on it.
 The arm + gripper cut cannot be a candidate at 4096: it leaves as few as 38 points (< 64 tokens).
 
+**Tuning round 2 (launched 2026-10-31, queue `R3D/data/outputs/sim/mimicgen/remover_tune2_queue.txt`,
+report `.../mimicgen/remover_tune2/`).** Four runs at 4096 / 64, seed 42, lr 3e-3, schedule 20 / 70 / 10:
+
+| tag | what | question |
+|---|---|---|
+| GOclosed | gates only, init_keep 0.2 (mirror of GO) | does the start decide? a gate opening against it = the region is needed |
+| GObal | gates only, policy pass at a fixed keep 0.5 (`theta_keep`), φ learns | is the bias only how often θ sees each mask? |
+| DOscene | density only, 8 robot regions + a label-free scene region (floor ρ 0.1), init ρ 0.9 | can the remover learn "fewer points" (uncut 1024 23.0% vs uncut 4096 8.5%)? |
+| GOmix | GO + ε = 0.25 structured masks (none, arm, arm + hand, all) | does the reward rate whole-arm removal better when it is actually sampled? |
+
+- **Fill-up is not an issue for the remover.** With all 8 regions closed, a frame keeps at
+  least 56 points (p1 282, median 891); only 3 of 30,646 frames (0.01%) fall below 64. The
+  remover never thins link0–4, unlike the label-5 cut (38).
+- **Why the scene region:** robot-only density cannot reproduce the 1024 effect, which is
+  coverage of the objects. Their density stays at 4096 when only the robot is thinned.
+
+**Round 2 result (finished 2026-11-01; 200 paired scenes, seed 42; report
+`R3D/data/outputs/sim/mimicgen/remover_tune2/sweep_report.md`):**
+
+| run | learned mask at inference | 200 | 250 | vs uncut 8.5 | vs arm cut 20.0 | vs uncut 1024 23.0 |
+|---|---|---|---|---|---|---|
+| GO (round 1) | all kept | 12.0 | 8.5 | p = 1.0 | 13 vs 36, p < 0.001 | – |
+| GOclosed | whole robot removed | 18.5 | 14.0 | 18 vs 7, p = 0.04 | 19 vs 31, p = 0.12 | p = 0.015 |
+| **GObal** | **link5 + link6 removed**; link7, hand, fingers kept | **22.0** | **19.5** | **30 vs 8, p < 0.001** | **25 vs 26, p = 1.0** | p = 0.40 |
+| DOscene | scene ρ 0.25, robot ρ 0.5–0.88 | 16.0 | 13.0 | p = 0.11 | p = 0.054 | 11 vs 31, p = 0.003 |
+| GOmix | link5 + link6 removed (same mask as GObal) | 18.5 | 16.5 | 26 vs 10, p = 0.011 | p = 0.43 | p = 0.12 |
+
+- **GOclosed** is the mirror of GO, as the user predicted. Every gate closed further
+  (0.007–0.04) and the reward said adding hurts for every region (t −6 to −18). The start
+  decides; no region opened against it.
+- **GObal: the bias was how often θ saw each mask.** With θ's training pass fixed at keep 0.5,
+  the shared reward separates the regions:
+  - remove link5 / link6: t −9.7 / −9.2;
+  - keep link7: t +8.6;
+  - keep the hand regions: t +7.6 to +8.6;
+  - keep the fingers: t +5.7 / +7.8.
+
+  The gates move from epoch 75 on. The learned mask refines the oracle: it keeps link7, the
+  wrist link next to the gripper. It matches the oracle's success, and the freed tokens go to
+  the task (nut 5.8 → 9.5 tokens, coverage 0.58 → 0.80; peg 6.8 → 14.6, coverage 0.47 → 0.85).
+- **GOmix reached the same mask independently.**
+  - **Per-mask verdict** (mean advantage against the rest of the window):
+    - arm removed (link5–7) −9.5e-5, t −24: better;
+    - nothing removed: ~0 in the second half;
+    - arm + hand removed +2.0e-4, t +31: worse;
+    - everything removed +7.7e-4, t +79: much worse.
+  - **Its per-region effects are confounded** by the bad structured masks: they all read
+    positive, yet link5 and link6 closed. Read only the per-mask table for a mix run.
+- **GObal vs GOmix is within noise** (27 vs 20 at 200, p = 0.38; 27 vs 21 at 250, p = 0.47).
+  It is NOT fine-tune length: both fine-tune epochs 226–250. GOmix's θ saw the exact final
+  mask more often (32.8% of its training clouds at epoch 200 vs 0.4% for GObal), and its val
+  loss on the final mask is lower (11.41 vs 12.12 ×1e-3). Possible but untested: GObal's 50%
+  robot-part dropout makes the policy more robust in closed loop.
+- **DOscene learned the "fewer points" density, but not the success.**
+  - The scene ρ fell 0.9 → 0.25 and was still falling when φ froze (0.30 at 175, 0.29 at 200,
+    0.25 at 224).
+  - The reward favoured sparser everywhere (scene density slope t 8.4, fingers 6.2 / 4.4).
+  - Object coverage reached the 1024 regime (nut 0.99, peg 1.00, patches 4.5 cm).
+  - Success stayed at 13.0%, against 23.0% for uncut 1024 (p = 0.003). The robot stayed dense
+    (still ~50 of 64 tokens).
+- **Fill-up is negligible:** at most 0.01% of clouds in any run.
+
+**Next:** round 3, spec in `docs/remover_round3_plan.md`. Seeds over more eval scenes (user,
+2026-11-01): seed noise dominates (the arm cut alone is 20.0 vs 16.5% between seeds).
+
+**Round 3 (finished 2026-11-02; 4096 / 64 tokens, 200 paired scenes; queue
+`R3D/data/outputs/sim/mimicgen/remover_tune3_queue.txt`, report `.../mimicgen/remover_tune3/`).**
+Runs: GObal seed 43, and **SPEC** seeds 42 / 43 -- a specialist trained from scratch on the FIXED mask GObal
+learned (link5 + link6 removed, everything else kept, nothing learned; `policy.link_remover.fixed_removed`,
+see the design doc). Afterwards (user, same day) GObal's 250.ckpt was re-evaluated with OTHER masks at
+inference (`eval_mimicgen_ckpt.py --remover-removed`, `scripts/sim/run_mask_override_evals.sh`).
+
+| method | s42 @200 | s43 @200 | s42 @250 | s43 @250 | mean @250 | spread @250 |
+|---|---|---|---|---|---|---|
+| GObal (learned mask) | 22.0 | 20.5 | 19.5 | 18.0 | 18.8 | 1.5 |
+| SPEC (fixed mask, from scratch) | 14.5 | 8.0 | 11.0 | 11.5 | 11.3 | 0.5 |
+| arm cut (oracle) | – | – | 20.0 | 16.5 | 18.3 | 3.5 |
+| uncut | – | – | 8.5 | – | – | – |
+| GObal 250.ckpt, **uncut cloud** at inference | | | 16.0 | 18.0 | 17.0 | |
+| GObal 250.ckpt, link5 + 6 + 7 removed at inference | | | 18.0 | 18.0 | 18.0 | |
+
+Paired McNemar (a only / b only; pooled = discordant pairs summed over both seeds, 400 scene-runs):
+
+| a vs b | s42 | s43 | pooled |
+|---|---|---|---|
+| GObal vs SPEC @200 | 31 / 16, p = 0.040 | 34 / 9, p = 0.0002 | 65 / 25, p = 3e-5 |
+| GObal vs SPEC @250 | 32 / 15, p = 0.019 | 28 / 15, p = 0.066 | 60 / 30, p = 0.002 |
+| GObal vs arm cut @250 | 25 / 26, p = 1.0 | 25 / 22, p = 0.77 | 50 / 48, p = 0.92 |
+| SPEC vs arm cut @250 | 14 / 32, p = 0.011 | 14 / 24, p = 0.14 | 28 / 56, p = 0.003 |
+| GObal vs uncut @250 | 30 / 8, p < 0.001 | – | – |
+| GObal uncut cloud vs GObal learned mask | 17 / 24, p = 0.35 | 15 / 15, p = 1.0 | 32 / 39, p = 0.48 |
+| GObal uncut cloud vs uncut baseline | 26 / 11, p = 0.020 | – | – |
+| GObal uncut cloud vs SPEC | 25 / 15, p = 0.15 | 28 / 15, p = 0.066 | 53 / 30, p = 0.015 |
+| GObal link5-7 removed vs GObal learned mask | 16 / 19, p = 0.74 | 10 / 10, p = 1.0 | 26 / 29, p = 0.79 |
+| GObal link5-7 removed vs arm cut | 28 / 32, p = 0.70 | 22 / 19, p = 0.76 | 50 / 51, p = 1.0 |
+
+- **GObal reproduces.** Seed 43 learned the same mask: keep prob link5 0.11, link6 0.07; link7 0.80, hand
+  0.89-0.93, fingers 0.82-0.84 (seed 42: 0.07 / 0.08 vs 0.82-0.91). The reward's per-region verdict agrees
+  in sign on every region (removal effect t: link5 -7.4 / link6 -9.7; link7 +5.0, hand +8.4..+10.4,
+  fingers +6.2 / +6.4; seed 42 in round 2). Gates (init 0.5, phi from epoch 50) leave 0.4-0.6 at
+  epochs 55-98 (link5 / link6: 76 / 86 at s42, 98 / 92 at s43) and stay on their final side from
+  epoch 50-70. Mechanism identical on both seeds and in SPEC: nut 5.8 -> 9.5 tokens (coverage 0.58 -> 0.80),
+  peg 6.8 -> 14.6 (0.47 -> 0.85).
+- **GObal ≈ the oracle arm cut on both seeds** (pooled p = 0.92) and > uncut (s42). GObal is the most
+  seed-stable run (1.5 points at both checkpoints).
+- **GObal ≈ SPEC is FALSE: the specialist is clearly worse** (~7-10 points, both seeds, both checkpoints;
+  pooled p = 3e-5 at 200, 0.002 at 250). SPEC sits at the uncut level (s42: 11.0 vs 8.5, p = 0.49),
+  although its token allocation equals GObal's. Its val loss (last 25 epochs, own mask) does not explain
+  it: 11.18 (s42, the lowest of any 4096 run) vs 13.66 (s43); GObal 12.12 / 11.89 (its last 25 epochs =
+  the fine-tune on the final mask), arm cut 11.66 / 11.59.
+- **The gain sits in the dropout-trained NETWORK, not in the mask.** GObal's 250.ckpt on the UNCUT cloud
+  keeps its success (16.0 / 18.0 vs 19.5 / 18.0 with its mask, pooled p = 0.48) and beats the uncut
+  baseline on the identical input (s42 16.0 vs 8.5, p = 0.02); it also matches the arm cut with nothing
+  removed. Removing link7 as well changes nothing (18.0 / 18.0), so link7 does NOT explain SPEC either.
+  Together: training theta on random robot-part dropout (keep 0.5 per region) makes the policy better on
+  every one of these clouds; the learned mask adds no measurable inference-time gain. Note GObal also had
+  the 25-epoch fine-tune on its mask, and seed 43 has no uncut baseline.
+- Diagnostics (phi phase mean): held-out mask-rank agreement ~0 (0.03 / -0.07) against a same-window floor
+  of 0.27 / 0.30, diagnostic B 0.73 / 0.68 -- the training-window reward ranks masks unlike held-out demos.
+- SPEC trains in 3 h 24 min (no reward passes) vs ~3 h 54 min for GObal.
+
+**Consequence for the method (user, 2026-11-02).** "Learned removal" currently works as a training-time
+augmentation, not as an inference-time selection. Round 4 tests it (queue `remover_tune4_queue.txt`,
+report `.../mimicgen/remover_tune4/`, both seed 42, launched 2026-11-02 23:42):
+- **DROP**: GObal's theta pass (keep 0.5 per region) for the whole run, phi frozen (lr 0, no phi steps),
+  no fine-tune -> inference on the uncut cloud. DROP ≈ GObal = dropout alone carries the gain; DROP ≈ uncut
+  = the learned part matters.
+- **DObal**: the decoupling fix for density -- DOscene + `theta_rho: [0.1, 1.0]` (theta's densities
+  ~ U[0.1, 1] per region and window, independent of phi; phi learns from its own draws as before).
+  User decision: density only, so it differs from DOscene in the decoupling alone. Diagnose by phi's own
+  movement, its logged density slopes, and success -- not by hand mechanism analyses (user: that would be
+  reverse-engineering the concept).
+
+**Round 4 (2026-11-03/04; seed 42 unless noted; PRELIMINARY until DROP seed 43 and SPECarm are in).**
+Drivers: `remover_tune4_queue.txt` (DROP, DObal), `scripts/sim/run_finetune_branches.sh` (round 4b),
+`remover_tune4c_queue.txt` (SPECarm). New knob: `training.link_remover.finetune_mask` (fine-tune on a given
+mask instead of phi's gates).
+
+*Density, decoupled (DObal = DOscene + theta_rho [0.1, 1]).* phi now gets a clear signal on the upper arm:
+
+| learned rho | link5 | link6 | link7 | hand f1 / ctr / f2 | fingers | scene | success 200 / 250 |
+|---|---|---|---|---|---|---|---|
+| DObal | 0.60 | 0.55 | 0.92 | 0.84 / 0.85 / 0.76 | 0.55 / 0.53 | 0.37 | 11.0 / 14.5 |
+| DOscene (round 2) | 0.84 | 0.76 | 0.85 | 0.87 / 0.88 / 0.85 | 0.51 / 0.67 | 0.25 | 16.0 / 13.0 |
+
+Density slope t (> 0 = sparser preferred): link5 +6.1, link6 +5.9, link7 -0.6, hand +1.2..+2.9, fingers
++5.9 / +5.7, scene +6.6 (second half 0.2: it stopped). Same structure as GObal's gates (thin the upper arm,
+keep link7 + hand), found by density alone. Success: vs uncut 4096 20 / 8, p = 0.036; vs uncut 1024 15 / 32,
+p = 0.019; vs DOscene p = 0.74. Density moves no tokens, so the learned density barely reaches success.
+
+*Is GObal's gain only the dropout? (DROP = GObal's theta pass, keep 0.5 per region, for all 251 epochs; phi
+frozen; no fine-tune; inference on the uncut cloud.)* DROP: 18.0 at 200, 13.0 at 250. At 200 GObal and DROP
+are the same procedure (phi never touches theta's masks before the fine-tune): GObal 200 on the uncut cloud
+20.5 vs DROP 200 18.0 (22 / 17, p = 0.52) -- equal.
+
+*Fine-tune branches (round 4b).* DROP-42's 200.ckpt resumed with the identical config; the branches are bit-identical
+up to epoch 225 (val loss checked; they differ from the ORIGINAL DROP from epoch 201 on -- a resume re-draws the
+random stream) and differ only in the fine-tune 226-250:
+
+| epoch 250 | success | vs FTcont | vs uncut 8.5 | vs SPEC 11.0 |
+|---|---|---|---|---|
+| FTcont: no fine-tune (dropout to 250) | **18.5** | – | 28 / 8, p = 0.001 | 27 / 12, p = 0.024 |
+| FTlearned: fine-tune on link5 + 6 removed | 17.5 | 11 / 13, p = 0.84 | 24 / 6, p = 0.001 | 26 / 13, p = 0.053 |
+| FTlearned evaluated on the uncut cloud | 18.5 | | | |
+| FTnone: fine-tune on the full cloud | 19.0 | 14 / 13, p = 1.0 | 31 / 10, p = 0.002 | 30 / 14, p = 0.023 |
+| FTarm: fine-tune on link5 + 6 + 7 removed | 18.5 | 17 / 17, p = 1.0 | 27 / 7, p = 0.001 | 26 / 11, p = 0.020 |
+
+FTcont vs GObal 19.5: 15 / 17, p = 0.86; vs arm cut 20.0: 24 / 27, p = 0.78; vs the original DROP 13.0:
+20 / 9, p = 0.061.
+
+- **GObal's result is the dropout training.** Random keep-0.5 dropout of whole robot regions, with no learned
+  phi, no fine-tune and the uncut cloud at inference, matches GObal and the oracle arm cut and beats the uncut
+  baseline (p = 0.001). The fine-tune mask (none / learned / full / arm) and the inference mask change nothing
+  measurable.
+- **The original DROP 13.0 was an unlucky realisation.** Re-running only its last 50 epochs from the same
+  200.ckpt gave 18.5. Run-to-run noise at a FIXED seed is therefore ~5 points on 200 scenes -- the McNemar
+  p-values cover scenes, not this; single comparisons below ~5-6 points are not interpretable.
+- **What the learned phi contributes at 4096 / 64: an interpretable mask, no success.**
+- **Open puzzle -- fixed clouds:** the fixed arm cut (all arm links removed) reaches 20.0 / 16.5, SPEC (link5 + 6
+  removed, link7 kept) only 11.0 / 11.5, the uncut cloud 8.5. Hypothesis: a visible, always-present link7
+  (or any robot part) lets a policy trained without dropout shortcut through proprio-redundant points;
+  dropout makes every robot part unreliable. Test queued: SPECarm (fixed link5 + 6 + 7 removed, from scratch).
+
+*DROP seed 43:* 17.0 at 250 -- vs GObal-43 18.0 (14 / 16, p = 0.86), vs GObal-43 on the uncut cloud
+18.0 (p = 0.85), vs arm cut 16.5 (p = 1.0), vs SPEC 11.5 (29 / 18, p = 0.14). Dropout alone replicates on
+the second seed (18.5 / 17.0 for FTcont / DROP-43 against GObal 19.5 / 18.0).
+
+**Round 5 (2026-11-04, user): link0-4 were never removable.** SPECarm was cancelled. Label 5 (the arm cut) is
+exactly cells link0..link7. link0-4 average 27 points per training frame (median 4), but link3 / link4 come into view
+in ~4-5% of frames with up to ~460 / ~980 of 4096 points, and no remover / dropout ever touched them.
+- New: `region_groups: all_links` (13 regions, gates for link0..link4 as well; closing link0..7 == the label-5
+  arm cut bit for bit, checked); `eval_mimicgen_ckpt.py --remover-removed` also removes link cells that are in
+  no region of an old checkpoint. Chain: `scripts/sim/run_round5_chain.sh`, queue `remover_tune5_queue.txt`.
+- **GObal-42 250.ckpt with link0..6 removed at inference** (link7 + gripper + scene kept): 15.0 -- vs its learned
+  mask 19.5 (11 / 20, p = 0.15), vs uncut cloud 16.0 (p = 0.87), vs uncut baseline 8.5 (23 / 10, p = 0.035). Not
+  better (the network never saw link0-4 removed in training).
+- In ROLLOUTS link0-4 are far more visible than in the demos: 142 points per frame on average over the 200 eval
+  scenes, and 83 / 200 scenes have a frame with > 100 (max 1111). Those scenes fail for every policy, the arm cut
+  included (success with / without such a frame: arm cut 8.4 / 28.2, GObal 4.8 / 29.9, uncut 2.4 / 12.8). Most
+  likely a symptom of failing rollouts (the arm wanders), not a cause.
+- **GObalAll** (GObal + all_links, seed 42): learned mask again link5 0.10 / link6 0.05 removed, link7 0.82, hand
+  0.88-0.93, fingers 0.82 / 0.87 kept (removal effect t -8.1 / -11.2; +6.2 .. +10.0). link0-4: NO signal
+  (t -0.7 .. +0.7, second half within +-1.7), keep probs 0.46-0.56 -> coin flips at inference (link0, link4 just
+  below 0.5). Success 17.0 at 250: vs GObal 19.5 p = 0.50, vs dropout-only 18.5 p = 0.74, vs arm cut p = 0.47,
+  vs uncut 24 / 7 p = 0.003. Removing link0-4 is neither learned (the prediction-error reward does not see it) nor
+  needed for the dropout effect.
+
+**Rounds 3-5 summary (all evaluations finished 2026-11-04 15:54; 200 paired scenes):**
+
+| run | s42 @200 | s43 @200 | s42 @250 | s43 @250 |
+|---|---|---|---|---|
+| GObal, learned mask | 22.0 | 20.5 | 19.5 | 18.0 |
+| GObal, uncut cloud at inference | 20.5 | 16.5 | 16.0 | 18.0 |
+| DROP (dropout only, no phi, no fine-tune) | 18.0 | 17.5 | 13.0 | 17.0 |
+| DROP-42 tail re-run from 200 (FTcont) | | | 18.5 | |
+| GObalAll (13 gates incl. link0-4) | 19.0 | | 17.0 | |
+| SPEC (fixed learned mask, from scratch) | 14.5 | 8.0 | 11.0 | 11.5 |
+| arm cut / uncut (baselines, 250 only) | | | 20.0 / 8.5 | 16.5 / – |
+
+At 200, where GObal and DROP are the same procedure: GObal on the uncut cloud vs DROP 22 / 17 (s42, p = 0.52),
+16 / 18 (s43, p = 0.86), pooled 38 / 35, p = 0.82. **Conclusion: on Square at 4096 / 64, the whole gain of the
+learned remover comes from training theta with random whole-part robot dropout (keep 0.5 per region).** Learned
+phi, its mask, the fine-tune mask and the inference mask (none, learned, link5-7, link0-6) all change nothing
+measurable; a fixed cloud without dropout is clearly worse unless it is the full arm cut (SPEC 11 vs arm cut 18).
+Run-to-run noise at one seed is up to ~5 points (DROP-42 13.0 vs its tail re-run 18.5). Open: why the fixed arm cut
+works without dropout but SPEC (link7 + link0-4 kept) does not -- the shortcut hypothesis (visible robot points
+duplicate proprio; dropout or a full cut removes the shortcut) is untested.
+Running (launched 2026-11-04 16:05, user): **SPEC06** -- the specialist with link0..6 removed (only link7 +
+gripper + scene kept; `region_groups: all_links`, fixed mask, seed 42), queue `remover_tune6_queue.txt`, report
+`.../mimicgen/remover_tune6/`. SPEC (link5 + 6 only) got 11.0 / 11.5, the full arm cut (link0..7) 20.0 / 16.5.
+**SPEC06 result (finished 2026-11-04 22:24):** 11.0 at 200, 13.0 at 250 (val loss 11.15, again among the lowest).
+At 250: vs SPEC 20 / 16, p = 0.62; vs arm cut 18 / 32, p = 0.065; vs dropout-only (FTcont) 17 / 28, p = 0.14; vs
+GObal 22 / 35, p = 0.11; vs uncut 22 / 13, p = 0.18. At 200 vs GObal 13 / 35, p = 0.002. **Removing link0-4 does
+not fix the specialist.** The only remaining difference to the arm cut is link7 (the remover reproduces the label
+cut bit for bit), so a fixed cloud without dropout reaches the arm-cut level only with EVERY arm link gone --
+consistent with link7 (rigid with the gripper, encodes the EE pose) carrying a proprio shortcut. Single seed and
+p = 0.065: suggestive, not shown. Next: the shortcut tests (sensitivity test; frozen robot points), watching link7.
+Correction (2026-11-05): SPEC06 and the arm cut run are equivalent EXCEPT link7 and the random stream (the remover
+draws extra random numbers), and a changed stream alone moved results by up to ~5 points (DROP 13.0 vs re-run 18.5). So
+the 5-7 point gap to the arm cut is within noise. Control queued: **SPEC07** = link0..7 removed through the specialist
+pipeline (the arm cut's cloud), seed 42, 125 + 250 ckpts, starts when the GPU is free (queue `remover_tune7_queue.txt`).
+Disk (2026-11-05, user): deleted the checkpoints of rm-G-42 (4096 / 1024 / 2048), rm-GO / GOgm2 / GOclosed / GOmix /
+DOscene, cut5from50, cut5from125, trunk-42 (25 files, 56 GB). Their eval JSONs, logs and analyses are kept.
+
+**Round 7: shortcut hypothesis (2026-11-04/05; 4096 / 64, seed 42, 200 paired scenes; outputs
+`R3D/data/outputs/sim/mimicgen/round7/`).** Hypothesis: visible robot points duplicate proprio and encode past actions,
+so a policy trained on them without dropout leans on them instead of the nut / peg; dropout or a full arm cut removes
+the shortcut.
+
+*Part 1 -- sensitivity test* (`scripts/sim/sensitivity_shortcut.py`, offline on the 250.ckpts, no training).
+594 held-out windows (every frame of the 4 val demos 17 / 87 / 130 / 153), 2 obs frames, no augmentation. A
+horizontal translation by 2 or 5 cm in a per-window random direction (the same for every policy), on both obs frames of
+the raw cloud BEFORE each policy's own cut / remover. Points moved per frame: nut + peg 795, link5-7 2470, gripper 816.
+Value: change of the executed action's position (8 steps, mean |d pos|), mm, with the base call's own seed (pure
+effect; 0 = the points never reach the policy). Noise floor = two seeds on the identical observation. 95% CI =
+bootstrap over windows (windows of one demo are correlated, so optimistic). The fresh-noise effect / floor ratios
+(the cube-study convention) are in `sensitivity_v2.json`; same ordering.
+
+| policy | success 200 / 250 | floor | nut + peg 5 cm | link5-7 5 cm | gripper 5 cm |
+|---|---|---|---|---|---|
+| uncut | – / 8.5 | 4.6 | 19.9 [18.9, 20.9] | 12.4 [11.8, 13.1] | 12.1 [11.3, 12.9] |
+| arm cut | – / 20.0 | 3.7 | 22.2 [21.3, 23.2] | 0 (cut) | 16.6 [15.7, 17.5] |
+| SPEC (link5 + 6 removed) | 14.5 / 11.0 | 3.9 | 20.1 [19.1, 21.1] | 7.9 [7.5, 8.3] (= link7) | 13.8 [12.9, 14.8] |
+| SPEC06 (link0-6 removed) | 11.0 / 13.0 | 3.8 | 20.0 [19.0, 21.0] | 8.4 [8.0, 8.8] (= link7) | 12.8 [12.0, 13.6] |
+| DROP | 18.0 / 13.0 | 5.4 | 20.1 [19.2, 21.1] | 7.2 [6.8, 7.5] | 8.5 [8.0, 9.0] |
+| FTcont | – / 18.5 | 5.4 | 20.1 [19.1, 21.0] | 7.2 [6.9, 7.6] | 8.5 [8.0, 9.0] |
+| GObal (learned mask) | 22.0 / 19.5 | 3.4 | 20.9 [19.9, 21.9] | 4.5 [4.2, 4.7] | 7.9 [7.4, 8.4] |
+| frozen robot (part 2) | 11.5 / 14.5 | 4.1 | 18.7 [17.9, 19.5] | 0 (live robot unused) | 0 |
+
+At 2 cm every column is roughly half the 5 cm value (objects 8.1-9.7 mm for every policy). The frozen policy moved by
+its FROZEN robot points: 11.1 [10.4, 11.8] mm at 5 cm.
+
+- **No policy ignores the objects.** Every policy moves 20-22 mm for a 5 cm nut + peg shift, the uncut one included
+  (arm cut +2.3 [1.4, 3.2] mm over uncut). The predicted "uncut / SPEC weak on objects" is NOT there.
+- **Reliance on the ARM points ranks success** (with FTcont as the dropout run; user, 2026-11-05: DROP 13.0 was the
+  unlucky realisation). Order by link5-7 reaction: arm cut 0, GObal 4.5, FTcont 7.2, SPEC 7.9, SPEC06 8.4, uncut 12.4.
+  Success order: 20.0, 19.5, 18.5, 11.0, 13.0, 8.5 (Spearman ~0.94). The paired differences are resolved (FTcont −
+  SPEC −0.66 [−1.15, −0.18] mm, FTcont − SPEC06 −1.20 [−1.66, −0.76]), though SPEC / SPEC06 see only link7 here.
+- **The gripper does NOT rank success:** the arm cut (best) reacts most to it (16.6 mm). If there is a shortcut it
+  runs through the arm, not robot points in general -- consistent with GObal keeping link7 + gripper.
+- **DROP and FTcont are nearly the same function** (per-window correlation 0.98, mean |diff| 0.37 mm) and still
+  succeed 13.0 vs 18.5%. The ~5-point run-to-run noise is closed-loop evaluation noise for almost identical weights, so
+  offline sensitivity can only describe a training procedure, never one run's success.
+
+*Part 2 -- frozen robot points* (one run: uncut 4096 / 64, seed 42, 251 epochs, 64 x 2; run dir
+`mimicgen_sim-square_d2-p4096-g64-frozen-42`, 200.ckpt + 250.ckpt kept). Every frame's robot points (labels 5 + 7 =
+link0-7 + gripper cells, checked identical to `point_link >= 0`) are replaced by the episode's FIRST frame's, in
+training and at inference (the rollout's reset frame); the scene points stay live, agent_pos untouched.
+- **Count kept at 4096 without padding:** frame t keeps its own scene points at their positions; its R_t robot
+  positions get the first R_t robot points (FPS order) of an FPS-8192 render of frame 0, whose first 4096 points ARE the
+  stored frame 0 (FPS prefix; asserted bit for bit on 200 / 200 demos and at every eval reset). Robot point count =
+  uncut's per frame, so the token allocation is uncut's; frame 0 maps to itself. Naive "frame-t scene + stored frame-0
+  robot" would have been short in 91.5% of frames (median −354; frame-0 robot 2864 vs 3228 points). References: min
+  5038 robot points (demos), 4887 (eval scenes) >= 4096, so no frame can run out.
+- **Train = eval:** one function (`r3d/common/robot_freeze.py`), in `RobotwinSimDataset._sample_to_data` BEFORE
+  augmentation (noise / jitter draws identical to the uncut run's -- checked) and in `eval_mimicgen_ckpt.py`.
+  Residual leak: occlusion holes of the current arm in the nut / peg points.
+
+| frozen vs (a only / b only, p) | frozen @200 (11.5) | frozen @250 (14.5) |
+|---|---|---|
+| uncut @250 (8.5) | 17 / 11, p = 0.35 | 21 / 9, p = 0.043 |
+| arm cut @250 (20.0) | 16 / 33, p = 0.021 | 18 / 29, p = 0.14 |
+| SPEC, same epoch (14.5 / 11.0) | 13 / 19, p = 0.38 | 21 / 14, p = 0.31 |
+| SPEC06, same epoch (11.0 / 13.0) | 18 / 17, p = 1.0 | 24 / 21, p = 0.77 |
+| FTcont @250 (18.5) | 12 / 26, p = 0.034 | 17 / 25, p = 0.28 |
+| GObal, same epoch (22.0 / 19.5) | 12 / 33, p = 0.002 | 18 / 28, p = 0.18 |
+
+**Interpretation.** Frozen sits at the SPEC / SPEC06 level (~11-14%): above uncut at 250 only (p = 0.04), below the
+arm cut / dropout level at 200 (p = 0.02-0.03), not separable at 250. Neither clean outcome: robot points with no
+current information give at most part of the arm cut's gain. Splitting it, frozen − uncut = the information part
+(+3 / +6) and arm cut − frozen = the token part (+5.5 / +8.5); each is within the ~5-point run-to-run noise, single
+seed. The frozen policy still uses its constant robot points (11.1 mm per 5 cm), as uncut uses the live arm.
+Together with part 1: the policies at ~18-20% are those with no arm points (arm cut) or trained with arm dropout;
+every fixed cloud that keeps arm points (uncut, frozen, SPEC, SPEC06) is below them. Open: seed repeats of frozen and
+SPEC07 (arm cut through the specialist pipeline) to separate "information" from "tokens" from noise.
+
+**SPEC07 result (finished 2026-11-05 10:09; link0..7 removed through the specialist pipeline, seed 42, 200 paired
+scenes): 13.0% at 250 (26/200).** Its cloud is the arm cut's cloud (closing link0..7 == the label-5 cut, bit for bit,
+`check_link_remover.py`); the training configs differ only in the policy class, the remover block and the dataset cut
+flag. Paired at 250:
+
+| SPEC07 vs | other | SPEC07 only / other only | p |
+|---|---|---|---|
+| SPEC06 (link0-6) | 13.0 | 19 / 19 | 1.00 |
+| SPEC (link5+6) | 11.0 | 16 / 12 | 0.57 |
+| arm cut s42 | 20.0 | 15 / 29 | 0.049 |
+| arm cut s43 | 16.5 | 16 / 23 | 0.34 |
+| GObal s42 | 19.5 | 17 / 30 | 0.08 |
+| FTcont (dropout to 250) | 18.5 | 12 / 23 | 0.09 |
+| uncut | 8.5 | 20 / 11 | 0.15 |
+
+**link7 is NOT the difference:** with the same cloud as the arm cut, SPEC07 lands exactly on SPEC06 (19 / 19). This
+retracts the link7 reading of SPEC06 above, and the round-7 pattern "no arm points -> ~18-20%" (SPEC07 has no arm
+points and sits at 13). All four fixed-mask runs of the remover pipeline cluster at 11-13% (SPEC 11.0 / 11.5,
+SPEC06 13.0, SPEC07 13.0); the two arm-cut runs of the plain DP3 pipeline sit at 20.0 / 16.5. What still differs
+between SPEC07 and the arm cut is only the random stream: `thin_window` draws extra `torch.rand` (the
+within-region FPS start, inert at rho 0 / 1), the token FPS is the same encoder FPS in both, and `fill_to_min_keep`
+never fired (filled fraction 0.0 in every epoch, mean 1715 points kept). So either the fixed-mask runs of the remover
+pipeline are consistently unlucky draws, or the arm cut s42 (20.0) is a high one -- vs the arm cut s43 the gap is not
+significant (p = 0.34).
+User (2026-11-05): the arm-cut runs are trusted (two seeds); the link7 question is re-run in the ARM-CUT pipeline, not
+the specialist one. **cutL06** = the arm cut run with link7 kept: plain DP3, `task.drop_point_links=[link0..link6]`
+(new dataset / eval option: the same `cut_points_by_label` after augmentation, keyed on the link cell; link0..7
+reproduces `drop_point_labels=[5]` bit for bit in training and live in eval, `scripts/sim/check_link_cut.py`), seed
+42, 251 epochs, 64 x 2, ckpts 200 + 250. link7 holds ~420-470 of the 4096 points per training frame (~620 at the
+eval resets). Chain `scripts/sim/run_cut_keep7.sh`, log `mimicgen/cut_keep7/chain.log`.
+
+**cutL06 result (finished 2026-11-06 00:07; checks and smoke passed): 11.5% at 200, 14.5% at 250.** Paired at 250:
+vs arm cut s42 (20.0) 18 / 29, p = 0.14; vs arm cut s43 (16.5) 16 / 20, p = 0.62; vs SPEC06 (13.0, the SAME cloud
+through the specialist pipeline) 21 / 18, p = 0.75; vs SPEC07 (13.0) 20 / 17, p = 0.74; vs GObal (19.5) 20 / 30,
+p = 0.20; vs FTcont (18.5) 16 / 24, p = 0.27; vs uncut (8.5) 22 / 10, p = 0.05. At 200 vs GObal (22.0) 13 / 34,
+p = 0.003. (Same percentages as frozen-42 by coincidence: 15 / 15 discordant at 250.)
+- Keeping link7 costs 2-5.5 points against the two arm-cut seeds, not significant: link7 is not shown to matter.
+- The two pipelines agree on the same cloud (cutL06 14.5 vs SPEC06 13.0, p = 0.75): the specialist runs were not
+  broken.
+- Spread between runs that differ only in seed or random stream: arm cut 20.0 / 16.5, DROP 13.0 vs its re-run 18.5,
+  DROP s42 / s43 13.0 / 17.0 -- 3.5-5.5 points. Every fixed-cloud removal run (14.5, 13.0, 13.0, 11.0, 11.5, 16.5,
+  20.0) lies within ~one such spread of ~14.5; the dropout runs sit at 17-19.5; uncut at 8.5 is the only fixed-cloud
+  run clearly below. The scene-level McNemar p-values do not include this training-run variance.
+Queued 2026-11-06 (user): seed 44 pair through ONE process, `scripts/sim/run_cut_pair.sh` (SEED=44):
+**cutL07-44** (`drop_point_links=[link0..link7]` == the arm cut) and **cutL06-44** (link7 kept); identical otherwise
+(251 epochs, 64 x 2, ckpts 200 + 250, eval 250 then 200). Neither removes the mount (class 3, ~8 pts/frame); both
+remove link0-4 (~30 pts/frame on average, in view in 3-58% of frames). A re-run of arm cut s42 was NOT done: training
+at a fixed seed is deterministic here, so it would reproduce 20.0. Log `mimicgen/cut_pair_s44/chain.log`. Separating them
+needs a seed repeat (a second SPEC07 seed, or a third arm-cut seed), not a new mask.
+
+*Part 3 -- the 1024-point policies (2026-11-05, same test, first 1024 points of each cloud).* Prediction (from
+"shortcut x coverage": at full object coverage the policy needs the arm less): 1024 uncut relies on the arm much
+less than 4096 uncut. **Falsified.**
+
+| policy | success 250 | floor | nut + peg 5 cm | link5-7 5 cm | gripper 5 cm |
+|---|---|---|---|---|---|
+| 4096 uncut s42 | 8.5 | 4.6 | 19.9 [18.9, 20.9] | 12.4 [11.8, 13.1] | 12.1 [11.3, 12.9] |
+| 1024 uncut s42 | 23.0 | 4.3 | 21.6 [20.5, 22.8] | 13.4 [12.6, 14.2] | 12.5 [11.7, 13.4] |
+| 1024 uncut s43 | 19.0 | 4.3 | 20.7 [19.8, 21.7] | 11.9 [11.2, 12.6] | 12.9 [12.1, 13.8] |
+| 1024 arm cut s42 | 17.5 | 3.0 | 22.3 [21.3, 23.4] | 0 | 17.1 [16.2, 18.2] |
+| 1024 arm cut s43 | 20.5 | 2.9 | 22.0 [21.0, 23.1] | 0 | 16.2 [15.4, 17.1] |
+
+1024 uncut leans on the arm exactly as much as 4096 uncut (s42 +0.9 [+0.2, +1.6] mm, s43 −0.5 [−1.3, +0.2]) and
+succeeds 2-3x as often. **Reliance on the arm points is not harmful in itself**, so the within-4096 ranking (arm
+reliance vs success, Spearman ~0.94) does not carry over across point counts and cannot be the mechanism by itself.
+The 1024 policies react to the objects as much as everything else (+0.8 / +1.7 mm over 4096 uncut). Whatever separates
+4096 uncut from the rest is invisible to a 5 cm rigid translation of nut + peg -- candidates: object ORIENTATION / shape
+detail (nut yaw is random over 360 deg and coverage of the nut is ~50% at 4096 / 64), which a translation does not
+probe.
+
+Files: `r3d/common/robot_freeze.py`; task keys `freeze_robot_labels` (null = off) + `freeze_reference`
+(`mimicgen_sim.yaml`); sidecar `R3D/data/square_d2-agentview_p4096-200.frame0_p8192.npz`
+(`scripts/sim/make_frame0_reference.py`); `+training.checkpoint_epochs=[200,250]` (train.py, absent = unchanged);
+checks `scripts/sim/check_frozen_robot.py` (29 checks: default off bit-identical to git HEAD for uncut + arm cut, train
++ val, normalizer); chain `scripts/sim/run_round7_chain.sh`; report `scripts/sim/round7_report.py`.
+
 ## Method plan and positioning
 
 **Implementation brief for the learned remover: `docs/learned_remover_v0.md`** (user's plan,
@@ -466,3 +858,145 @@ they differ.
 | cloud viewers (HTML) | `R3D/data/outputs/sim_view/clouds/` |
 | density / attention studies | `R3D/data/outputs/sim_view_dense/hanging_mug_labeled/*.json` |
 | real-data local coverage | `~/R3D-Policy/R3D/data/outputs/robot_cut/local_coverage_s20.json` |
+
+## Next task candidate: MimicGen Threading (checked 2026-11-06, no training)
+
+User constraint: failures on Square D2 come from generalization (50 x 50 cm nut and peg ranges), not from the
+observation; the next task should be harder than cup / blocks but with small init ranges -- AND (user) the target
+must move, or everything after the grasp can be memorized from proprio. `scripts/sim/threading_task_check.py`
+(r3d_robosuite, CPU, simulator states only) on the 1000-demo MimicGen datasets, output
+`R3D/data/outputs/sim/mimicgen/threading_check/threading_task_check.json`. Ring radius (success tolerance) 12 mm.
+Held-out (5-fold by demo) RMSE of the EE position at the insertion frame, gradient-boosted trees:
+
+| dataset | n | tripod range | mean only | proprio at grasp | + tripod pose | + in-hand offset |
+|---|---|---|---|---|---|---|
+| D0 (tripod fixed) | 1000 | fixed | 12.6 mm | 7.5 | 7.5 | 5.9 |
+| D1 | 1000 | 25 x 10 cm, 120 deg | 80.0 | 87.8 | 12.3 | 10.5 |
+| D1, x + yaw middle half | 313 | 12 x 10 cm, 60 deg | 52.0 | 59.5 | 12.7 | 10.4 |
+
+- D0 is memorizable after the grasp: a constant insertion pose is already at the ring radius, proprio at the grasp
+  gets 7.5 mm. User's concern confirmed; all D0 variants (fixed target) are out.
+- D1 needs the tripod: proprio alone 80-88 mm, with the tripod pose 12 mm. Holds in the narrowed window (52-60 ->
+  12.7 mm), which keeps 313 demos (more than the 250 expected from uniform sampling).
+- The in-hand needle offset varies 4-5 mm per axis at the grasp and adds ~2 mm (12.5 -> 10.5): a fine-detail cue.
+- All 1000 demos parse (grasp >= 5 frames, success; 4-6% reach success only with the final action). Median 211
+  frames per demo, 144 after the grasp.
+Not yet measured: whether the agentview cloud resolves the ring opening and the needle at 4096 / 64 tokens (view
+check), and whether a baseline's failures are near misses (precision) or gross (generalization).
+
+**Seed-44 pair + val loss (2026-11-06).** Success at 250: arm cut s44 (cutL07-44) 16.5 (200: 14.5), link7 kept s44
+(cutL06-44) 13.0. Paired arm cut vs link7 kept: s42 29 / 18 (p = 0.14), s44 23 / 16 (p = 0.34), pooled 52 / 34
+(p = 0.07): removing link7 helps by ~4.5 points on both seeds, at the edge of resolution. Val loss (e-3, mean of the last
+25 epochs before 250, each run on its own val clouds; `scripts/sim/wandb_val_loss.py`):
+
+| cloud | run | val loss @250 | success @250 |
+|---|---|---|---|
+| link0-7 removed | arm cut s42 / s43 / s44 (cutL07) | 11.66 / 11.59 / 12.44 | 20.0 / 16.5 / 16.5 |
+| link0-7 removed | SPEC07 s42 | 12.28 | 13.0 |
+| link0-6 removed | cutL06 s42 / s44 | 12.93 / 12.68 | 14.5 / 13.0 |
+| link0-6 removed | SPEC06 s42 | 11.15 | 13.0 |
+| link5+6 removed | SPEC s42 / s43 | 11.18 / 13.66 | 11.0 / 11.5 |
+| none | uncut s42 / frozen s42 | 14.51 / 16.50 | 8.5 / 14.5 |
+
+- Matched pairs (same pipeline, same seed): the arm cut has the lower val loss on both seeds at 250, as in success --
+  clearly at s42 (-1.27), marginally at s44 (-0.24, ~2 SEM; reversed at 200: 12.12 vs 11.94).
+- Across runs val loss does not track success: Spearman -0.17 over the 11 fixed-cloud runs (p = 0.63; -0.30 without
+  frozen). The same cloud at the same seed through the other pipeline (another random stream) moves val loss by
+  0.6-1.8 (SPEC07 vs arm cut s42, SPEC06 vs cutL06 s42) -- more than the s44 gap.
+- Conclusion (user): the learner does not work as intended. Reasons: (1) loss and success are only loosely aligned;
+  (2) one link more or less is a marginal effect, below run noise in both loss and success; (3) phi's reward scores
+  masks for ONE shared network that has learned to use link7 (removing it = information that network loses), not what a
+  network trained without link7 would reach -- a from-scratch run can reallocate the tokens and lean on agent_pos.
+
+**Threading D1 narrowed: runs queued (2026-11-06, user).** Window `threading_d1n` (r3d/common/robosuite_tasks.py):
+tripod x [-0.0375, 0.0875], y [-0.2, -0.1], yaw [60, 120] deg (middle half of D1's x and yaw), needle as D1. Training
+data: the FIRST 200 demos in file order inside the window (317 of 1000 qualify; ids 1 ... 612, stored in the zarr attrs
+`demos`) -- as for Square, where the zarr holds demos 0-199. Eval: `Threading_D1_Narrow` resets from exactly the
+window (asserted per scene), 200 scenes of seed block 1, MAX_STEPS 500 (demos: median 215, max 261 steps). 4096
+points / 64 tokens, 251 epochs, 64 x 2, seed 42: uncut -> arm cut [5] -> GObalAll (GObal with gates for every
+arm link: `region_groups=all_links`, 13 regions incl. link0-4; user); eval 250 first, then 200. One test
+demo: needle 332 points per frame (min 162), tripod 1116 (min 572), arm 1405, gripper 1234 of 4096. Chain
+`scripts/sim/run_threading_chain.sh`, log `mimicgen/threading/chain.log`; zarr `R3D/data/threading_d1n-agentview_p4096-200.zarr`.
+
+**Threading results at 250 (2026-11-07; seed 42, 200 paired scenes) -- the Square effect does not transfer.**
+
+| run | success @250 | vs uncut (only this / only uncut, p) |
+|---|---|---|
+| uncut | 37.5 | - |
+| arm cut [5] | 35.0 | 36 / 41, p = 0.65 |
+| GObalAll (dropout keep 0.5, gates for all 13 regions) | 36.5 | 41 / 43, p = 0.91 |
+
+- Coverage (`scripts/sim/coverage_cut_vs_uncut.py`, training clouds, 64 tokens): Threading is in the Square-4096 regime
+  (patches ~1.8 cm, needle 56% / tripod 48% covered uncut), NOT the 1024 one (100%). The arm cut raises needle coverage
+  to 76% and tripod to 64% (the large tripod absorbs most freed tokens: 21 -> 31; needle 5.7 -> 8.4) -- and success does
+  not move. Square 4096 for reference: nut 49 -> 83%, peg 57 -> 93%.
+- Neither the arm cut nor the dropout helps here, so "removing proprio-redundant robot points" (reallocation) and
+  "robot-part dropout" (reliance) are both Square-specific so far. User decision rule (agreed before the GObalAll
+  result): GObalAll ~ uncut -> the hypothesis is dead for the paper. It is.
+- GObalAll's learned mask: removes link1, link6, link7, hand_centre; keeps link0, link2-5, hand sides, fingers. Reward
+  signal (removal effect, t over all phi steps): link6 -8.6 (remove), hand_f1side +6.3 / hand_f2side +5.9 / finger1 +3.3
+  (keep); link7 -1.2 (2nd half -2.6), link1 -1.6, link0-4 |t| < 2 (noise again), hand_centre +0.7 (2nd half -2.8).
+  On Square phi removed link5 + link6 and kept link7: the learned masks differ between tasks, and none helps success.
+- Single seed per run; the scene-level interval for the arm cut is about -11 to +6 points, so a Square-sized gain (+9)
+  is unlikely, small effects are not excluded. The 200 evals follow (chain).
+
+**Last test (2026-11-07, user): is the Square gain about generalization (out-of-distribution scenes), not tokens?**
+(a) Square, from existing evals (`scripts/sim/ood_gain_square.py`, epoch 250, 200 scenes): U = uncut s42, C = arm cut
+(cut5-42, cut5-43, cutL07-44), D = dropout-trained (GObal-42/43, FTcont-42, DROP-43, GObalAll-42); gains per tertile of
+three "unusualness" measures. Gain C-U near / mid / far: nn distance to the training layouts +10.4 / +9.6 / +7.5,
+reach from the robot base +10.4 / +11.6 / +5.5, link0-4 points in rollout +10.9 / +8.6 / +8.0; D-U alike. Far - near
+CIs all include 0 and lean NEGATIVE. **Not supported:** the gain is spread evenly (roughly a doubling of success in every
+tertile), not concentrated in unusual scenes. (b) Threading policies evaluated on stock Threading D1 (tripod also outside
+the training window), split inside / outside: queued, `scripts/sim/run_threading_ood.sh` -> `mimicgen/threading/ood_report.txt`.
+(b) result (2026-11-08): the three Threading 250 checkpoints on stock Threading D1, 200 scenes, split by the training
+window -- inside (44): uncut 40.9 / arm cut 36.4 / GObalAll 40.9 (8/10, 9/9 vs uncut); outside (156): uncut 10.9 / arm
+cut 6.4 / GObalAll 7.1 (9/16 p = 0.23, 10/16 p = 0.33). **Not supported either:** out of distribution the cut and the
+dropout are, if anything, slightly worse than uncut. Also at epoch 200 on the narrowed eval: uncut 39.5, arm cut 29.0
+(31/52 vs uncut, p = 0.03), GObalAll 34.0 (p = 0.25). Conclusion: neither token reallocation nor robustness to distribution
+shift explains the Square gain in a way that transfers; the robot-point removal / dropout line is closed for the paper.
+
+**hanging_mug dropout run (queued 2026-11-08, user).** Does the Square dropout effect hold on the task where the cut
+helped most (4096/64: uncut 42.0, arms cut 59.0, 51/17 discordant, p < 0.001)? GObal itself is not portable (per-link
+labels missing from the RoboTwin data; re-collection needs the non-deterministic planner), so the DROP mechanism at
+class level: `task.dropout_point_labels=[4,5,6,7]`, keep 0.5 per class per window, training only (checks:
+`scripts/sim/check_label_dropout.py`, 13/13; per class dropped 44-53% of the windows where present; arms in view in only
+~half the windows). Recipe = the arm cut run's (601 epochs, 64 x 4, ckpts 300 + 600, seed 42). All three 600.ckpts
+evaluated on the CURRENT shared scene list (tag `shared`; the old 4096 evals used their own list, 180/200 shared) for a
+paired report. Chain `scripts/sim/run_mug_drop.sh`, report `outputs/sim/mug_drop/report.txt`.
+Interim (2026-11-08 16:10): dropout 600.ckpt 55.5% on the shared list. Paired on the 180 scenes shared with the OLD
+4096 list (each scene is fixed by its seed, eval deterministic per scene): uncut 41.1 / arms cut 59.4 / dropout 54.4;
+dropout vs uncut 43 / 19 (p = 0.003), dropout vs arms cut 31 / 40 (p = 0.34), arms cut vs uncut 48 / 15. **The Square
+pattern replicates on hanging_mug: dropout ~ arm cut > uncut.** Note: the dropout network is evaluated on the FULL cloud,
+so its token allocation at test time equals uncut's -- its gain cannot be token reallocation; it is in how the network
+uses the robot points. Full 200-scene re-evals of uncut and arms cut on the shared list follow (chain).
+Final (2026-11-08, all 600.ckpts on the shared 200-scene list, paired): uncut 45.0 / arms cut 60.0 / dropout (full cloud)
+55.5 / dropout with the arms cut at eval 54.0. Arms cut vs uncut 49 / 19 (p = 0.0004); dropout vs uncut 44 / 23
+(p = 0.014); dropout vs arms cut 34 / 43 (p = 0.36); dropout cut-at-eval vs full cloud 17 / 20 (p = 0.74). As on Square:
+the dropout network is indifferent to whether the arms are present at test time, and ~ the arm cut. Re-evaluated on the
+shared list, uncut moved 42.0 -> 45.0 and arms cut 59.0 -> 60.0 (scene-list change only).
+
+**Sensitivity test on all three tasks (2026-11-09; `scripts/sim/sensitivity_shortcut.py --task square|threading|mug`).**
+Pure effect (same seed) on the executed action of a 5 cm horizontal shift of one part, held-out windows; ratio = effect /
+the policy's own noise floor; abs = mm (Square, Threading) or rad over 14 joints (hanging_mug).
+
+| task | policy | objects | arm | gripper |
+|---|---|---|---|---|
+| hanging_mug | uncut | 5.26x (0.090) | 5.33x (0.092) both arms | 4.03x (0.069) |
+| hanging_mug | arms cut | 5.21x (0.091) | 0 | 6.79x (0.118) |
+| hanging_mug | dropout (full cloud) | 4.79x (0.104) | **1.07x (0.023)** | **1.49x (0.032)** |
+| Square | uncut | 4.36x (19.9 mm) | 2.72x (12.4) link5-7 | 2.65x (12.1) |
+| Square | arm cut | 6.07x (22.2) | 0 | 4.53x (16.6) |
+| Square | DROP (full cloud) | 3.72x (20.1) | **1.33x (7.2)** | **1.57x (8.5)** |
+| Threading | uncut | 11.16x (22.7 mm) | 5.72x (11.6) link5-7 | 5.36x (10.9) |
+| Threading | arm cut | 14.75x (24.9) | 0 | 8.85x (14.9) |
+| Threading | GObalAll (its learned mask) | 15.99x (26.4) | 0.14x * | 2.30x * |
+
+\* GObalAll evaluated on its learned mask (link6, link7, hand_centre removed), so its arm / gripper numbers are partly the
+mask. Findings: dropout makes the policy far less sensitive to robot points (-40 to -75% in abs), object sensitivity
+barely changes (Square +1%, hanging_mug +15%). Suggestive (3 tasks, different arm perturbations): the uncut policy's
+object / arm sensitivity predicts the gain -- hanging_mug 1.0 (gain +15 / +10.5), Square 1.6 (+9), Threading 2.0 (0).
+
+**Threading GObalAll with other masks at inference (2026-11-10, 250.ckpt, 200 paired scenes):** own learned mask 36.5 /
+full cloud 37.5 / arm-cut mask (link0-7) 41.5. Arm-cut mask vs uncut (37.5) 47 / 39 (p = 0.45), vs arm cut run (35.0)
+46 / 33 (p = 0.18), vs its own full cloud 26 / 18 (p = 0.29); full cloud vs uncut 37 / 37. As on Square / hanging_mug the
+dropout network does not depend on which mask it sees (all within noise); unlike them it is not better than uncut.

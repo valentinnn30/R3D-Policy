@@ -18,6 +18,15 @@ num_points: 1024
 # Oracle label cut AFTER preprocessing (r3d/common/label_cut.py), training and evaluation.
 # Classes as point_labels.py: [5] = the Panda arm (the gripper, 7, is kept). null = no cut.
 drop_point_labels: null
+# The same cut by link cell (robosuite_pcd.CELL_NAMES), e.g. [link0, ..., link6] = the arm cut minus
+# link7. Training: data/point_link; evaluation: robosuite_pcd.LinkCells, live. null = off.
+drop_point_links: null
+
+# Round 7 shortcut test: every frame's robot points replaced by the episode's FIRST frame's
+# (r3d/common/robot_freeze.py), training and evaluation; [5, 7] = arm + gripper. The reference is
+# the frame-0 FPS-8192 sidecar (scripts/sim/make_frame0_reference.py). null = off.
+freeze_robot_labels: null
+freeze_reference: R3D/data/${task_name}-${setting}.frame0_p8192.npz
 
 shape_meta: &shape_meta
   obs:
@@ -52,4 +61,7 @@ dataset:
   saturation_range: [0.5, 1.5]
   use_target_ee: ${policy.use_target_ee}
   drop_point_labels: ${task.drop_point_labels}
+  drop_point_links: ${task.drop_point_links}
+  freeze_robot_labels: ${task.freeze_robot_labels}
+  freeze_reference: ${task.freeze_reference}
   num_points: ${task.num_points}

@@ -507,7 +507,12 @@ class TrainDP3Workspace:
             # checkpoint (only save on main process)
             # epoch > 0: epochs count from 0, so without it every run also saves
             # an untrained 0.ckpt (~2 GB) next to the ones actually wanted.
-            if self.epoch > 0 and (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt and is_main_process():
+            # `+training.checkpoint_epochs=[200,250]` saves exactly those epochs instead (disk);
+            # absent / null = every checkpoint_every as before.
+            ckpt_epochs = cfg.training.get("checkpoint_epochs", None)
+            save_now = (self.epoch in ckpt_epochs) if ckpt_epochs is not None \
+                else (self.epoch % cfg.training.checkpoint_every) == 0
+            if self.epoch > 0 and save_now and cfg.checkpoint.save_ckpt and is_main_process():
                 # if not cfg.policy.use_pc_color:
                 #     # Build checkpoint save path
                 #     base_checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')

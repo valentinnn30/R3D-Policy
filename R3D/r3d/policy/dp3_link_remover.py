@@ -34,6 +34,15 @@ Three passes, three kinds of randomness:
 "sample" -- the theta pass draws z per window (warm-up and phi phase); "deterministic" --
 the theta pass uses the inference rho, snapped (the final phi-frozen fine-tune, so theta
 trains on exactly the clouds evaluation will show it).
+
+`link_remover.fixed_removed` (round 3 SPECIALIST, default null): a fixed mask, nothing
+learned -- the listed regions removed, the rest kept whole. The theta pass always uses the
+deterministic mask (remover_mode is ignored), so training and evaluation see the same clouds.
+
+`link_remover.theta_rho: [lo, hi]` (DObal, round 4, default null): the density counterpart of
+`theta_keep` for a density-only remover. The theta pass draws every region's density from
+U[lo, hi] per window, independent of phi (the scene region still floored at scene_rho_min);
+phi keeps learning from its own reward draws. Fine-tune (deterministic mode) is unchanged.
 """
 
 import torch
@@ -41,7 +50,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from r3d.common import robosuite_pcd as RP
 from r3d.common.pytorch_util import dict_apply
-from r3d.model.vision.link_remover import LinkRemover, rloo_surrogate, thin_window
+from r3d.model.vision.link_remover import NON_ROBOT, LinkRemover, rloo_surrogate, thin_window
 from r3d.policy.dp3 import DP3
 
 LINK_KEY = "point_link"
@@ -62,11 +71,33 @@ class DP3LinkRemover(DP3):
         groups = cfg.get("region_groups", "default")
         if groups == "default":
             groups = RP.default_region_groups()
+        elif groups == "all_links":                     # + learned gates for link0..link4
+            groups = RP.all_links_region_groups()
+        elif groups == "default+scene":                 # + a label-free scene region (density only)
+            groups = RP.default_region_groups() + [{"name": "scene", "cells": [NON_ROBOT]}]
         self.link_remover = LinkRemover(
             RP.CELL_NAMES, groups, init_rho=cfg.get("init_rho", 0.8), init_keep=cfg.get("init_keep", 0.8),
             sigma=cfg.get("sigma", 1.0), mu_min=cfg.get("mu_min", -9.0), mu_max=cfg.get("mu_max", 6.0),
             gate_max=cfg.get("gate_max", 5.0), snap_rho_below=cfg.get("snap_rho_below", None),
-            learn_density=cfg.get("learn_density", True))
+            learn_density=cfg.get("learn_density", True), learn_gates=cfg.get("learn_gates", True),
+            scene_rho_min=cfg.get("scene_rho_min", 0.1), mix_eps=cfg.get("mix_eps", 0.0),
+            mix_masks=cfg.get("mix_masks", None), fixed_removed=cfg.get("fixed_removed", None))
+        # theta pass gates drawn at this fixed keep probability instead of phi's (decoupled
+        # exploration); the reward pass still samples from phi. None = phi's own draws.
+        tk = cfg.get("theta_keep", None)
+        if tk is not None and not (0.0 < float(tk) < 1.0 and self.link_remover.learn_gates):
+            raise ValueError("theta_keep must be in (0, 1) and needs learned gates")
+        self.theta_keep = None if tk is None else float(tk)
+        tr = cfg.get("theta_rho", None)
+        if tr is not None:
+            lo, hi = (float(v) for v in tr)
+            if not (0.0 <= lo < hi <= 1.0) or self.link_remover.learn_gates or not self.link_remover.learn_density:
+                raise ValueError("theta_rho [lo, hi] needs 0 <= lo < hi <= 1 and a density-only remover")
+            tr = (lo, hi)
+        self.theta_rho = tr
+        self.fixed_mask = self.link_remover.fixed_removed is not None
+        if self.fixed_mask and self.theta_keep is not None:
+            raise ValueError("fixed_removed: theta_keep has no meaning (the mask is fixed)")
         self.fill_to_min_keep = bool(cfg.get("fill_to_min_keep", True))
         self.reward_t = [int(t) for t in cfg.get("reward_t", [20, 50, 80])]
         self.k_masks = int(cfg.get("k_masks", 2))
@@ -102,7 +133,8 @@ class DP3LinkRemover(DP3):
         obs = {k: v[:, :To] for k, v in obs.items()}
         out = thin_window(obs["point_cloud"], cells[:, :To], rho, self.link_remover.cell_to_region,
                           lengths=obs.get("point_cloud_len"), min_keep=self.num_tokens,
-                          fill_to_min_keep=self.fill_to_min_keep, **kw)
+                          fill_to_min_keep=self.fill_to_min_keep,
+                          scene_region=self.link_remover.scene_region, **kw)
         obs["point_cloud"], obs["point_cloud_len"] = out[0], out[1]
         return obs, out
 
@@ -112,12 +144,24 @@ class DP3LinkRemover(DP3):
         if self.link_remover is None:
             return super().compute_loss(batch)
         B = cells.shape[0]
-        if self.remover_mode == "sample":
-            rho = self.link_remover.rho(self.link_remover.sample(B))
-        elif self.remover_mode == "deterministic":
+        mode = "deterministic" if self.fixed_mask else self.remover_mode
+        if mode == "sample":
+            draw = self.link_remover.sample(B)
+            if self.theta_keep is not None:
+                z_, g_ = self.link_remover.split(draw)
+                g_ = (torch.rand(g_.shape, device=g_.device) < self.theta_keep).to(g_.dtype)
+                draw = torch.cat([z_, g_], -1)
+            rho = self.link_remover.rho(draw)
+            if self.theta_rho is not None:
+                lo, hi = self.theta_rho
+                rho = lo + (hi - lo) * torch.rand(rho.shape, device=rho.device)
+                sr = self.link_remover.scene_region
+                if sr is not None:
+                    rho[:, sr] = rho[:, sr].clamp(min=self.link_remover.scene_rho_min)
+        elif mode == "deterministic":
             rho = self.link_remover.rho()[None].expand(B, -1)
         else:
-            raise ValueError(f"remover_mode {self.remover_mode!r}")
+            raise ValueError(f"remover_mode {mode!r}")
         obs, (_, ln, n, k, filled) = self._thin_obs(obs, cells, rho, random_start=True)
         loss, loss_dict = super().compute_loss({**batch, "obs": obs})
         loss_dict.update(self._kept_stats(ln, n, k, filled))
@@ -148,6 +192,35 @@ class DP3LinkRemover(DP3):
         st = lambda xs: torch.stack(xs).to(device)
         return {"u_enc": st(u_enc), "perm": st(perm), "u_region": st(u_reg), "u_fill": st(u_fill),
                 "eps": st(eps)}
+
+    def _crn_start(self, cells, keep, draws, obs):
+        """The shared token-FPS start for a reward-pass mask (see _encoder_start)."""
+        sr = self.link_remover.scene_region
+        if sr is None:
+            return self._encoder_start(cells, keep, draws["u_enc"])
+        ln = obs.get("point_cloud_len")
+        return self._scene_start(cells, keep, draws["u_region"][..., sr], None if ln is None else ln[:, :cells.shape[1]])
+
+    def _scene_start(self, cells, keep, u_scene, lengths=None):
+        """With a scene region the non-robot points are thinned too, so "the u-th kept
+        non-robot point" would differ between masks. Use the scene region's own shared FPS
+        start instead: the floor(u * n)-th scene member over ALL members (as `_fps_from`
+        picks it). FPS inside the scene starts there and the scene keeps >= 1 point (its rho
+        floor), so it is kept by every mask: the identical physical point.
+        cells / keep (B, To, N), u_scene (B, To) -> (B * To,) long."""
+        N = cells.shape[-1]
+        valid = torch.ones_like(keep) if lengths is None else \
+            torch.arange(N, device=cells.device) < lengths[..., None].to(cells.device)
+        members = (cells < 0) & valid
+        n = members.sum(-1)
+        if (n == 0).any():
+            raise RuntimeError("a frame has no scene point to start the token FPS from")
+        target = torch.minimum((u_scene.to(torch.float64) * n).long(), n - 1) + 1     # 1-based rank
+        s_ = torch.argmax((torch.cumsum(members.long(), -1) >= target[..., None]).long(), -1)
+        if not bool(keep.gather(-1, s_[..., None]).all()):
+            raise RuntimeError("the scene's shared FPS start was not kept (scene rho floor violated?)")
+        new = torch.cumsum(keep.long(), -1).gather(-1, s_[..., None])[..., 0] - 1
+        return new.reshape(-1)
 
     def _encoder_start(self, cells, keep, u_enc):
         """Token-FPS start per thinned cloud: the floor(u * n)-th NON-ROBOT point of the
@@ -180,11 +253,13 @@ class DP3LinkRemover(DP3):
         self.eval()
         try:
             out = torch.zeros(B, K, device=dev)
+            n_filled = 0
             for k in range(K):
                 tobs, res = self._thin_obs(obs, cells, self.link_remover.rho(z[:, k]),
                                            u_region=draws["u_region"], u_fill=draws["u_fill"],
                                            return_keep=True)
-                start = self._encoder_start(cells[:, :To], res[5], draws["u_enc"])
+                n_filled += int((res[4] > 0).sum())
+                start = self._crn_start(cells[:, :To], res[5], draws, obs)
                 global_cond, pc_pe = self._encode(tobs, start, draws["perm"].reshape(B * To, -1))
                 err = 0.0
                 for t in self.reward_t:
@@ -194,6 +269,8 @@ class DP3LinkRemover(DP3):
                                       pc_pe=pc_pe, n_obs_steps=self.n_obs_steps)
                     err = err + ((pred - nactions)[:, s0:s1].float() ** 2).mean(dim=(1, 2))
                 out[:, k] = err / len(self.reward_t)
+            # fraction of the reward pass's clouds that needed fill-up (read by remover_loss)
+            self.reward_filled_frac = n_filled / float(B * To * K)
         finally:
             self.train(was_training)
         return out
@@ -228,8 +305,9 @@ class DP3LinkRemover(DP3):
         surr, adv = rloo_surrogate(rem.log_prob(z), reward)
         stats = {"remover_reward_mean": reward.mean().item(), "remover_reward_std": reward.std().item(),
                  "remover_adv_std": adv.std().item(), "remover_adv_absmean": adv.abs().mean().item(),
-                 "remover_sigma": rem.sigma.item()}
+                 "remover_sigma": rem.sigma.item(), "remover_reward_filled_frac": self.reward_filled_frac}
         stats.update(self._effect_stats(z, adv))
+        stats.update(self._mask_stats(z, adv))
         keep = rem.keep_prob()
         for l, name in enumerate(rem.region_names):
             stats[f"remover_mu/{name}"] = rem.mu[l].item()
@@ -313,7 +391,7 @@ class DP3LinkRemover(DP3):
             for j in range(n_masks):
                 tobs, res = self._thin_obs(obs, cells, rem.rho(zb[:, j]), u_region=draws["u_region"],
                                            u_fill=draws["u_fill"], return_keep=True)
-                start = self._encoder_start(cells[:, :To], res[5], draws["u_enc"])
+                start = self._crn_start(cells[:, :To], res[5], draws, obs)
                 global_cond, pc_pe = self._encode(tobs, start, draws["perm"].reshape(B * To, -1))
                 traj = draws["eps"].to(nactions.dtype).clone()                # shared start noise
                 self.noise_scheduler.set_timesteps(self.num_inference_steps)
@@ -333,6 +411,24 @@ class DP3LinkRemover(DP3):
         ra, rb = rank(a_scores), rank(b_scores)
         return {"ab_rank_spearman": (ra @ rb / (ra.norm() * rb.norm())).item(),
                 "a_scores": a_scores.tolist(), "b_scores": b_scores.tolist()}
+
+    def _mask_stats(self, z, adv):
+        """Structured-mix diagnostic: per structured mask s, the mean advantage of the draws
+        equal to it (adv is already relative to the other masks of the same window; > 0 =
+        worse) and their count. Empty without a mix."""
+        rem = self.link_remover
+        mix = rem.mix_table(z.device)
+        if mix is None:
+            return {}
+        _, g = rem.split(z)
+        a = adv.detach().float()
+        out = {}
+        for i, name in enumerate(rem.mix_names):
+            hit = (g == mix[i]).all(-1)
+            out[f"remover_mask_n/{name}"] = int(hit.sum())
+            if bool(hit.any()):
+                out[f"remover_mask_effect/{name}"] = a[hit].mean().item()
+        return out
 
     def _effect_stats(self, z, adv):
         """What the reward says about each region in THIS phi step (adv > 0 = worse than the

@@ -81,7 +81,10 @@ def eval_results(run):
     return dict(sorted(out.items()))
 
 
-def baselines(N, seed):
+def baselines(N, seed, run=None):
+    """250-epoch results to pair against: uncut / arm cut at this N (seeds 42, 43, own), the
+    gates-only remover GO at this N and seed, and uncut 1024 (the "fewer points" reference;
+    the 200 eval scenes are the same seeds at every N, so the pairing is valid)."""
     res = {}
     for name, suffix in (("uncut", ""), ("arm cut", "-cut5")):
         for s in sorted({seed, 42, 43}):
@@ -89,12 +92,30 @@ def baselines(N, seed):
             r = eval_results(d) if os.path.isdir(d) else {}
             if 250 in r:
                 res[f"{name} s{s}"] = r[250]
+    extra = [("GO (gates only)", f"mimicgen_sim_remover-square_d2-p{N}-g64-rm-GO-{seed}"),
+             (f"GObal s{seed}", f"mimicgen_sim_remover-square_d2-p{N}-g64-rm-GObal-{seed}"),
+             (f"SPEC s{seed}", f"mimicgen_sim_remover-square_d2-p{N}-g64-rm-SPEC-{seed}")]
+    if N != 1024:
+        extra.append(("uncut 1024 s42", "mimicgen_sim-square_d2-p1024-g64-42"))
+    for name, rd in extra:
+        d = os.path.join(SIM_OUT, rd)
+        if run is not None and os.path.abspath(d) == os.path.abspath(run):
+            continue
+        r = eval_results(d) if os.path.isdir(d) else {}
+        if 250 in r:
+            res[name] = r[250]
     return res
+
+
+def is_fixed(cfg):
+    return (cfg["policy"].get("link_remover") or {}).get("fixed_removed") is not None
 
 
 def shade(ax, cfg, x_max):
     E = cfg["training"]["num_epochs"]
     rl = cfg["training"]["link_remover"]
+    if is_fixed(cfg):              # specialist: one phase, the fixed mask throughout
+        return 0, E
     w = round(rl["warmup_frac"] * E)
     f = E - round(rl["finetune_frac"] * E)
     ax.axvspan(0, w, color=PHASE_COLOURS["warmup"], zorder=0)
@@ -129,7 +150,7 @@ def analyze(run):
     cmap10 = plt.get_cmap("tab10")
     cmap = lambda i: cmap10(i) if len(regions) + 4 <= 10 else plt.get_cmap("tab20")(i % 20)
     xs = [r["epoch_frac"] for r in phi]
-    summary = {"run": run, "N": N, "seed": seed, "regions": regions, "phi_steps": len(phi), "epochs_logged": len(ep)}
+    summary = {"run": run, "N": N, "seed": seed, "fixed_removed": cfg["policy"]["link_remover"].get("fixed_removed"), "regions": regions, "phi_steps": len(phi), "epochs_logged": len(ep)}
 
     # ---- phi trajectories ---------------------------------------------------------------
     fig, axs = plt.subplots(1, 3, figsize=(20, 5), sharex=True)
@@ -192,8 +213,10 @@ def analyze(run):
                 ax.plot(x, m, color=c, label=nm)
                 ax.fill_between(x, m - ci, m + ci, color=c, alpha=0.15)
                 late = np.asarray(v[len(v) // 2:])
+                va = np.asarray(v)
                 eff.setdefault(nm, {})[kind] = {
                     "mean_all": float(np.mean(v)), "ci95_all": float(ci[-1]), "n_steps": len(v),
+                    "t_all": float(va.mean() / (va.std(ddof=1) / math.sqrt(len(va)))) if len(va) > 2 and va.std() > 0 else None,
                     "mean_2nd_half": float(late.mean()),
                     "t_2nd_half": float(late.mean() / (late.std(ddof=1) / math.sqrt(len(late)))) if len(late) > 2 and late.std() > 0 else None}
         for ax, t in zip(axs, ("removal effect: mean adv closed - open (< 0: removing helps)",
@@ -277,7 +300,7 @@ def analyze(run):
 
     # ---- success ------------------------------------------------------------------------------
     ev = eval_results(run)
-    base = baselines(N, seed)
+    base = baselines(N, seed, run)
     summary["success"] = {str(k): v["success_rate"] for k, v in ev.items()}
     summary["baselines_250"] = {k: v["success_rate"] for k, v in base.items()}
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -307,9 +330,30 @@ def analyze(run):
     summary["paired_250"] = tests
     summary["final_phi"] = ep[-1]["phi"]
 
+    def tstat(x):
+        x = np.asarray(x, float)
+        return float(x.mean() / (x.std(ddof=1) / math.sqrt(len(x)))) if len(x) > 2 and x.std() > 0 else None
+    masks = sorted({k.split("/", 1)[1] for r in phi for k in r if k.startswith("remover_mask_n/")})
+    summary["mask_effects"] = {}
+    for m in masks:
+        v = [r[f"remover_mask_effect/{m}"] for r in phi if f"remover_mask_effect/{m}" in r]
+        n = sum(r.get(f"remover_mask_n/{m}", 0) for r in phi)
+        if len(v) > 2:
+            late = v[len(v) // 2:]
+            summary["mask_effects"][m] = {"mean_all": float(np.mean(v)), "t_all": tstat(v), "mean_2nd_half": float(np.mean(late)),
+                                          "t_2nd_half": tstat(late), "steps": len(v), "draws": int(n)}
+    fr_theta = [r["remover_filled_frac_epoch"] for r in ep if "remover_filled_frac_epoch" in r]
+    fr_reward = [r["remover_reward_filled_frac"] for r in phi if "remover_reward_filled_frac" in r]
+    summary["fill_up"] = {"theta_pass_mean": float(np.mean(fr_theta)) if fr_theta else None,
+                          "theta_pass_max_epoch": float(np.max(fr_theta)) if fr_theta else None,
+                          "reward_pass_mean": float(np.mean(fr_reward)) if fr_reward else None}
+
     # ---- report -------------------------------------------------------------------------------
+    ft = lambda t: "" if t is None else f"{t:+.1f}"
+    fe = lambda x: "-" if x is None or x != x else f"{x:+.2e}"
     L = [f"# Learned link remover: {os.path.basename(run)}", "",
-         f"N = {N}, 64 tokens, seed {seed}; {len(phi)} phi steps, {len(ep)} epochs logged.", "",
+         f"N = {N}, 64 tokens, seed {seed}; {len(phi)} phi steps, {len(ep)} epochs logged."
+         + (f" SPECIALIST: fixed mask, removed {summary['fixed_removed']}, nothing learned." if summary["fixed_removed"] is not None else ""), "",
          "## Final phi (deterministic = what evaluation uses)", "",
          "| region | keep prob | gate open | density rho | deterministic rho |", "|---|---|---|---|---|"]
     for nm, v in ep[-1]["phi"].items():
@@ -317,14 +361,29 @@ def analyze(run):
     if summary.get("effects"):
         L += ["", "## What the reward says per region (phi phase)", "",
               "removal effect = mean advantage gate closed - open (< 0: removing the region lowers the loss); "
-              "t over the second half of the phi steps.", "",
-              "| region | removal effect (all) +- 95% CI | 2nd half | t | density slope (all) |", "|---|---|---|---|---|"]
+              "addition effect = -removal effect (< 0: adding the region lowers the loss). Density slope = "
+              "d adv / d z over open draws (< 0: denser helps). t over all phi steps and over their second half.", "",
+              "| region | removal effect (all) +- 95% CI | t all | 2nd half | t 2nd | addition effect (all) | density slope (all) | t all | t 2nd |",
+              "|---|---|---|---|---|---|---|---|---|"]
         for nm, v in summary["effects"].items():
             g, d = v.get("gate", {}), v.get("density", {})
-            t = g.get("t_2nd_half")
-            L.append(f"| {nm} | {g.get('mean_all', float('nan')):+.2e} +- {g.get('ci95_all', float('nan')):.1e} | "
-                     f"{g.get('mean_2nd_half', float('nan')):+.2e} | {'' if t is None else f'{t:+.1f}'} | "
-                     f"{d.get('mean_all', float('nan')):+.2e} |")
+            L.append(f"| {nm} | {g.get('mean_all', float('nan')):+.2e} +- {g.get('ci95_all', float('nan')):.1e} | {ft(g.get('t_all'))} | "
+                     f"{g.get('mean_2nd_half', float('nan')):+.2e} | {ft(g.get('t_2nd_half'))} | {fe(-g['mean_all']) if 'mean_all' in g else '-'} | "
+                     f"{fe(d.get('mean_all'))} | {ft(d.get('t_all'))} | {ft(d.get('t_2nd_half'))} |")
+    if summary.get("mask_effects"):
+        L += ["", "## Structured masks (mix): mean advantage of draws equal to the mask vs the rest of their window", "",
+              "> 0 = worse than the window's other masks. Caveat: a mask drawn by the eps-component is weighted in the "
+              "gradient by (1 - eps) Bern(g) / P(g), which is small, so phi learns little from those draws; this table is "
+              "the reward's own verdict on each mask.", "",
+              "| mask | mean adv (all) | t all | 2nd half | t 2nd | phi steps | draws |", "|---|---|---|---|---|---|---|"]
+        for m, v in summary["mask_effects"].items():
+            L.append(f"| {m} | {v['mean_all']:+.2e} | {ft(v['t_all'])} | {v['mean_2nd_half']:+.2e} | {ft(v['t_2nd_half'])} | "
+                     f"{v['steps']} | {v['draws']} |")
+    fu = summary["fill_up"]
+    pct = lambda x: "-" if x is None else f"{100 * x:.3f}%"
+    L += ["", "## Fill-up (clouds below the 64 tokens, refilled with removed region points)", "",
+          f"theta pass: mean {pct(fu['theta_pass_mean'])} of clouds per epoch (max epoch {pct(fu['theta_pass_max_epoch'])}); "
+          f"reward pass: mean {pct(fu['reward_pass_mean'])} of clouds per phi step."]
     if diag:
         L += ["", "## Diagnostics (mean over the phi phase | last)", "", "| metric | phi phase | last |", "|---|---|---|"]
         for k, v in summary["diagnostics_last"].items():
@@ -332,7 +391,7 @@ def analyze(run):
         L += ["", "## Mechanism at the last diagnostic", "", "| class | tokens uncut | tokens det. | coverage uncut | coverage det. | patch cm uncut | patch cm det. |",
               "|---|---|---|---|---|---|---|"]
         mm = summary["mechanism_last"]
-        for c in regions + ["link0-4", "nut", "peg", "other"]:
+        for c in [r for r in regions if r != "scene"] + ["link0-4", "nut", "peg", "other"]:   # scene = nut + peg + other
             g = lambda m, s: mm.get(f"mech/{m}/{s}/{c}", float("nan"))
             L.append(f"| {c} | {g('none', 'tokens'):.1f} | {g('deterministic', 'tokens'):.1f} | {g('none', 'coverage'):.2f} | "
                      f"{g('deterministic', 'coverage'):.2f} | {g('none', 'patch_cm'):.1f} | {g('deterministic', 'patch_cm'):.1f} |")
@@ -360,28 +419,29 @@ def sweep(summaries, out):
     import matplotlib.pyplot as plt
     os.makedirs(out, exist_ok=True)
     summaries = sorted(summaries, key=lambda s: (s["N"], s["seed"]))
+    tag = lambda s: os.path.basename(s["run"]).split("-rm-")[-1]
     L = ["# Learned link remover sweep", "", "## Success at 250 (200 fixed scenes)", "",
-         "| N | seed | remover | uncut | arm cut | vs uncut (rem only / base only, p) | vs arm cut |", "|---|---|---|---|---|---|---|"]
+         "| run | N | seed | remover | uncut | arm cut | vs uncut (rem only / base only, p) | vs arm cut |", "|---|---|---|---|---|---|---|---|"]
     for s in summaries:
         sc = s["success"].get("250")
         b = s["baselines_250"]
         pt = s.get("paired_250", {})
         f = lambda k: f"{pt[k]['remover_only']}/{pt[k]['baseline_only']}, p={pt[k]['p']:.3f}" if k in pt else "-"
-        L.append(f"| {s['N']} | {s['seed']} | {'-' if sc is None else f'{100 * sc:.1f}%'} | "
+        L.append(f"| {tag(s)} | {s['N']} | {s['seed']} | {'-' if sc is None else f'{100 * sc:.1f}%'} | "
                  f"{b.get('uncut s' + str(s['seed']), float('nan')) * 100:.1f}% | {b.get('arm cut s' + str(s['seed']), float('nan')) * 100:.1f}% | "
                  f"{f('uncut s' + str(s['seed']))} | {f('arm cut s' + str(s['seed']))} |")
     regions = summaries[0]["regions"]
     L += ["", "## Learned gates (keep prob) and densities at the end", "",
-          "| N | " + " | ".join(regions) + " |", "|---|" + "---|" * len(regions)]
+          "| run | N | " + " | ".join(regions) + " |", "|---|---|" + "---|" * len(regions)]
     for s in summaries:
-        L.append(f"| {s['N']} | " + " | ".join(f"{s['final_phi'][r]['keep_prob']:.2f} / {s['final_phi'][r]['rho']:.2f}" for r in regions) + " |")
+        L.append(f"| {tag(s)} | {s['N']} | " + " | ".join(f"{s['final_phi'][r]['keep_prob']:.2f} / {s['final_phi'][r]['rho']:.2f}" for r in regions) + " |")
     with open(os.path.join(out, "sweep_report.md"), "w") as fh:
         fh.write("\n".join(L) + "\n")
     fig, ax = plt.subplots(figsize=(8, 5))
     for i, s in enumerate(summaries):
         ev = {int(k): v for k, v in s["success"].items()}
         if ev:
-            ax.plot(list(ev), list(ev.values()), "o-", color=plt.get_cmap("tab10")(i), label=f"remover N={s['N']}")
+            ax.plot(list(ev), list(ev.values()), "o-", color=plt.get_cmap("tab10")(i), label=f"{tag(s)} s{s['seed']}")
         for j, (k, v) in enumerate(s["baselines_250"].items()):
             if k.endswith(f"s{s['seed']}"):
                 ax.axhline(v, color=plt.get_cmap("tab10")(i), ls="--" if k.startswith("uncut") else ":", lw=0.8)
@@ -396,8 +456,8 @@ def sweep(summaries, out):
     w = 0.8 / len(summaries)
     for i, s in enumerate(summaries):
         x = np.arange(len(regions)) + i * w
-        axs[0].bar(x, [s["final_phi"][r]["keep_prob"] for r in regions], w, label=f"N={s['N']}")
-        axs[1].bar(x, [s["final_phi"][r]["rho"] for r in regions], w, label=f"N={s['N']}")
+        axs[0].bar(x, [s["final_phi"][r]["keep_prob"] for r in regions], w, label=f"{tag(s)} s{s['seed']}")
+        axs[1].bar(x, [s["final_phi"][r]["rho"] for r in regions], w, label=f"{tag(s)} s{s['seed']}")
     for ax, t in zip(axs, ("gate keep probability", "density rho")):
         ax.set_xticks(np.arange(len(regions)) + 0.4 - w / 2)
         ax.set_xticklabels(regions, rotation=30, fontsize=8)
@@ -414,7 +474,9 @@ def sweep(summaries, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--sweep-out", default=os.path.join(SIM_OUT, "mimicgen", "remover_sweep"))
+    ap.add_argument("--sweep-out", default=None,
+                    help="cross-run report dir (default with several runs: mimicgen/remover_sweep; one run "
+                         "writes no sweep report unless this is given)")
     a = ap.parse_args()
     sums = []
     for r in a.runs:
@@ -422,8 +484,8 @@ def main():
             sums.append(analyze(os.path.abspath(r)))
         except Exception as e:      # one broken run must not hide the others
             print(f"{r}: analysis FAILED: {type(e).__name__}: {e}", file=sys.stderr)
-    if len(sums) > 1 or (sums and a.sweep_out):
-        sweep(sums, a.sweep_out)
+    if sums and (len(sums) > 1 or a.sweep_out):
+        sweep(sums, a.sweep_out or os.path.join(SIM_OUT, "mimicgen", "remover_sweep"))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,22 @@ The thinned cloud is compacted (kept points first, in their original order) and 
 with copies of the first kept point; the valid count is returned as `point_cloud_len`,
 the robot-cut padding path that masks padding out of the encoder's FPS and kNN (same
 convention as `r3d/common/label_cut.py`).
+
+Variants (all default off; tuning round 2, docs/sim_token_allocation_learnings.md):
+  learn_gates=False      density only: g = 1 always, phi = mu.
+  scene region           a group with the pseudo cell NON_ROBOT ("<non_robot>") is every
+                         point outside the robot cells (cell -1: nut, peg, rest of the scene),
+                         label-free. Density only (needs learn_gates=False); its rho is floored
+                         at scene_rho_min in every draw and at inference and is never snapped,
+                         so the objects can never be thinned away.
+  mix_eps / mix_masks    with probability eps a draw is one of S fixed structured gate masks
+                         (uniformly), otherwise the independent Bernoullis:
+                         P(g) = (1 - eps) prod_l Bern(g_l; pi_l) + eps/S * 1[g in masks].
+  fixed_removed          the SPECIALIST (round 3): a fixed mask, nothing learned. The listed
+                         regions are removed, every other region is kept whole: gate logits at
+                         -gate_max / +gate_max (so the deterministic mask is exactly that), no
+                         density (needs learn_density=False), phi_parameters() empty, and every
+                         draw IS the fixed mask.
 """
 
 import math
@@ -43,6 +59,7 @@ import torch.nn as nn
 
 NOT_THINNED = -1
 FPS_MIN_WIDTH = 8
+NON_ROBOT = "<non_robot>"   # pseudo cell: a scene region of every point with cell -1
 
 
 def region_table(cell_names, region_groups):
@@ -54,6 +71,10 @@ def region_table(cell_names, region_groups):
     for r, g in enumerate(region_groups):
         names.append(str(g["name"]))
         for c in g["cells"]:
+            if c == NON_ROBOT:
+                if list(g["cells"]) != [NON_ROBOT]:
+                    raise ValueError(f"region '{g['name']}': {NON_ROBOT} must be the only cell of its group")
+                continue                       # no table entry: region_of maps cell -1 to it
             if c not in cell_names:
                 raise KeyError(f"region '{g['name']}': unknown link cell '{c}' (known: {cell_names})")
             i = cell_names.index(c)
@@ -65,10 +86,20 @@ def region_table(cell_names, region_groups):
     return table, names
 
 
-def region_of(cells, cell_to_region):
-    """per-point region id (C, N), NOT_THINNED (-1) for points in no region."""
+def scene_region_of(region_groups):
+    """index of the group made of NON_ROBOT, or None."""
+    idx = [r for r, g in enumerate(region_groups) if NON_ROBOT in g["cells"]]
+    if len(idx) > 1:
+        raise ValueError(f"more than one {NON_ROBOT} region")
+    return idx[0] if idx else None
+
+
+def region_of(cells, cell_to_region, scene_region=None):
+    """per-point region id (C, N), NOT_THINNED (-1) for points in no region; with a scene
+    region, points with cell -1 belong to it."""
     c2r = cell_to_region.to(cells.device)
-    return torch.where(cells >= 0, c2r[cells.clamp(min=0)], torch.full_like(cells, NOT_THINNED))
+    rest = NOT_THINNED if scene_region is None else int(scene_region)
+    return torch.where(cells >= 0, c2r[cells.clamp(min=0)], torch.full_like(cells, rest))
 
 
 def _fps_from(xyz, lengths, K, u):
@@ -83,7 +114,7 @@ def _fps_from(xyz, lengths, K, u):
 
 def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None,
                  fill_to_min_keep=False, random_start=False, u_region=None, u_fill=None,
-                 return_keep=False):
+                 return_keep=False, scene_region=None):
     """Keep round(rho[c, l] * n[c, l]) points of region l in cloud c, by FPS within the region.
 
     points (C, N, D) (xyz first), cells (C, N) long link-cell id or -1, rho (C, L) in [0, 1],
@@ -121,7 +152,7 @@ def thin_regions(points, cells, rho, cell_to_region, lengths=None, min_keep=None
         if u is not None and (tuple(u.shape) != shape or bool((u < 0).any()) or bool((u >= 1).any())):
             raise ValueError(f"{name} must be {shape} uniforms in [0, 1)")
 
-    region = region_of(cells, cell_to_region)
+    region = region_of(cells, cell_to_region, scene_region)
     valid = torch.ones(C, N, dtype=torch.bool, device=dev) if lengths is None else \
         torch.arange(N, device=dev)[None] < lengths.to(dev)[:, None]
     in_region = valid & (region >= 0)
@@ -220,12 +251,17 @@ class LinkRemover(nn.Module):
     moves through sample / log_prob / rho without a second container."""
 
     def __init__(self, cell_names, region_groups, init_rho=0.8, init_keep=0.8, sigma=1.0,
-                 mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None, learn_density=True):
+                 mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None, learn_density=True,
+                 learn_gates=True, scene_rho_min=0.1, mix_eps=0.0, mix_masks=None, fixed_removed=None):
         super().__init__()
+        self.learn_gates = bool(learn_gates)
+        if not self.learn_gates and not learn_density:
+            raise ValueError("learn_gates and learn_density are both off: nothing to learn")
         # learn_density False = gates only: a kept region keeps ALL its points (rho = g), mu is
         # not learned (no gradient, left at logit(init_rho) for checkpoint compatibility)
         self.learn_density = bool(learn_density)
         table, self.region_names = region_table(cell_names, region_groups)
+        self.scene_region = scene_region_of(region_groups)
         self.cell_names = list(cell_names)
         self.register_buffer("cell_to_region", table)
         L = len(self.region_names)
@@ -243,8 +279,56 @@ class LinkRemover(nn.Module):
         self.snap_rho_below = None if snap_rho_below is None else float(snap_rho_below)
         logit = lambda p: math.log(p / (1 - p))
         self.mu = nn.Parameter(torch.full((L,), logit(init_rho)), requires_grad=self.learn_density)
-        self.gate = nn.Parameter(torch.full((L,), logit(init_keep)))
+        self.gate = nn.Parameter(torch.full((L,), logit(init_keep)), requires_grad=self.learn_gates)
         self.register_buffer("sigma", torch.tensor(float(sigma)))
+        # scene region: density only, floored (plain tensors, not buffers: old state_dicts load)
+        self.scene_rho_min = None
+        if self.scene_region is not None:
+            if self.learn_gates or not learn_density:
+                raise ValueError("a scene region is density only: learn_gates=False, learn_density=True")
+            if not 0.0 < float(scene_rho_min) < 1.0:
+                raise ValueError("scene_rho_min must be in (0, 1)")
+            self.scene_rho_min = float(scene_rho_min)
+            self._mu_lo = torch.full((L,), self.mu_min)
+            self._mu_lo[self.scene_region] = logit(self.scene_rho_min)
+        # structured mix
+        self.mix_eps = float(mix_eps)
+        if not 0.0 <= self.mix_eps < 1.0:
+            raise ValueError("mix_eps must be in [0, 1)")
+        self.mix_names, self._mix = [], None
+        if self.mix_eps > 0:
+            if not self.learn_gates:
+                raise ValueError("mix_eps > 0 needs learned gates")
+            if not mix_masks:
+                raise ValueError("mix_eps > 0 needs mix_masks")
+            rows = []
+            for m in mix_masks:
+                removed = list(self.region_names) if m == "all" else list(m)
+                bad = [r for r in removed if r not in self.region_names]
+                if bad:
+                    raise KeyError(f"mix mask: unknown regions {bad} (known: {self.region_names})")
+                rows.append([0.0 if r in removed else 1.0 for r in self.region_names])
+                self.mix_names.append("none_removed" if not removed else
+                                      "all_removed" if len(set(removed)) == L else "+".join(removed))
+            self._mix = torch.tensor(rows)
+            if len({tuple(r) for r in rows}) != len(rows):
+                raise ValueError("mix_masks must be distinct")
+        # fixed mask (specialist): the gates hold the mask and are not learned
+        self.fixed_removed = None
+        if fixed_removed is not None:
+            if learn_density or not self.learn_gates:
+                raise ValueError("fixed_removed needs learn_density=False and learn_gates=True")
+            if self.mix_eps > 0 or self.scene_region is not None:
+                raise ValueError("fixed_removed excludes mix_eps and a scene region")
+            removed = list(fixed_removed)
+            bad = [r for r in removed if r not in self.region_names]
+            if bad:
+                raise KeyError(f"fixed_removed: unknown regions {bad} (known: {self.region_names})")
+            self.fixed_removed = removed
+            with torch.no_grad():
+                self.gate.copy_(torch.tensor([-self.gate_max if r in removed else self.gate_max
+                                              for r in self.region_names]))
+            self.gate.requires_grad_(False)
         self.clamp_()
 
     @property
@@ -253,7 +337,10 @@ class LinkRemover(nn.Module):
 
     @torch.no_grad()
     def clamp_(self):
-        self.mu.clamp_(self.mu_min, self.mu_max)
+        if self.scene_region is None:
+            self.mu.clamp_(self.mu_min, self.mu_max)
+        else:
+            self.mu.copy_(torch.clamp(torch.maximum(self.mu, self._mu_lo.to(self.mu.device)), max=self.mu_max))
         self.gate.clamp_(-self.gate_max, self.gate_max)
 
     @torch.no_grad()
@@ -261,13 +348,28 @@ class LinkRemover(nn.Module):
         self.sigma.fill_(float(sigma))
 
     def phi_parameters(self):
-        return [self.gate, self.mu] if self.learn_density else [self.gate]
+        if self.fixed_removed is not None:
+            return []
+        return [p for p, on in ((self.gate, self.learn_gates), (self.mu, self.learn_density)) if on]
+
+    def fixed_gates(self, device=None):
+        """(L,) gates of the fixed mask (1 = kept), or None."""
+        if self.fixed_removed is None:
+            return None
+        return torch.tensor([0.0 if r in self.fixed_removed else 1.0 for r in self.region_names],
+                            device=self.gate.device if device is None else device)
+
+    def mix_table(self, device):
+        """(S, L) gates of the structured masks (1 = kept), or None."""
+        return None if self._mix is None else self._mix.to(device)
 
     def density(self):
         """deterministic density of a kept region, unsnapped: sigmoid(mu), or 1 gates-only."""
         return torch.sigmoid(self.mu.detach()) if self.learn_density else torch.ones_like(self.mu.detach())
 
     def keep_prob(self):
+        if not self.learn_gates:
+            return torch.ones_like(self.gate.detach())
         return torch.sigmoid(self.gate.detach())
 
     def sample(self, n):
@@ -276,7 +378,15 @@ class LinkRemover(nn.Module):
             L, dev = self.n_regions, self.mu.device
             z = self.mu[None] + self.sigma * torch.randn(n, L, device=dev) if self.learn_density \
                 else torch.zeros(n, L, device=dev)
+            if not self.learn_gates:
+                return torch.cat([z, torch.ones_like(z)], -1)
+            if self.fixed_removed is not None:
+                return torch.cat([z, self.fixed_gates(dev)[None].expand(n, -1)], -1)
             g = (torch.rand(n, L, device=dev) < torch.sigmoid(self.gate)[None]).to(z.dtype)
+            if self.mix_eps > 0:                # no extra RNG at all when the mix is off
+                use = torch.rand(n, device=dev) < self.mix_eps
+                pick = torch.randint(self._mix.shape[0], (n,), device=dev)
+                g = torch.where(use[:, None], self.mix_table(dev)[pick].to(g.dtype), g)
             return torch.cat([z, g], -1)
 
     def split(self, draw):
@@ -288,8 +398,27 @@ class LinkRemover(nn.Module):
     def log_prob(self, draw):
         """sum_l [log Bern(g_l; sigmoid(a_l)) + g_l log N(z_l; mu_l, sigma^2)] -> (...,);
         the gradient reaches a and mu only. Gates only: the Bernoulli term alone."""
+        if self.fixed_removed is not None:
+            raise RuntimeError("fixed-mask remover: nothing to learn, no log P")
         z, g = self.split(draw.detach())
+        if not self.learn_gates:
+            if bool((g != 1).any()):
+                raise ValueError("density-only remover got a draw with a closed gate")
+            s = self.sigma
+            return (-0.5 * ((z - self.mu) / s) ** 2 - torch.log(s) - 0.5 * math.log(2 * math.pi)).sum(-1)
         lp_g = g * torch.nn.functional.logsigmoid(self.gate) + (1 - g) * torch.nn.functional.logsigmoid(-self.gate)
+        if self.mix_eps > 0:
+            mix = self.mix_table(g.device)
+            hit = (g[..., None, :] == mix).all(-1).any(-1)
+            lp_bern = math.log(1 - self.mix_eps) + lp_g.sum(-1)
+            lp_mix = torch.where(hit, torch.full_like(lp_bern, math.log(self.mix_eps / mix.shape[0])),
+                                 torch.full_like(lp_bern, -math.inf))
+            lp_gates = torch.logsumexp(torch.stack([lp_bern, lp_mix]), 0)
+            if not self.learn_density:
+                return lp_gates
+            s = self.sigma
+            lp_z = -0.5 * ((z - self.mu) / s) ** 2 - torch.log(s) - 0.5 * math.log(2 * math.pi)
+            return lp_gates + (g * lp_z).sum(-1)
         if not self.learn_density:
             return lp_g.sum(-1)
         s = self.sigma
@@ -302,10 +431,22 @@ class LinkRemover(nn.Module):
         to 0 below `snap_rho_below`."""
         if draw is not None:
             z, g = self.split(draw)
-            return g * torch.sigmoid(z) if self.learn_density else g
+            rho = g * torch.sigmoid(z) if self.learn_density else g
+            if self.scene_region is not None:
+                rho = rho.clone()
+                rho[..., self.scene_region] = rho[..., self.scene_region].clamp(min=self.scene_rho_min)
+            return rho
         rho = self.density()
         if self.snap_rho_below is not None and self.learn_density:
-            rho = torch.where(rho < self.snap_rho_below, torch.zeros_like(rho), rho)
+            snap = rho < self.snap_rho_below
+            if self.scene_region is not None:
+                snap[self.scene_region] = False
+                rho = rho.clone()
+                rho[self.scene_region] = rho[self.scene_region].clamp(min=self.scene_rho_min)
+            rho = torch.where(snap, torch.zeros_like(rho), rho)
+        elif self.scene_region is not None:
+            rho = rho.clone()
+            rho[self.scene_region] = rho[self.scene_region].clamp(min=self.scene_rho_min)
         return torch.where(self.keep_prob() >= 0.5, rho, torch.zeros_like(rho))
 
 

@@ -26,8 +26,13 @@ Policy checks (DP3LinkRemover, N = 1024, 64 tokens; skip with --no-policy):
     the same (masks, seeds) twice -> identical rewards; other seeds -> other rewards
  12 the theta pass keeps independent random starts: the encoder's token FPS draws its own
     start / shuffle and the within-region FPS its own starts (nothing shared is passed)
+ 13 fixed-mask specialist (fixed_removed: [link5, link6], round 3): the training and the eval
+    clouds have exactly link5 + link6 removed and every other point kept, in order; no phi
+    parameter changes over a controller step; the controller has no phi optimizer, phase
+    "fixed", and its diagnostics are the mechanism only
 """
 
+import math
 import os
 import pathlib
 import sys
@@ -41,7 +46,7 @@ sys.path.insert(0, str(ROOT / "R3D"))
 from r3d.common import robosuite_pcd as RP  # noqa: E402
 from r3d.common.label_cut import cut_points_by_label  # noqa: E402
 from r3d.common.token_allocation import box_normalize  # noqa: E402
-from r3d.model.vision.link_remover import FPS_MIN_WIDTH, LinkRemover, thin_regions, thin_window  # noqa: E402
+from r3d.model.vision.link_remover import FPS_MIN_WIDTH, NON_ROBOT, LinkRemover, thin_regions, thin_window  # noqa: E402
 from pytorch3d.ops import sample_farthest_points  # noqa: E402
 
 ZARR = ROOT / "R3D" / "data" / "square_d2-agentview_p4096-200.zarr"
@@ -308,11 +313,287 @@ def main():
     o5, l5 = thin_regions(P5, C5, torch.ones(1, r5.n_regions, device=DEV), r5.cell_to_region.to(DEV))[:2]
     check("gates only: an open gate (rho = 1) keeps the cloud unchanged", torch.equal(o5, P5) and int(l5[0]) == 1024)
 
+    round2_module_checks(z)
+    fixed_module_checks()
+    all_links_checks(z)
     if "--no-policy" not in sys.argv:
         policy_checks(z)
+        fixed_policy_checks(z)
 
     print(f"\n{'ALL CHECKS PASSED' if not FAILS else 'FAILED: ' + ', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
+
+
+def round2_module_checks(z):
+    import itertools
+    groups = RP.default_region_groups()
+    scene_groups = groups + [{"name": "scene", "cells": [NON_ROBOT]}]
+
+    print("\n=== density only (learn_gates: false) ===")
+    rd = LinkRemover(RP.CELL_NAMES, groups, learn_gates=False, init_rho=0.9)
+    torch.manual_seed(0)
+    dd = rd.sample(500)
+    zd, gd = rd.split(dd)
+    rd.zero_grad()
+    rd.log_prob(dd[:5]).sum().backward()
+    check("density only: every gate open, rho = sigmoid(z), gradient on mu only",
+          bool((gd == 1).all()) and torch.equal(rd.rho(dd), torch.sigmoid(zd)) and rd.gate.grad is None
+          and not rd.gate.requires_grad and bool((rd.mu.grad != 0).all()) and rd.phi_parameters() == [rd.mu]
+          and bool((rd.keep_prob() == 1).all()))
+    try:
+        LinkRemover(RP.CELL_NAMES, groups, learn_gates=False, learn_density=False)
+        check("raises on learn_gates = learn_density = false", False)
+    except ValueError:
+        check("raises on learn_gates = learn_density = false", True)
+
+    print("\n=== scene region (label-free, density only) ===")
+    try:
+        LinkRemover(RP.CELL_NAMES, scene_groups)
+        check("scene region with learned gates raises", False)
+    except ValueError:
+        check("scene region with learned gates raises", True)
+    rs = LinkRemover(RP.CELL_NAMES, scene_groups, learn_gates=False, init_rho=0.9, scene_rho_min=0.1,
+                     snap_rho_below=0.05)
+    S, L = rs.scene_region, rs.n_regions
+    N = 4096
+    P = torch.as_tensor(np.asarray(z["data"]["point_cloud"][:6, :N]), device=DEV)
+    Cc = torch.as_tensor(np.asarray(z["data"]["point_link"][:6, :N]), device=DEV).long()
+    c2r = rs.cell_to_region.to(DEV)
+    one = torch.ones(6, L, device=DEV)
+    o1, l1 = thin_regions(P, Cc, one, c2r, scene_region=S)[:2]
+    check("scene: rho = 1 everywhere -> cloud unchanged", torch.equal(o1, P) and bool((l1 == N).all()))
+    rho = one.clone()
+    rho[:, S] = 0.25
+    o2, l2, n2, k2, _, keep = thin_regions(P, Cc, rho, c2r, scene_region=S, return_keep=True)
+    n_scene = (Cc < 0).sum(1)
+    link04 = (Cc >= 0) & (Cc <= 4)
+    check("scene: rho_scene = 0.25 keeps round(0.25 n) scene points; robot and link0-4 untouched",
+          torch.equal(k2[:, S], torch.floor(0.25 * n_scene.double() + 0.5).long())
+          and int((keep & (Cc < 0)).sum()) == int(k2[:, S].sum()) and bool(keep[link04].all())
+          and bool(keep[Cc > 4].all()), f"scene points {n_scene.tolist()} -> {k2[:, S].tolist()}")
+    u = torch.rand(6, L, device=DEV)
+    rlo, rhi = one.clone(), one.clone()
+    rlo[:, S], rhi[:, S] = 0.2, 0.5
+    klo = thin_regions(P, Cc, rlo, c2r, scene_region=S, u_region=u, return_keep=True)[5]
+    khi = thin_regions(P, Cc, rhi, c2r, scene_region=S, u_region=u, return_keep=True)[5]
+    check("scene: nested masks with shared starts (0.2 subset of 0.5)", bool((klo <= khi).all()))
+    with torch.no_grad():
+        rs.mu.fill_(-20.0)
+    rs.clamp_()
+    zlow = torch.cat([torch.full((3, L), -30.0), torch.ones(3, L)], -1)
+    check("scene: rho floored at scene_rho_min (mu bound, every draw, inference never snaps it to 0)",
+          abs(float(torch.sigmoid(rs.mu[S])) - 0.1) < 1e-6 and float(rs.mu[[l for l in range(L) if l != S]].max()) == -9.0
+          and bool((rs.rho(zlow)[:, S] == 0.1).all()) and abs(float(rs.rho()[S]) - 0.1) < 1e-6
+          and bool((rs.rho()[[l for l in range(L) if l != S]] == 0).all()))
+
+    print("\n=== structured mix ===")
+    masks = [[], ["link5", "link6", "link7"], ["link5", "link6", "link7", "hand_f1side", "hand_centre", "hand_f2side"], "all"]
+    rm = LinkRemover(RP.CELL_NAMES, groups, learn_density=False, init_keep=0.8, mix_eps=0.25, mix_masks=masks)
+    with torch.no_grad():
+        rm.gate.copy_(torch.linspace(-1.5, 2.5, rm.n_regions))
+    Lg = rm.n_regions
+    pats = torch.tensor(list(itertools.product([0.0, 1.0], repeat=Lg)))
+    allp = torch.cat([torch.zeros_like(pats), pats], -1)
+    tot = torch.exp(rm.log_prob(allp)).sum().item()
+    check("mix: P summed over all 256 gate patterns = 1", abs(tot - 1.0) < 1e-5, f"{tot:.8f}")
+    torch.manual_seed(1)
+    dm = rm.sample(200000)
+    _, gm = rm.split(dm)
+    mix = rm.mix_table("cpu")
+    pi = torch.sigmoid(rm.gate.detach())
+    bern = lambda m: float(torch.prod(torch.where(m > 0, pi, 1 - pi)))
+    ok = True
+    for i in range(mix.shape[0]):
+        f_emp = (gm == mix[i]).all(-1).float().mean().item()
+        f_exp = 0.75 * bern(mix[i]) + 0.25 / mix.shape[0]
+        ok &= abs(f_emp - f_exp) < 4 * math.sqrt(f_exp * (1 - f_exp) / 200000) + 1e-4
+    marg = gm.mean(0)
+    marg_exp = 0.75 * pi + 0.25 * mix.mean(0)
+    ok &= bool((marg - marg_exp).abs().max() < 0.005)
+    check("mix: sampled frequencies match (1-eps) Bern + eps/S per mask, and the gate marginals", ok,
+          f"max marginal error {(marg - marg_exp).abs().max():.4f}")
+    rm.zero_grad()
+    rm.log_prob(dm[:64]).sum().backward()
+    check("mix: gradient reaches the gate logits only", rm.mu.grad is None and bool((rm.gate.grad != 0).any()))
+    # mix off == the pre-mix sampler / log_prob (reference formulas inline)
+    r0 = LinkRemover(RP.CELL_NAMES, groups, init_keep=0.8, sigma=0.7)
+    torch.manual_seed(5)
+    d0 = r0.sample(1000)
+    torch.manual_seed(5)
+    zr = r0.mu[None].detach() + r0.sigma * torch.randn(1000, Lg)
+    gr = (torch.rand(1000, Lg) < torch.sigmoid(r0.gate.detach())[None]).to(zr.dtype)
+    lg = gr * torch.nn.functional.logsigmoid(r0.gate.detach()) + (1 - gr) * torch.nn.functional.logsigmoid(-r0.gate.detach())
+    lz = -0.5 * ((zr - r0.mu.detach()) / r0.sigma) ** 2 - torch.log(r0.sigma) - 0.5 * math.log(2 * math.pi)
+    check("mix off: sample and log_prob bit-identical to the pre-mix formulas",
+          torch.equal(d0, torch.cat([zr, gr], -1)) and torch.equal(r0.log_prob(d0).detach(), (lg + gr * lz).sum(-1)))
+
+
+SPEC = ["link5", "link6"]
+
+
+def fixed_module_checks():
+    print("\n=== fixed mask (specialist) ===")
+    groups = RP.default_region_groups()
+    rf = LinkRemover(RP.CELL_NAMES, groups, learn_density=False, fixed_removed=SPEC)
+    want = torch.tensor([0.0 if n in SPEC else 1.0 for n in rf.region_names])
+    d = rf.sample(500)
+    check("fixed: deterministic rho == the mask exactly (listed 0, rest 1); every draw is the mask",
+          torch.equal(rf.rho(), want) and bool((rf.split(d)[1] == want).all()) and torch.equal(rf.rho(d), want.expand(500, -1)))
+    check("fixed: gate logits at -/+ gate_max, frozen; phi_parameters() empty",
+          torch.equal(rf.gate.detach(), (want * 2 - 1) * rf.gate_max) and not rf.gate.requires_grad
+          and not rf.mu.requires_grad and rf.phi_parameters() == [])
+    cases = {
+        "unknown region name": lambda: LinkRemover(RP.CELL_NAMES, groups, learn_density=False, fixed_removed=["link9"]),
+        "fixed_removed with learn_density": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_removed=SPEC),
+        "fixed_removed with mix": lambda: LinkRemover(RP.CELL_NAMES, groups, learn_density=False, fixed_removed=SPEC,
+                                                      mix_eps=0.25, mix_masks=[[], "all"]),
+        "log_prob of a fixed remover": lambda: rf.log_prob(d),
+    }
+    for nm, fn in cases.items():
+        try:
+            fn()
+            check(f"fixed: raises on {nm}", False)
+        except (ValueError, RuntimeError, KeyError) as e:
+            check(f"fixed: raises on {nm}", True, type(e).__name__)
+    # off: no fixed_removed -> the same parameters and the same sampler as before
+    torch.manual_seed(4)
+    a = LinkRemover(RP.CELL_NAMES, groups, learn_density=False, init_keep=0.5)
+    da = a.sample(300)
+    torch.manual_seed(4)
+    b = LinkRemover(RP.CELL_NAMES, groups, learn_density=False, init_keep=0.5, fixed_removed=None)
+    db = b.sample(300)
+    check("fixed_removed=None: parameters and draws identical to the plain remover",
+          torch.equal(da, db) and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
+          and a.phi_parameters() == [a.gate])
+
+
+def all_links_checks(z):
+    """region_groups all_links (13 regions, gates for link0..link4 too): closing link0..7 IS the
+    oracle arm cut (label 5), bit for bit -- a clean removal is reachable."""
+    print("\n=== all_links: 13 regions, the arm cut is reachable ===")
+    groups = RP.all_links_region_groups()
+    ra = LinkRemover(RP.CELL_NAMES, groups, learn_density=False, init_keep=0.5)
+    check("all_links: 13 regions, link0..link7 + hand x3 + fingers x2, every cell of the arm and gripper in one",
+          ra.n_regions == 13 and ra.region_names[:8] == [f"link{i}" for i in range(8)]
+          and bool((ra.cell_to_region >= 0).all()))
+    ok, worst = True, 0
+    for N in (1024, 4096):
+        pc, cell, lab = load_windows(z, N, n_win=20, seed=7)
+        B = len(pc)
+        P, Cc = torch.as_tensor(pc, device=DEV), torch.as_tensor(cell, device=DEV)
+        rho = torch.tensor([0.0 if n.startswith("link") else 1.0 for n in ra.region_names], device=DEV).expand(B, -1)
+        out, ln, _, _, _ = thin_window(P, Cc, rho, ra.cell_to_region.to(DEV))
+        for b in range(B):
+            for f in range(2):
+                ref, nref = cut_points_by_label(pc[b, f], lab[b, f], [5])
+                ok &= nref == int(ln[b, f]) and np.array_equal(ref, out[b, f].cpu().numpy())
+                worst = max(worst, int(((cell[b, f] >= 0) & (cell[b, f] <= 4)).sum()))
+    check("all_links: closing link0..7 == label-5 arm cut, padded arrays bit-identical (N 1024, 4096)", ok,
+          f"most link0-4 points in a checked frame: {worst}")
+
+
+def fixed_policy_checks(z):
+    """The specialist policy on real windows: the clouds theta trains on and the clouds
+    inference sees, audited point by point against the link labels."""
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from r3d.common.link_remover_training import RemoverController
+    print("\n=== policy: fixed-mask specialist (link5 + link6 removed) ===")
+    N = 1024
+    with initialize_config_dir(config_dir=str(ROOT / "R3D" / "r3d" / "config"), version_base=None):
+        cfg = compose(config_name="r3d_robotwin2_remover", overrides=[
+            "task=mimicgen_sim_remover", "task_name=square_d2", "setting=agentview_p4096-200",
+            f"task.num_points={N}", "task.num_group=64", "policy.link_remover.learn_density=false",
+            "policy.link_remover.fixed_removed=[link5,link6]"])
+    torch.manual_seed(123)
+    cwd = os.getcwd()
+    os.chdir(ROOT)
+    try:
+        pol = hydra.utils.instantiate(cfg.policy)
+    finally:
+        os.chdir(cwd)
+    pol.set_normalizer(make_normalizer(z))
+    pol = pol.to(DEV)
+    rem = pol.link_remover
+    c2r = rem.cell_to_region.cpu().numpy()
+    removed = [rem.region_names.index(n) for n in SPEC]
+    B = 8
+
+    seen = []
+    orig = pol._thin_obs
+    def rec(obs, cells, rho, **kw):
+        res = orig(obs, cells, rho, **kw)
+        seen.append((obs["point_cloud"][:, :pol.n_obs_steps].detach(), cells[:, :pol.n_obs_steps].detach(), rho.detach(), res))
+        return res
+    pol._thin_obs = rec
+
+    def audit():
+        """every recorded thinning: kept == every valid point not in link5 / link6, in order."""
+        ok, n_rm, n_frames = True, 0, 0
+        for P, Cc, rho, (tobs, (out, ln, n, k, filled)) in seen:
+            ok &= bool((filled == 0).all())
+            for b in range(P.shape[0]):
+                for f in range(P.shape[1]):
+                    cell = Cc[b, f].cpu().numpy()
+                    reg = np.where(cell >= 0, c2r[np.clip(cell, 0, None)], -1)
+                    keep = ~np.isin(reg, removed)
+                    m = int(ln[b, f])
+                    ok &= m == int(keep.sum()) and torch.equal(out[b, f, :m], P[b, f][torch.as_tensor(keep, device=DEV)])
+                    ok &= torch.equal(tobs["point_cloud"][b, f, :m], out[b, f, :m]) and int(tobs["point_cloud_len"][b, f]) == m
+                    n_rm += int((~keep).sum())
+                    n_frames += 1
+        return ok, n_rm, n_frames
+
+    # training: the controller sets the mode; a stale "sample" mode is ignored by compute_loss
+    ctl = RemoverController(pol, OmegaConf.create(dict(
+        lr=3e-3, phi_every=1, warmup_frac=0.2, finetune_frac=0.1, sigma_start=1.0, sigma_end=0.2,
+        diag_every=1, diag_batches=2, diag_masks=4)), num_epochs=10)
+    check("fixed: controller has no phi optimizer; phase 'fixed' in every epoch",
+          ctl.optimizer is None and all(ctl.phase_of(e) == "fixed" for e in range(10)))
+    pol.train()
+    phi_before = {k: v.detach().clone() for k, v in rem.state_dict().items()}
+    batch = make_batch(z, N, B=B, seed=31)
+    ctl.begin_batch(pol, 5, 0.0)
+    mode_ok = pol.remover_mode == "deterministic"
+    ctl.remember(batch, pol.n_obs_steps)
+    pol.remover_mode = "sample"
+    loss, ld = pol.compute_loss(batch)
+    loss.backward()
+    log = ctl.after_opt_step(pol, 4, contextlib_null)
+    ok_train, n_rm, nf = audit()
+    check("fixed: training clouds have exactly link5 + link6 removed, every other point kept, in order",
+          ok_train and n_rm > 0, f"{nf} frames, {n_rm} points removed")
+    grads = [n for n, p_ in pol.named_parameters() if n.startswith("link_remover.") and p_.grad is not None]
+    phi_after = rem.state_dict()
+    check("fixed: no phi parameter changes over a controller step (no grad, no phi step, no phi log)",
+          mode_ok and not grads and all(torch.equal(phi_before[k], phi_after[k]) for k in phi_before)
+          and log.get("remover_phase") == 3 and not any(k.startswith("remover_grad_") for k in log))
+    # eval: predict_action sees the same mask
+    seen.clear()
+    pol.eval()
+    with torch.no_grad():
+        act = pol.predict_action({k: v for k, v in make_batch(z, N, B=B, seed=32)["obs"].items() if k != "point_label"})
+    ok_eval, n_rm, nf = audit()
+    check("fixed: eval clouds (predict_action) have exactly link5 + link6 removed, every other point kept",
+          ok_eval and n_rm > 0 and act["action"].shape[0] == B, f"{nf} frames, {n_rm} points removed")
+    pol._thin_obs = orig
+    # diagnostics: mechanism only
+    out = ctl.end_epoch(pol, [make_batch(z, N, B=B, seed=33)], DEV, contextlib_null, 0, {})
+    tok = lambda r: out.get(f"mech/deterministic/tokens/{r}", float("nan"))
+    check("fixed: diagnostics = mechanism only (no held-out check, no diagnostic B); 0 tokens on link5 / link6",
+          any(k.startswith("mech/deterministic/") for k in out) and not any(k.startswith("mech/sampled/") for k in out)
+          and [k for k in out if k.startswith("remover_check/")] == ["remover_check/n_batches"]
+          and tok("link5") == 0.0 and tok("link6") == 0.0,
+          f"uncut link5/6 tokens {out.get('mech/none/tokens/link5', float('nan')):.1f}/{out.get('mech/none/tokens/link6', float('nan')):.1f}, "
+          f"nut cov {out.get('mech/none/coverage/nut', float('nan')):.2f} -> {out.get('mech/deterministic/coverage/nut', float('nan')):.2f}")
+    del pol
+    torch.cuda.empty_cache()
+
+
+def contextlib_null():
+    import contextlib
+    return contextlib.nullcontext()
 
 
 def encoder_check(clouds, lengths, bbox, N):
@@ -379,6 +660,22 @@ def make_batch(z, N, B, horizon=16, To=2, seed=0):
     return {"obs": {"point_cloud": t(pc), "agent_pos": t(state), "point_link": t(link, torch.long),
                     "point_label": t(plab, torch.int8)},
             "action": t(act)}
+
+
+def controller_step(pol, batch, z_unused=None):
+    """One real phi step through RemoverController (phase phi, opt_step % phi_every == 0)."""
+    import contextlib
+    from omegaconf import OmegaConf
+    from r3d.common.link_remover_training import RemoverController
+    ctl = RemoverController(pol, OmegaConf.create(dict(
+        lr=3e-3, phi_every=1, warmup_frac=0.1, finetune_frac=0.1, sigma_start=1.0, sigma_end=0.2,
+        diag_every=10, diag_batches=2, diag_masks=4)), num_epochs=10)
+    ctl.begin_batch(pol, 5, 0.0)
+    ctl.remember(batch, pol.n_obs_steps)
+    before = [p.detach().clone() for p in pol.link_remover.phi_parameters()]
+    log = ctl.after_opt_step(pol, 4, contextlib.nullcontext)
+    moved = any(not torch.equal(b, p.detach()) for b, p in zip(before, pol.link_remover.phi_parameters()))
+    return log, moved
 
 
 def policy_checks(z):
@@ -588,6 +885,159 @@ def policy_checks(z):
         diag_every=10, diag_batches=4, diag_masks=8)), num_epochs=10)
     ps = [p for g in ctl.optimizer.param_groups for p in g["params"]]
     check("gates only: the phi optimizer holds the gate logits only", len(ps) == 1 and ps[0] is rg.gate)
+
+    print("\n=== controller: finetune_mask ===")
+    from r3d.common.link_remover_training import RemoverController as RC
+    base_cfg = dict(lr=3e-3, phi_every=4, warmup_frac=0.2, finetune_frac=0.1, sigma_start=1.0, sigma_end=0.2,
+                    diag_every=10, diag_batches=4, diag_masks=8)
+    gate_before = rg.gate.detach().clone()
+    c_off = RC(pg, OmegaConf.create(base_cfg), num_epochs=10)
+    c_off.begin_batch(pg, 9, 0.0)
+    off_ok = torch.equal(rg.gate.detach(), gate_before) and pg.remover_mode == "deterministic"
+    c_on = RC(pg, OmegaConf.create(dict(base_cfg, finetune_mask=["link5", "link6", "link7"])), num_epochs=10)
+    c_on.begin_batch(pg, 5, 0.0)
+    phi_untouched = torch.equal(rg.gate.detach(), gate_before)
+    c_on.begin_batch(pg, 9, 0.0)
+    want = torch.tensor([0.0 if n in ("link5", "link6", "link7") else 1.0 for n in rg.region_names], device=rg.gate.device)
+    c_none = RC(pg, OmegaConf.create(dict(base_cfg, finetune_mask=[])), num_epochs=10)
+    on_ok = torch.equal(rg.rho(), want) and pg.remover_mode == "deterministic"
+    c_none.begin_batch(pg, 9, 0.0)
+    check("finetune_mask: null leaves the gates alone; a mask is set only on entering the fine-tune "
+          "(deterministic rho == that mask); [] keeps everything",
+          off_ok and phi_untouched and on_ok and bool((rg.rho() == 1).all()))
+    with torch.no_grad():
+        rg.gate.copy_(gate_before)
+
+    print("\n=== policy: decoupled theta exploration (theta_keep) ===")
+    del pg
+    torch.cuda.empty_cache()
+    pt = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+               {"enabled": True, "k_masks": 4, "learn_density": False, "init_keep": 0.95, "theta_keep": 0.5})
+    pt.train()
+    pt.remover_mode = "sample"
+    seen = []
+    orig = pt._thin_obs
+    pt._thin_obs = lambda obs, cells, rho, **kw: (seen.append(rho.detach().clone()), orig(obs, cells, rho, **kw))[1]
+    for i in range(6):
+        pt.compute_loss(make_batch(z, N, B=B, seed=20 + i))
+    pt._thin_obs = orig
+    frac = torch.cat(seen).gt(0).float().mean().item()
+    zt = pt.link_remover.sample(4000)
+    check("theta_keep 0.5: theta-pass gates open ~50% while phi's keep prob is 0.95",
+          abs(frac - 0.5) < 0.1 and abs(pt.link_remover.split(zt)[1].mean().item() - 0.95) < 0.02, f"theta open {frac:.2f}")
+
+    print("\n=== policy: density only + scene region ===")
+    del pt
+    torch.cuda.empty_cache()
+    ps_ = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+                {"enabled": True, "k_masks": 4, "learn_gates": False, "init_rho": 0.9,
+                 "region_groups": "default+scene", "snap_rho_below": 0.05})
+    ps_.train()
+    rem = ps_.link_remover
+    batch = make_batch(z, N, B=B, seed=1)
+    torch.manual_seed(3)
+    zd = rem.sample(B * 3).view(B, 3, -1)
+    zd[:, 1] = zd[:, 0]
+    starts = []
+    orig_ss = ps_._scene_start
+    def rec(cells, keep, u, lengths=None):
+        idx = orig_ss(cells, keep, u, lengths)
+        starts.append((cells, keep, idx))
+        return idx
+    ps_._scene_start = rec
+    sd = torch.randint(0, 2 ** 62, (B,))
+    r1 = ps_.crn_reward(batch, zd, sd)
+    ps_._scene_start = orig_ss
+    # the start as an index into the INPUT cloud, per mask
+    def input_idx(cells, keep, idx):
+        kk = keep.reshape(-1, keep.shape[-1])
+        return torch.stack([torch.nonzero(kk[i])[idx[i], 0] for i in range(kk.shape[0])])
+    phys = [input_idx(*t) for t in starts]
+    check("scene CRN: same mask twice -> reward difference exactly 0; the token-FPS start is the same "
+          "physical point in every mask", float((r1[:, 0] - r1[:, 1]).abs().max()) == 0.0
+          and all(torch.equal(phys[0], p) for p in phys[1:]) and not torch.equal(r1[:, 0], r1[:, 2]))
+    surr, stats = ps_.remover_loss(batch)
+    surr.backward()
+    grads = {n: p.grad for n, p in ps_.named_parameters() if p.grad is not None}
+    check("density only + scene: remover_loss gradient on mu only (incl. the scene), no gate effect",
+          sorted(grads) == ["link_remover.mu"] and float(grads["link_remover.mu"][rem.scene_region].abs()) > 0
+          and not any(k.startswith("remover_effect_gate/") for k in stats)
+          and "remover_reward_filled_frac" in stats)
+    mech = ps_.mechanism_check(batch, masks=("none", "deterministic"))
+    log, moved = controller_step(ps_, make_batch(z, N, B=B, seed=4))
+    check("density only + scene: a real controller phi step runs and moves mu", moved and "remover_grad_mu/scene" in log
+          and not any(k.startswith("remover_grad_gate/") for k in log))
+    check("density only + scene: mechanism_check runs; predict_action runs",
+          any(k.startswith("mech/deterministic/coverage/nut") for k in mech)
+          and ps_.predict_action({k: v for k, v in batch["obs"].items() if k != "point_label"})["action"].shape[0] == B)
+
+    print("\n=== policy: decoupled theta density (theta_rho, DObal) ===")
+    del ps_
+    torch.cuda.empty_cache()
+    pr = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+               {"enabled": True, "k_masks": 4, "learn_gates": False, "init_rho": 0.9,
+                "region_groups": "default+scene", "theta_rho": [0.1, 1.0]})
+    pr.train()
+    pr.remover_mode = "sample"
+    seen = []
+    orig = pr._thin_obs
+    pr._thin_obs = lambda obs, cells, rho, **kw: (seen.append(rho.detach().clone()), orig(obs, cells, rho, **kw))[1]
+    for i in range(6):
+        pr.compute_loss(make_batch(z, N, B=B, seed=40 + i))
+    pr.remover_mode = "deterministic"
+    pr.compute_loss(make_batch(z, N, B=B, seed=46))
+    pr._thin_obs = orig
+    th = torch.cat(seen[:-1])
+    phi_rho = pr.link_remover.rho(pr.link_remover.sample(4000))
+    sr = pr.link_remover.scene_region
+    check("theta_rho [0.1, 1]: theta-pass rho ~ U[0.1, 1] per region (mean ~0.55), phi's own draws stay at ~0.9; "
+          "fine-tune uses the deterministic rho",
+          float(th.min()) >= 0.1 and float(th.max()) <= 1.0 and abs(float(th.mean()) - 0.55) < 0.05
+          and float(th.std()) > 0.2 and abs(float(phi_rho.mean()) - 0.85) < 0.1
+          and torch.equal(seen[-1], pr.link_remover.rho()[None].expand(B, -1)),
+          f"theta mean {float(th.mean()):.3f} sd {float(th.std()):.3f}, phi mean {float(phi_rho.mean()):.3f}, "
+          f"scene min {float(th[:, sr].min()):.3f}")
+    try:
+        build("r3d.policy.dp3_link_remover.DP3LinkRemover", {"enabled": True, "theta_rho": [0.1, 1.0]})
+        check("theta_rho with learned gates raises", False)
+    except Exception as e:                       # hydra wraps it in an InstantiationException
+        check("theta_rho with learned gates raises", "theta_rho" in str(e), type(e).__name__)
+    del pr
+    torch.cuda.empty_cache()
+
+    print("\n=== policy: all_links (gates for link0..link4) ===")
+    pa = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+               {"enabled": True, "k_masks": 4, "learn_density": False, "init_keep": 0.5, "theta_keep": 0.5,
+                "region_groups": "all_links"})
+    pa.train()
+    torch.manual_seed(12)
+    la, _ = pa.compute_loss(make_batch(z, N, B=B, seed=50))
+    surr, stats = pa.remover_loss(make_batch(z, N, B=B, seed=51))
+    surr.backward()
+    g = pa.link_remover.gate.grad
+    check("all_links policy: theta pass + reward pass run; 13 gate logits get a gradient",
+          bool(torch.isfinite(la)) and g is not None and g.shape[0] == 13 and "remover_n_closed/link4" in stats)
+    del pa
+    torch.cuda.empty_cache()
+
+    print("\n=== policy: structured mix ===")
+    torch.cuda.empty_cache()
+    pm = build("r3d.policy.dp3_link_remover.DP3LinkRemover",
+               {"enabled": True, "k_masks": 4, "learn_density": False, "init_keep": 0.8, "mix_eps": 0.25,
+                "mix_masks": [[], ["link5", "link6", "link7"],
+                              ["link5", "link6", "link7", "hand_f1side", "hand_centre", "hand_f2side"], "all"]})
+    pm.train()
+    torch.manual_seed(11)
+    surr, stats = pm.remover_loss(make_batch(z, N, B=16, seed=2))
+    surr.backward()
+    grads = {n: p.grad for n, p in pm.named_parameters() if p.grad is not None}
+    names = pm.link_remover.mix_names
+    log, moved = controller_step(pm, make_batch(z, N, B=16, seed=5))
+    check("mix: a real controller phi step runs, moves the gates, logs the per-mask diagnostic",
+          moved and any(k.startswith("remover_mask_n/") for k in log))
+    check("mix: per-mask diagnostic logged; gradient on the gate logits only",
+          all(f"remover_mask_n/{n}" in stats for n in names) and any(k.startswith("remover_mask_effect/") for k in stats)
+          and sorted(grads) == ["link_remover.gate"], f"masks {names}, counts {[stats[f'remover_mask_n/{n}'] for n in names]}")
 
 
 if __name__ == "__main__":

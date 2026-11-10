@@ -41,6 +41,12 @@ leave-one-out baseline. The reward is the policy's own action-prediction error.
 | windows per φ step / `phi_every` | 128 / 4 | more windows = less noise. `phi_every` 2 doubles the updates (and the cost) |
 | `policy.link_remover.init_keep` | 0.8 | exploration of removal (each region removed in 20% of draws). 0.6–0.9 |
 | `policy.link_remover.init_rho` | 0.8 | starting density |
+| `policy.link_remover.learn_gates` | true | false = **density only**: every gate open, φ = μ |
+| `policy.link_remover.region_groups` | default | `default+scene` adds a label-free **scene** region (every point outside the robot cells: nut, peg, rest). Density only; floored at `scene_rho_min` (0.1) in every draw and at inference, never snapped. The CRN token-FPS start is then the scene's shared FPS start, which every mask keeps |
+| `policy.link_remover.theta_keep` | null | e.g. 0.5: the policy's training pass draws gates at this fixed keep probability (balanced, decoupled exploration); φ still learns from its own reward masks |
+| `policy.link_remover.mix_eps` / `mix_masks` | 0 / null | with probability ε a draw is one of S structured masks (lists of removed regions, or `all`): P(g) = (1−ε)∏Bern + ε/S·1[g ∈ masks]. Logs a per-mask advantage diagnostic. ε = 0 is bit-identical to the plain sampler |
+| `policy.link_remover.fixed_removed` | null | e.g. `[link5, link6]`: the SPECIALIST (round 3) -- a fixed mask, nothing learned (gates pinned at -/+gate_max, no phi optimizer, phase "fixed", theta always on the deterministic mask). Needs `learn_density: false` |
+| `policy.link_remover.theta_rho` | null | e.g. `[0.1, 1.0]`: density-only remover, the theta pass draws every region's rho ~ U[lo, hi] per window, independent of phi (the density counterpart of `theta_keep`; DObal, round 4) |
 | `policy.link_remover.learn_density` | true | false = **gates only**: ρ = g, so a kept region keeps every point and μ gets no gradient. First tuning step after sweep 1, where the density slopes were weak and ρ drifted to 0.6–0.75 |
 | `training.link_remover.warmup_frac` / `finetune_frac` | 0.2 / 0.1 | user: start with 20%, tune afterwards |
 | `sigma_start` / `sigma_end` | 1.0 / 0.2 | toy: ending at 0.5 learned no worse. Untested on the real task |
@@ -48,6 +54,10 @@ leave-one-out baseline. The reward is the policy's own action-prediction error.
 | `policy.link_remover.reward_t` | [20, 50, 80] | the encoder dominates the cost, so fewer t values save almost nothing |
 | `policy.link_remover.gate_max` / `mu_min` | 5 / −9 | lower `gate_max` means more exploration of closed regions |
 | `region_groups` | 8 regions | a finer hand (6 cells) or fingers prox/dist are possible without re-rendering |
+
+Inference-only: `scripts/sim/eval_mimicgen_ckpt.py --remover-removed none|link5,link6,...` evaluates a
+gates-only checkpoint with another mask than the learned one (output `<ckpt>_200ep_block1_mask-<removed>.json`,
+not read by the sweep analysis); `scripts/sim/run_mask_override_evals.sh` queues them.
 
 ## What to read after a run (`scripts/sim/analyze_remover_run.py`)
 
