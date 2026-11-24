@@ -1000,3 +1000,110 @@ object / arm sensitivity predicts the gain -- hanging_mug 1.0 (gain +15 / +10.5)
 full cloud 37.5 / arm-cut mask (link0-7) 41.5. Arm-cut mask vs uncut (37.5) 47 / 39 (p = 0.45), vs arm cut run (35.0)
 46 / 33 (p = 0.18), vs its own full cloud 26 / 18 (p = 0.29); full cloud vs uncut 37 / 37. As on Square / hanging_mug the
 dropout network does not depend on which mask it sees (all within noise); unlike them it is not better than uncut.
+
+**Token-dropout control (queued 2026-11-12, user).** Is the Square gain of robot-part dropout (DROP / FTcont / GObal,
+17-19.5 vs uncut 8.5) just "dropout", or does it need the structure? Standard ViT token dropout (PatchDropout, Liu et al.
+2023; Uni3D pretrains with 0.5): each training frame independently keeps a uniform random 48 of its 64 encoder tokens
+(p = 0.25), after the positional embedding, before the transformer; the head sees only the kept tokens and their centres;
+eval keeps all 64. Otherwise the uncut s42 recipe (plain DP3, 4096 / 64, 251 epochs, 64 x 2, 200 scenes); ckpt 250 only (user).
+Before this, `patch_dropout` was 0 in every config, and the inherited PatchDropout was broken for `pointsam`: it dropped
+tokens from x but not from the centres, so pc_pe would not have lined up with the tokens. Fixed: one index set gathers
+both (`Uni3DPointcloudEncoder.forward`; at p = 0 the path is unchanged). Note: every run already has UNIFORM POINT
+dropout (`random_point_dropout`, 0-80% of points per cloud, training only) and stochastic depth 0.2. Checks
+`scripts/sim/check_token_dropout.py` (10/10); chain `scripts/sim/run_token_dropout.sh`, run
+`mimicgen_sim-square_d2-p4096-g64-tokdrop25-42`, report `mimicgen/token_dropout/report.txt`.
+
+**Table-in-the-cloud eval (queued 2026-11-12, user: out of interest, not a test of the claim).** DROP s42 and uncut s42,
+250.ckpt, 200 scenes, cloud cropped by the workspace box only (`eval_mimicgen_ckpt.py --keep-table 0.02`: floor 2 cm
+below the table top, TABLE not filtered; normalizer = training box, table z clamped onto its floor, min -1.03). Measured
+first (`scripts/sim/table_cloud_check.py`, 10 eval resets): table 3630 / 4096 points and **53 / 64 tokens**; nut / peg
+11.3 / 9.9 -> 1.7 / 1.0 tokens, arm + gripper 41 -> 7. So it measures token starvation by background, not whether a
+policy ignores irrelevant content (agreed with the user). A fair version would APPEND table tokens to the unchanged 64.
+Chain `scripts/sim/run_table_eval.sh` (after the token-dropout chain), report `mimicgen/table_eval/report.txt`.
+
+**Threading 1024 / 64 (queued 2026-11-12, user).** Completes the point-count comparison: on Square and hanging_mug
+1024/64 uncut was the best plain policy; on Threading the arm cut did not help at 4096. If 1024 helps on Threading,
+sparser clouds and the cut are separate phenomena. Recipe = Threading 4096 uncut except `task.num_points=1024` (same
+zarr, seed 42, 251 epochs, 64 x 2, ckpt 250, 200 scenes). Chain `scripts/sim/run_thr_p1024.sh` (runs after the
+token-dropout and table-eval chains), report `mimicgen/threading/p1024_report.txt`.
+**Token-dropout RESULT (2026-11-12, 250.ckpt, 200 paired scenes): 8.0% (16/200)** -- vs uncut s42 8.5% 11 / 12 (p = 1.0);
+vs DROP s42 13.0% 13 / 23 (p = 0.13); vs DROP s43 17.0% 13 / 31 (p = 0.010); vs FTcont 18.5% 13 / 34 (p = 0.003); vs arm cut
+s42 20.0% 12 / 36 (p = 0.001). Classical uniform token dropout (p = 0.25) does not reproduce the robot-part-dropout gain;
+it sits exactly at uncut. Single seed; 0.5 not run (user: wait for this result first).
+
+**Claim sweep (queued 2026-11-12, user plan `mimicgen/claim_sweep/claim_sweep_plan.md`).** R1 uncut s43 / s44; R2 armsparse
+and R3 scenesparse s42 / s43 (new `task.thin_point_set: arm | non_arm`, `thin_prefix: 1024`, `r3d/common/prefix_thin.py`:
+the arm resp. everything else reduced to its points in the stored FPS-1024 prefix, same cut path as the arm cut); R4
+DROP-1024 s42 / s43; R5 DROP s44; E1 = uncut networks with the arm cut at inference only (`eval_mimicgen_ckpt.py
+--cut-labels 5`; hanging_mug uncut 600 with `--drop-point-labels 4,5`). Checks `scripts/sim/check_prefix_thin.py` (23 dataset
++ 5 eval-reset checks, all pass: option off bit-identical to HEAD; arm cells == label 5 on all 30646 frames; both rules ==
+the first 1024 points; live first-1024 == live FPS-1024 on all 200 eval resets; kept points min 1452 / 1455 train, 2767 /
+1986 eval). Mechanism (`scripts/sim/claim_sweep_mechanism.py`, 1533 frames) -- gate PASS:
+
+| cloud | points | arm tok / cov / patch cm | nut tok / cov / patch cm | peg tok / cov / patch cm |
+|---|---|---|---|---|
+| uncut 4096 | 4096 | 35.8 / 0.47 / 2.1 | 6.7 / 0.48 / 2.4 | 6.6 / 0.57 / 2.5 |
+| armsparse | 2289 | 34.6 / 0.99 / 4.4 | 6.8 / 0.50 / 2.3 | 6.8 / 0.58 / 2.5 |
+| scenesparse | 2831 | 37.0 / 0.49 / 2.1 | 6.6 / 1.00 / 4.5 | 6.3 / 1.00 / 4.4 |
+| 1024 | 1024 | 35.8 / 0.99 / 4.4 | 6.8 / 1.00 / 4.5 | 6.5 / 1.00 / 4.4 |
+
+Config diffs vs the reference runs (`claim_sweep/config_diffs.txt`): only seed / name / num_points / thin set /
+checkpoint_epochs, plus option keys added after the reference runs (all null). Chain `scripts/sim/run_claim_sweep.sh`
+(after the table-eval and Threading-1024 chains), report `scripts/sim/claim_sweep_report.py` -> `claim_sweep/report.md`.
+
+**Token-budget side runs (queued 2026-11-14, user).** Is 64 tokens a fair budget, and does the arm cut's gain survive
+more tokens? Square 4096, seed 42 only (second seed only if a result is too close to call), 250.ckpt, 200 scenes:
+128 uncut, 128 arm cut [5], 256 uncut. The claim is relative (cut vs uncut at the SAME budget): if 128 cut - 128 uncut
+~ 64 cut - 64 uncut, the effect transfers and 64 was a smaller budget to show the concept. 256 cut skipped (the cut
+cloud, ~1710 points, is fully covered at 128 x 32 already). Chain `scripts/sim/run_token_budget.sh` (after the claim
+sweep), queue + report `mimicgen/token_budget/`.
+
+**Queue restructured (2026-11-14, user).** Rule: one seed for side checks, two for main results. Dropped: uncut s44,
+armsparse / scenesparse s43, DROP-1024 s43, DROP s44, E1 s44. Remaining, one chain `scripts/sim/run_final_queue.sh`
+(log `mimicgen/final_queue.log`): scenesparse s42 (running) -> DROP-1024 s42 -> E1 uncut s43 -> claim report -> token
+block (`token_budget/queue.txt`: 4096/128 uncut, 4096/128 cut, 4096/256 uncut, then 2048/128 cut and 4096/256 cut,
+removable) -> `scripts/sim/token_budget_report.py`. Coverage grid measured on stored frames (`scripts/sim/coverage_grid.py`):
+token count barely moves Square success at fixed points (1024: 19.0 / 23.0 / 20.5; 2048: 14.0 / 15.5 / 16.5, although
+2048 nut coverage 0.84 -> 0.99), while uncut success follows object patch size (4.5 / ~3.3 / 2.5 cm -> ~21 / ~15 / ~8%)
+and every cut lands at ~17-20. Working reading (user + me): fine object patches + an arm the policy can rely on hurt;
+removing the arm or training with it unreliable restores the coarse-patch level (armsparse: coarsening the arm alone
+does little). The 4096/128 and /256 uncut runs test whether coverage matters at 4096 (0.48 -> 0.81 -> 0.99 at
+~2.4 cm patches); 4096/128 uncut has the coverage of 4096/64 cut.
+Added (user, 2026-11-14): **4096 / 64 tokens, group size k = 128** (`policy.pointcloud_encoder_cfg.group_size=128`) at the
+end of the token block: coverage 1.00 / 1.00, object patches 4.7 cm (= 1024's 4.5), arm patches 4.6 cm, arm tokens 35.8,
+at full 4096 density. Against 4096/256 (also full coverage, 2.3 cm patches) it separates coarseness from coverage.
+Hypothesis behind it (shortcut learning, not measured): with fine object patches the object signal (esp. nut yaw) must be
+assembled across tokens and is hard to learn, so the easy arm signal starves it; coarse patches make the object signal
+easy, cut / dropout remove the easy alternative.
+Queued last (user, 2026-11-14): **nut-yaw sensitivity** (`scripts/sim/sensitivity_yaw.py`, chain `run_yaw_sens.sh`, after
+the final queue): round-7 machinery, nut points rotated +-15 / +-45 deg about their centroid (and a 2 cm nut shift as a
+position reference); measure = change of the executed actions' goal rotation (deg) and position (mm), per phase.
+Prediction of the shortcut hypothesis: uncut 4096 / armsparse react less to the nut's yaw than cut / dropout / coarse-patch
+policies. `sensitivity_shortcut.build_obs` now also handles drop_point_links and prefix thinning (needed for cutL07-44,
+armsparse, scenesparse). Smoke test (stride 20, ~30 windows only, NOT a result): yaw 45 -> rot change uncut 2.9 deg,
+arm cut s44 4.8, FTcont 5.1, scenesparse 2.9.
+
+**DROP-1024 s42 (2026-11-14): 22.0% at 250** (= uncut 1024 23.0, 20 / 22, p = 0.88; the driver also evaluated 200.ckpt,
+27.5%, because MID_CKPTS="" falls back to the default list -- harmless). **Combined interpretation as of 2026-11-14:
+`docs/current_interpretation.md`** (facts, hypotheses, what each queued run decides, claim wording).
+
+**Density convergence + density specialist (user, launched 2026-11-19 15:35; chain `scripts/sim/run_density_long.sh`,
+outputs `R3D/data/outputs/sim/mimicgen/density_long/`).** DOscene (round 2, density only + scene region, NOT the
+decoupled DObal) never converged: over its last 75 phi epochs link5, link6, both fingers and the scene were still
+pushed sparser (density slope t +2.3 .. +3.2; scene 0.37 -> 0.25, finger1 0.67 -> 0.51), only link7 and the hand had
+no push left (|t| < 2). `scripts/sim/density_convergence.py` makes that the criterion: a region has converged when
+|density slope t| < 2 over the last 100 phi epochs, or it sits at a bound (scene floor 0.1, snapped 0). A rho-range
+test is NOT used: a no-signal region random-walks under Adam (~lr per phi step) and would never pass.
+- **DOlong** = DOscene, 4096 / 64, seed 42, with **init rho 0.5** (was 0.9) and a 3.4x longer phi phase: 651 epochs =
+  warm-up 50 | phi 601 | **no fine-tune** (user: 25 epochs at the end of the cosine LR do nothing; first launch with a
+  25-epoch fine-tune stopped after 2 epochs and restarted), only 650.ckpt saved (disk: 8.9 GB free at launch). Why 0.5: logit 0 is the
+  neutral middle of the bounded logit range, so the warm-up's sigma 1 draws span rho ~0.12-0.88 (scene ~500-3600 of
+  4096 points) and theta has seen sparse AND dense clouds before phi judges them; 0.9 put the scene's trek (to 0.25)
+  outside what theta had seen (the round-2 lesson: with a shared theta the start biases the answer, GO vs GOclosed);
+  a start near the known uncut optimum (~0.25) would bake in the answer.
+- **SPECrho** = the density specialist: DOlong's final deterministic rho as a FIXED table (`policy.link_remover.fixed_rho`,
+  new, checks in `check_link_remover.py` part 14), from scratch, standard budget (251 epochs, 64 x 2, seed 42),
+  ckpts 200 + 250, 200 paired scenes. The specialist question for density, as SPEC was for gates (SPEC 11.0 / 11.5).
+Disk (2026-11-19, user): deleted the 200.ckpt of 16 runs whose reported result is 250 (rm-DObal-42, rm-DROP-42/43,
+rm-GObal-42/43, rm-GObalAll-42, rm-SPEC-42/43, rm-SPEC06-42, cutL06-42/44, cutL07-44, frozen-42, threading p4096,
+p4096-cut5, rm-GObalAll-42) -> 41 GB free. Their 250.ckpts and all eval JSONs (200 and 250) are kept.

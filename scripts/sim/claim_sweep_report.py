@@ -1,0 +1,236 @@
+#!/usr/bin/env python
+"""Claim sweep report (plan section 6): tables + a verdict per claim by the agreed decision rules.
+
+    python scripts/sim/claim_sweep_report.py      # any python3; rerunnable with partial results
+
+Success at 250 on the 200 paired scenes (seed block 1), straight from the eval JSONs (hanging_mug: the eval logs,
+whose JSONs hold no per-scene rows). Missing cells are reported as missing.
+Terms: effect = mean gap >= 6 points AND pooled McNemar p < 0.05; not detected = |mean gap| < 5 and pooled
+p > 0.05; anything else inconclusive. Gap = b - a in points, averaged over the matched seeds; pooled McNemar =
+discordant pairs summed over the matched seeds, exact two-sided binomial.
+Writes R3D/data/outputs/sim/mimicgen/claim_sweep/report.md.
+"""
+
+import json
+import math
+import pathlib
+import re
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+S = ROOT / "R3D/data/outputs/sim"
+OUT = S / "mimicgen/claim_sweep"
+P = "mimicgen_sim-square_d2-p4096-g64"
+RM = "mimicgen_sim_remover-square_d2"
+STD = "eval/250_200ep_block1.json"
+CUT = "eval/250_200ep_block1_evalcut-5.json"
+
+# cell -> {seed label: (run dir, eval file)}
+CELLS = {
+    "uncut 4096": {42: (f"{P}-42", STD), 43: (f"{P}-43", STD), 44: (f"{P}-44", STD)},
+    "arm cut 4096": {42: (f"{P}-cut5-42", STD), 43: (f"{P}-cut5-43", STD), 44: (f"{P}-cutL07-44", STD)},
+    "DROP 4096 (s42 = DROP-42)": {42: (f"{RM}-p4096-g64-rm-DROP-42", STD), 43: (f"{RM}-p4096-g64-rm-DROP-43", STD),
+                                  44: (f"{RM}-p4096-g64-rm-DROP-44", STD)},
+    "DROP 4096 (s42 = FTcont)": {42: (f"{RM}-p4096-g64-rm-FTcont-42", STD), 43: (f"{RM}-p4096-g64-rm-DROP-43", STD),
+                                 44: (f"{RM}-p4096-g64-rm-DROP-44", STD)},
+    "armsparse": {42: (f"{P}-armsparse-42", STD), 43: (f"{P}-armsparse-43", STD)},
+    "scenesparse": {42: (f"{P}-scenesparse-42", STD), 43: (f"{P}-scenesparse-43", STD)},
+    "uncut 1024": {42: ("mimicgen_sim-square_d2-p1024-g64-42", STD), 43: ("mimicgen_sim-square_d2-p1024-g64-43", STD)},
+    "arm cut 1024": {42: ("mimicgen_sim-square_d2-p1024-g64-cut5-42", STD), 43: ("mimicgen_sim-square_d2-p1024-g64-cut5-43", STD)},
+    "DROP 1024": {42: (f"{RM}-p1024-g64-rm-DROP-42", STD), 43: (f"{RM}-p1024-g64-rm-DROP-43", STD)},
+    "uncut 4096, arm cut at inference (E1)": {42: (f"{P}-42", CUT), 43: (f"{P}-43", CUT), 44: (f"{P}-44", CUT)},
+    "uncut 4096 g128 (O1)": {42: ("mimicgen_sim-square_d2-p4096-g128-42", STD), 43: ("mimicgen_sim-square_d2-p4096-g128-43", STD)},
+}
+MUG = S / "robotwin2_sim-hanging_mug_labeled-p4096-g64-42"
+
+
+def load(cell, seed):
+    r, f = CELLS[cell].get(seed, (None, None))
+    p = S / r / f if r else None
+    if not p or not p.exists():
+        return None
+    d = json.load(open(p))
+    return {s["seed"]: bool(s["success"]) for s in d["scenes"]}
+
+
+def mug_log(name):
+    p = MUG / name
+    if not p.exists():
+        return None
+    r = {int(k): v == "SUCCESS" for k, v in re.findall(r"Episode (\d+)/200: ([A-Z]+)", p.read_text(errors="ignore"))}
+    return r if len(r) == 200 else None
+
+
+def rate(r):
+    return 100 * sum(r.values()) / len(r)
+
+
+def p_mcnemar(b, c):
+    n = b + c
+    return 1.0 if n == 0 else min(1.0, 2 * sum(math.comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n)
+
+
+def discord(a, b):
+    k = sorted(set(a) & set(b))
+    return sum(b[s] and not a[s] for s in k), sum(a[s] and not b[s] for s in k)   # (b only, a only)
+
+
+def compare(ca, cb, seeds):
+    """b vs a over matched seeds -> dict with per-seed and pooled numbers, or None if nothing matches."""
+    rows, gaps, B, A = [], [], 0, 0
+    for s in seeds:
+        a, b = load(ca, s), load(cb, s)
+        if a is None or b is None:
+            rows.append((s, None))
+            continue
+        bo, ao = discord(a, b)
+        B += bo; A += ao
+        gaps.append(rate(b) - rate(a))
+        rows.append((s, (rate(a), rate(b), bo, ao, p_mcnemar(bo, ao))))
+    if not gaps:
+        return None
+    return dict(rows=rows, gap=sum(gaps) / len(gaps), b_only=B, a_only=A, p=p_mcnemar(B, A), n_seeds=len(gaps),
+                complete=len(gaps) == len(seeds))
+
+
+def term(c, sign=+1):
+    """effect / not detected / inconclusive, for a gap expected in direction `sign`; negative effect named."""
+    if c is None:
+        return "missing"
+    g = c["gap"]
+    if abs(g) >= 6 and c["p"] < 0.05:
+        return "effect" if g * sign > 0 else "negative effect"
+    if abs(g) < 5 and c["p"] > 0.05:
+        return "not detected"
+    return "inconclusive"
+
+
+def fmt(c):
+    if c is None:
+        return "missing"
+    tail = "" if c["complete"] else f" (only {c['n_seeds']} seed{'s' if c['n_seeds'] > 1 else ''} in)"
+    return f"gap {c['gap']:+.1f}, pooled {c['b_only']} / {c['a_only']}, p = {c['p']:.3g}{tail}"
+
+
+def main():
+    L = ["# Claim sweep report", "",
+         "Square D2, 200 demos, 64 tokens, k = 32, 251 epochs, batch 64 x 2, checkpoint 250, 200 paired scenes "
+         "(seed block 1). Generated by `scripts/sim/claim_sweep_report.py` from the eval JSONs.", "",
+         "Terms: **effect** = mean gap >= 6 points AND pooled McNemar p < 0.05; **not detected** = |gap| < 5 and "
+         "pooled p > 0.05; anything else **inconclusive**. Gap = b - a (points), mean over matched seeds.", "",
+         "## Table 1: success at 250 per cell", "", "| cell | s42 | s43 | s44 | mean | range |", "|---|---|---|---|---|---|"]
+    for cell in CELLS:
+        v = {s: load(cell, s) for s in (42, 43, 44)}
+        got = [rate(r) for r in v.values() if r is not None]
+        if not got and "O1" in cell:
+            continue
+        cols = [("-" if s not in CELLS[cell] else ("missing" if v[s] is None else f"{rate(v[s]):.1f}")) for s in (42, 43, 44)]
+        mean = f"{sum(got) / len(got):.1f}" if got else "-"
+        rng = f"{min(got):.1f}-{max(got):.1f}" if len(got) > 1 else "-"
+        L.append(f"| {cell} | " + " | ".join(cols) + f" | {mean} | {rng} |")
+    mug_u, mug_c = mug_log("eval_600_200ep_seed1_shared.log"), mug_log("eval_600_200ep_seed1_shared_cut-45.log")
+    L += ["", f"hanging_mug uncut 600.ckpt (single training seed, shared list): full cloud "
+          f"{'missing' if mug_u is None else f'{rate(mug_u):.1f}'}, arms [4,5] cut at inference (E1) "
+          f"{'missing' if mug_c is None else f'{rate(mug_c):.1f}'}."]
+
+    comps = [  # (label, a, b, seeds, expected sign of b - a)
+        ("C1 / C2 removing: uncut vs arm cut", "uncut 4096", "arm cut 4096", (42, 43, 44), +1),
+        ("C2 randomising: uncut vs DROP (s42 = DROP-42)", "uncut 4096", "DROP 4096 (s42 = DROP-42)", (42, 43, 44), +1),
+        ("C2 randomising: uncut vs DROP (s42 = FTcont)", "uncut 4096", "DROP 4096 (s42 = FTcont)", (42, 43, 44), +1),
+        ("C2 coarsening: uncut vs armsparse", "uncut 4096", "armsparse", (42, 43), +1),
+        ("C4 side: uncut vs scenesparse", "uncut 4096", "scenesparse", (42, 43), +1),
+        ("armsparse vs arm cut", "armsparse", "arm cut 4096", (42, 43), +1),
+        ("scenesparse vs arm cut", "scenesparse", "arm cut 4096", (42, 43), +1),
+        ("armsparse vs uncut 1024", "armsparse", "uncut 1024", (42, 43), +1),
+        ("scenesparse vs uncut 1024", "scenesparse", "uncut 1024", (42, 43), +1),
+        ("C3: uncut network, uncut cloud vs arm cut at inference", "uncut 4096", "uncut 4096, arm cut at inference (E1)", (42, 43, 44), +1),
+        ("C5: uncut 1024 vs DROP 1024", "uncut 1024", "DROP 1024", (42, 43), +1),
+        ("C5 (existing): uncut 1024 vs arm cut 1024", "uncut 1024", "arm cut 1024", (42, 43), +1),
+        ("C4 (O1): uncut g64 vs g128 at 4096", "uncut 4096", "uncut 4096 g128 (O1)", (42, 43), +1),
+    ]
+    C = {}
+    L += ["", "## Table 2: paired McNemar (b only / a only, p), per seed and pooled", "",
+          "| comparison (a vs b) | s42 | s43 | s44 | pooled | mean gap | term |", "|---|---|---|---|---|---|---|"]
+    for label, a, b, seeds, sign in comps:
+        c = compare(a, b, seeds)
+        C[label] = c
+        if c is None and "O1" in label:
+            continue
+        cells = []
+        for s in (42, 43, 44):
+            r = dict(c["rows"]).get(s, "n/a") if c else ("missing" if s in seeds else "n/a")
+            if s not in seeds:
+                cells.append("-")
+            elif r is None or r == "missing":
+                cells.append("missing")
+            else:
+                cells.append(f"{r[0]:.1f} -> {r[1]:.1f}: {r[2]} / {r[3]}, p = {r[4]:.3g}")
+        pooled = "missing" if c is None else f"{c['b_only']} / {c['a_only']}, p = {c['p']:.3g}"
+        gap = "-" if c is None else f"{c['gap']:+.1f}"
+        L.append(f"| {label} | " + " | ".join(cells) + f" | {pooled} | {gap} | {term(c, sign)} |")
+    if mug_u is not None and mug_c is not None:
+        bo, ao = discord(mug_u, mug_c)
+        L.append(f"| C3 hanging_mug: uncut network, full cloud vs arms cut at inference | {rate(mug_u):.1f} -> "
+                 f"{rate(mug_c):.1f}: {bo} / {ao}, p = {p_mcnemar(bo, ao):.3g} | - | - | single seed | "
+                 f"{rate(mug_c) - rate(mug_u):+.1f} | "
+                 f"{term(dict(gap=rate(mug_c) - rate(mug_u), p=p_mcnemar(bo, ao)))} |")
+
+    mech = OUT / "mechanism.md"
+    L += ["", "## Table 3: mechanism (stored training frames, before training)", ""]
+    L += mech.read_text().splitlines()[2:] if mech.exists() else ["missing (run scripts/sim/claim_sweep_mechanism.py)"]
+
+    t = lambda k, s=+1: term(C[k], s)
+    v = []
+    c1 = t("C1 / C2 removing: uncut vs arm cut")
+    v.append(("C1", fmt(C["C1 / C2 removing: uncut vs arm cut"]),
+              "stands" if c1 == "effect" else f"{c1}: Square does not carry C1 at the stated size; hanging_mug "
+              "(45.0 vs 60.0) carries it alone"))
+    v.append(("C2 removing", "as C1: " + fmt(C["C1 / C2 removing: uncut vs arm cut"]), "stands" if c1 == "effect" else c1))
+    for k in ("C2 randomising: uncut vs DROP (s42 = DROP-42)", "C2 randomising: uncut vs DROP (s42 = FTcont)"):
+        v.append(("C2 randomising" + (" [DROP-42]" if "DROP-42" in k else " [FTcont]"), fmt(C[k]),
+                  "stands" if t(k) == "effect" else t(k)))
+    a_t, s_t = t("C2 coarsening: uncut vs armsparse"), t("C4 side: uncut vs scenesparse")
+    v.append(("C2 coarsening", fmt(C["C2 coarsening: uncut vs armsparse"]),
+              {"effect": "stands", "not detected": "remove 'coarsening' from C2"}.get(a_t, a_t)))
+    matrix = {("effect", "not detected"): "the arm's fine detail is the cause; C2 as written, C4 stays 'may contribute'",
+              ("not detected", "effect"): "the 1024 gain is object coverage, not arm coarsening: C2 loses 'coarsening', "
+                                          "C4 becomes a main statement",
+              ("effect", "effect"): "either change is enough; both statements hold",
+              ("not detected", "not detected"): "only coarsening everything works (interaction); 1024 stays an "
+                                                "observation, C2 loses 'coarsening'"}
+    v.append(("C2 vs C4 (A / S)", f"A: {a_t}; S: {s_t} ({fmt(C['C4 side: uncut vs scenesparse'])})",
+              matrix.get((a_t, s_t), "inconclusive cell of the matrix: report as inconclusive")))
+    c3 = t("C3: uncut network, uncut cloud vs arm cut at inference")
+    v.append(("C3", fmt(C["C3: uncut network, uncut cloud vs arm cut at inference"]),
+              "C3 is wrong" if c3 == "effect" else ("stands (with the existing dropout-network result)"
+                                                    if c3 in ("not detected", "negative effect") else c3)))
+    c5 = t("C5: uncut 1024 vs DROP 1024")
+    v.append(("C5", fmt(C["C5: uncut 1024 vs DROP 1024"]),
+              {"not detected": "stands", "effect": "'neither helps' is wrong for dropout",
+               "negative effect": "'dropout can hurt at full coverage'"}.get(c5, c5)))
+    if C.get("C4 (O1): uncut g64 vs g128 at 4096"):
+        c4 = t("C4 (O1): uncut g64 vs g128 at 4096")
+        smaller = C["C4 (O1): uncut g64 vs g128 at 4096"]["gap"] < (C["C1 / C2 removing: uncut vs arm cut"] or {"gap": 0})["gap"]
+        v.append(("C4", fmt(C["C4 (O1): uncut g64 vs g128 at 4096"]),
+                  "stands as written" if c4 == "effect" and smaller else "keep 'may contribute'"))
+    else:
+        v.append(("C4", "O1 not run", "keep 'may contribute'"))
+    L += ["", "## Verdicts (decision rules of the plan, section 6)", "", "| claim | numbers | verdict |", "|---|---|---|"]
+    L += [f"| {a} | {b} | {('PROVISIONAL (seeds missing): ' + c) if 'only' in b or 'missing' in b else c} |"
+          for a, b, c in v]
+
+    def closed(x, lo, hi):
+        cx, cl, ch = (compare(lo, x, (42, 43)), compare(lo, hi, (42, 43)), None)
+        if cx is None or cl is None or abs(cl["gap"]) < 1e-9:
+            return "missing"
+        return f"{100 * cx['gap'] / cl['gap']:.0f}%"
+    L += ["", "Share of the uncut -> reference gap closed (seeds 42-43, mean gaps):", "",
+          "| run | of uncut -> arm cut | of uncut -> uncut 1024 |", "|---|---|---|"]
+    for x in ("armsparse", "scenesparse"):
+        L.append(f"| {x} | {closed(x, 'uncut 4096', 'arm cut 4096')} | {closed(x, 'uncut 4096', 'uncut 1024')} |")
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "report.md").write_text("\n".join(L) + "\n")
+    print("\n".join(L))
+
+
+if __name__ == "__main__":
+    main()

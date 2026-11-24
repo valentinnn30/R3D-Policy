@@ -208,11 +208,14 @@ class CloudBuilder:
     """Holds the camera geometry; `build(obs)` turns one robosuite observation
     (rendered with camera_depths=True, camera_segmentations='element') into a cloud."""
 
-    def __init__(self, sim, camera, height, width, bbox, num_points, lut):
+    def __init__(self, sim, camera, height, width, bbox, num_points, lut, drop_classes=(TABLE, BACKGROUND)):
         from robosuite.utils import camera_utils as CU
         self.sim, self.camera, self.H, self.W = sim, camera, height, width
         self.bbox = np.asarray(bbox, dtype=np.float64)
         self.num_points, self.lut = num_points, lut
+        # classes removed after the box; the default is every training cloud. (BACKGROUND,) alone
+        # keeps the table: the eval-only `--keep-table` test (eval_mimicgen_ckpt.py)
+        self.drop_classes = tuple(drop_classes)
         K = CU.get_camera_intrinsic_matrix(sim, camera, height, width)
         v, u = np.mgrid[0:height, 0:width]
         self._ray = np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u, float)], -1).reshape(-1, 3)
@@ -237,7 +240,7 @@ class CloudBuilder:
         # are silhouette pixels with foreground depth and background label (measured
         # on Square D2: 97-100% of them sit on a > 2 cm depth jump, vs 5-14% for real
         # surfaces). A depth-edge filter would also cost the thin peg 14% of its points.
-        keep &= ~np.isin(self.lut[seg], (TABLE, BACKGROUND))
+        keep &= ~np.isin(self.lut[seg], self.drop_classes)
         pts = np.concatenate([pw[keep], rgb[keep]], 1).astype(np.float32)
         lab = self.lut[seg[keep]]
         cell = None if cells is None else cells(pw[keep], seg[keep])

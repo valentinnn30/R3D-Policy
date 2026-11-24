@@ -30,6 +30,9 @@ Policy checks (DP3LinkRemover, N = 1024, 64 tokens; skip with --no-policy):
     clouds have exactly link5 + link6 removed and every other point kept, in order; no phi
     parameter changes over a controller step; the controller has no phi optimizer, phase
     "fixed", and its diagnostics are the mechanism only
+ 14 density specialist (fixed_rho, default+scene): rho / draws == the table exactly, nothing
+    learnable, contract violations raise; the training and eval clouds keep exactly
+    round(rho_l * n_l) points of every region (snapped regions 0), the controller is "fixed"
 """
 
 import math
@@ -315,10 +318,12 @@ def main():
 
     round2_module_checks(z)
     fixed_module_checks()
+    fixed_rho_module_checks()
     all_links_checks(z)
     if "--no-policy" not in sys.argv:
         policy_checks(z)
         fixed_policy_checks(z)
+        fixed_rho_policy_checks(z)
 
     print(f"\n{'ALL CHECKS PASSED' if not FAILS else 'FAILED: ' + ', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
@@ -465,6 +470,129 @@ def fixed_module_checks():
     check("fixed_removed=None: parameters and draws identical to the plain remover",
           torch.equal(da, db) and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
           and a.phi_parameters() == [a.gate])
+
+
+FIXED_RHO = {"link5": 0.6, "link6": 0.03, "link7": 0.9, "hand_f1side": 0.8, "hand_centre": 0.85,
+             "hand_f2side": 0.75, "finger1": 0.5, "finger2": 1.0, "scene": 0.25}   # link6 below the snap
+
+
+def fixed_rho_module_checks():
+    print("\n=== fixed densities (density specialist) ===")
+    groups = RP.default_region_groups() + [{"name": "scene", "cells": [NON_ROBOT]}]
+    kw = dict(learn_gates=False, snap_rho_below=0.05)
+    rf = LinkRemover(RP.CELL_NAMES, groups, fixed_rho=FIXED_RHO, **kw)
+    table = torch.tensor([FIXED_RHO[n] for n in rf.region_names])
+    det = torch.where(table < 0.05, torch.zeros_like(table), table)
+    d = rf.sample(300)
+    check("fixed_rho: density() == table, deterministic rho == table snapped (< 0.05 -> 0), every draw == table",
+          torch.equal(rf.density(), table) and torch.equal(rf.rho(), det)
+          and torch.equal(rf.rho(d), table.expand(300, -1)) and bool((rf.split(d)[1] == 1).all()))
+    check("fixed_rho: nothing learnable (mu frozen, phi_parameters() empty, is_fixed)",
+          not rf.mu.requires_grad and not rf.gate.requires_grad and rf.phi_parameters() == [] and rf.is_fixed)
+    rl = LinkRemover(RP.CELL_NAMES, groups, fixed_rho=list(table.tolist()), **kw)
+    check("fixed_rho: a list in region order == the dict", torch.equal(rl.rho(), rf.rho()))
+    bad_scene = dict(FIXED_RHO, scene=0.05)
+    cases = {
+        "learned gates": lambda: LinkRemover(RP.CELL_NAMES, RP.default_region_groups(), fixed_rho={k: v for k, v in FIXED_RHO.items() if k != "scene"}),
+        "unknown region": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_rho=dict(FIXED_RHO, link9=0.5), **kw),
+        "missing region": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_rho={k: v for k, v in FIXED_RHO.items() if k != "link5"}, **kw),
+        "rho outside [0, 1]": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_rho=dict(FIXED_RHO, link5=1.2), **kw),
+        "scene below scene_rho_min": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_rho=bad_scene, **kw),
+        "wrong list length": lambda: LinkRemover(RP.CELL_NAMES, groups, fixed_rho=[0.5] * 3, **kw),
+        "log_prob of a fixed remover": lambda: rf.log_prob(d),
+    }
+    for nm, fn in cases.items():
+        try:
+            fn()
+            check(f"fixed_rho: raises on {nm}", False)
+        except (ValueError, RuntimeError, KeyError) as e:
+            check(f"fixed_rho: raises on {nm}", True, type(e).__name__)
+    torch.manual_seed(5)
+    a = LinkRemover(RP.CELL_NAMES, groups, learn_gates=False, init_rho=0.5)
+    da = a.sample(300)
+    torch.manual_seed(5)
+    b = LinkRemover(RP.CELL_NAMES, groups, learn_gates=False, init_rho=0.5, fixed_rho=None)
+    db = b.sample(300)
+    check("fixed_rho=None: parameters and draws identical to the plain density remover",
+          torch.equal(da, db) and all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
+          and a.phi_parameters() == [a.mu] and not a.is_fixed)
+
+
+def fixed_rho_policy_checks(z):
+    """The density specialist policy on real windows: every training and eval cloud keeps
+    exactly round(rho * n) points per region (the table, snapped), no fill, nothing learned."""
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from r3d.common.link_remover_training import RemoverController
+    print("\n=== policy: density specialist (fixed_rho) ===")
+    N = 4096
+    tbl = ",".join(f"{k}:{v}" for k, v in FIXED_RHO.items())
+    with initialize_config_dir(config_dir=str(ROOT / "R3D" / "r3d" / "config"), version_base=None):
+        cfg = compose(config_name="r3d_robotwin2_remover", overrides=[
+            "task=mimicgen_sim_remover", "task_name=square_d2", "setting=agentview_p4096-200",
+            f"task.num_points={N}", "task.num_group=64", "policy.link_remover.learn_gates=false",
+            "policy.link_remover.region_groups=default+scene", f"policy.link_remover.fixed_rho={{{tbl}}}"])
+    torch.manual_seed(321)
+    cwd = os.getcwd()
+    os.chdir(ROOT)
+    try:
+        pol = hydra.utils.instantiate(cfg.policy)
+    finally:
+        os.chdir(cwd)
+    pol.set_normalizer(make_normalizer(z))
+    pol = pol.to(DEV)
+    rem = pol.link_remover
+    want = rem.rho().to(DEV)
+    check("fixed_rho policy: hydra dict override -> deterministic rho == the table snapped",
+          torch.allclose(want.cpu(), torch.tensor([0.0 if FIXED_RHO[n] < 0.05 else FIXED_RHO[n] for n in rem.region_names])),
+          " ".join(f"{n} {v:.2f}" for n, v in zip(rem.region_names, want.tolist())))
+    seen = []
+    orig = pol._thin_obs
+    def rec(obs, cells, rho, **kw):
+        res = orig(obs, cells, rho, **kw)
+        seen.append((rho.detach(), res))
+        return res
+    pol._thin_obs = rec
+
+    def audit():
+        ok, nf = True, 0
+        for rho, (tobs, (out, ln, n, k, filled)) in seen:
+            exp = torch.floor(want.double()[None, None] * n + 0.5).long().clamp(max=n)
+            ok &= bool((rho == want[None]).all()) and torch.equal(k, exp) and bool((filled == 0).all())
+            nf += n.shape[0] * n.shape[1]
+        return ok, nf
+
+    ctl = RemoverController(pol, OmegaConf.create(dict(
+        lr=3e-3, phi_every=1, warmup_frac=0.2, finetune_frac=0.1, sigma_start=1.0, sigma_end=0.2,
+        diag_every=1, diag_batches=2, diag_masks=4)), num_epochs=10)
+    check("fixed_rho: controller has no phi optimizer; phase 'fixed' in every epoch",
+          ctl.optimizer is None and all(ctl.phase_of(e) == "fixed" for e in range(10)))
+    pol.train()
+    phi_before = {k: v.detach().clone() for k, v in rem.state_dict().items()}
+    B = 8
+    batch = make_batch(z, N, B=B, seed=41)
+    ctl.begin_batch(pol, 5, 0.0)
+    ctl.remember(batch, pol.n_obs_steps)
+    pol.remover_mode = "sample"                 # stale mode: must be ignored
+    loss, ld = pol.compute_loss(batch)
+    loss.backward()
+    log = ctl.after_opt_step(pol, 4, contextlib_null)
+    ok_train, nf = audit()
+    grads = [n for n, p_ in pol.named_parameters() if n.startswith("link_remover.") and p_.grad is not None]
+    check("fixed_rho: training clouds keep round(rho * n) per region (table), no fill; phi unchanged, no phi step",
+          ok_train and not grads and all(torch.equal(phi_before[k], rem.state_dict()[k]) for k in phi_before)
+          and log.get("remover_phase") == 3, f"{nf} frames")
+    seen.clear()
+    pol.eval()
+    with torch.no_grad():
+        act = pol.predict_action({k: v for k, v in make_batch(z, N, B=B, seed=42)["obs"].items() if k != "point_label"})
+    ok_eval, nf = audit()
+    check("fixed_rho: eval clouds (predict_action) keep round(rho * n) per region", ok_eval and act["action"].shape[0] == B,
+          f"{nf} frames")
+    pol._thin_obs = orig
+    del pol
+    torch.cuda.empty_cache()
 
 
 def all_links_checks(z):

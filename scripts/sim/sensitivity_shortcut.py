@@ -145,9 +145,23 @@ def build_obs(policy, cfg, pc, W, idx, move_frozen=None):
         raise ValueError(f"policy wants {N} points, stored {p.shape[2]}")
     W = {**W, "label": W["label"][:, :, :N], "link": W["link"][:, :, :N]}
     p = p[:, :, :N]
-    if drop:
-        cut = [[cut_points_by_label(p[b, t], W["label"][idx][b, t], list(drop)) for t in range(p.shape[1])]
-               for b in range(len(p))]
+    links = cfg.task.get("drop_point_links", None)
+    thin = cfg.task.get("thin_point_set", None)
+    if sum(map(bool, (drop, links, thin))) > 1:
+        raise ValueError("more than one of drop_point_labels / drop_point_links / thin_point_set")
+    if drop or links or thin:
+        # 2026-11-14 (yaw test): drop_point_links (keyed on the link cell) and prefix thinning (stored index; the
+        # perturbations move points in place, so the stored order is intact) as in training / eval
+        if links:
+            from r3d.common.robosuite_pcd import CELL_NAMES
+            ids = [CELL_NAMES.index(str(c)) for c in links]
+            fn = lambda b, t: cut_points_by_label(p[b, t], W["link"][idx][b, t], ids)
+        elif thin:
+            from r3d.common.prefix_thin import thin_cloud
+            fn = lambda b, t: thin_cloud(p[b, t], W["link"][idx][b, t], thin, int(cfg.task.thin_prefix))
+        else:
+            fn = lambda b, t: cut_points_by_label(p[b, t], W["label"][idx][b, t], list(drop))
+        cut = [[fn(b, t) for t in range(p.shape[1])] for b in range(len(p))]
         p = np.stack([[c[0] for c in row] for row in cut])
         obs["point_cloud_len"] = torch.tensor([[c[1] for c in row] for row in cut], dtype=torch.int64)
     obs["point_cloud"] = torch.from_numpy(np.ascontiguousarray(p))

@@ -108,7 +108,8 @@ def baselines(N, seed, run=None):
 
 
 def is_fixed(cfg):
-    return (cfg["policy"].get("link_remover") or {}).get("fixed_removed") is not None
+    lr = cfg["policy"].get("link_remover") or {}
+    return lr.get("fixed_removed") is not None or lr.get("fixed_rho") is not None
 
 
 def shade(ax, cfg, x_max):
@@ -150,7 +151,8 @@ def analyze(run):
     cmap10 = plt.get_cmap("tab10")
     cmap = lambda i: cmap10(i) if len(regions) + 4 <= 10 else plt.get_cmap("tab20")(i % 20)
     xs = [r["epoch_frac"] for r in phi]
-    summary = {"run": run, "N": N, "seed": seed, "fixed_removed": cfg["policy"]["link_remover"].get("fixed_removed"), "regions": regions, "phi_steps": len(phi), "epochs_logged": len(ep)}
+    summary = {"run": run, "N": N, "seed": seed, "fixed_removed": cfg["policy"]["link_remover"].get("fixed_removed"),
+               "fixed_rho": cfg["policy"]["link_remover"].get("fixed_rho"), "regions": regions, "phi_steps": len(phi), "epochs_logged": len(ep)}
 
     # ---- phi trajectories ---------------------------------------------------------------
     fig, axs = plt.subplots(1, 3, figsize=(20, 5), sharex=True)
@@ -353,7 +355,8 @@ def analyze(run):
     fe = lambda x: "-" if x is None or x != x else f"{x:+.2e}"
     L = [f"# Learned link remover: {os.path.basename(run)}", "",
          f"N = {N}, 64 tokens, seed {seed}; {len(phi)} phi steps, {len(ep)} epochs logged."
-         + (f" SPECIALIST: fixed mask, removed {summary['fixed_removed']}, nothing learned." if summary["fixed_removed"] is not None else ""), "",
+         + (f" SPECIALIST: fixed mask, removed {summary['fixed_removed']}, nothing learned." if summary["fixed_removed"] is not None else "")
+         + (" DENSITY SPECIALIST: fixed densities (table below), nothing learned." if summary.get("fixed_rho") is not None else ""), "",
          "## Final phi (deterministic = what evaluation uses)", "",
          "| region | keep prob | gate open | density rho | deterministic rho |", "|---|---|---|---|---|"]
     for nm, v in ep[-1]["phi"].items():

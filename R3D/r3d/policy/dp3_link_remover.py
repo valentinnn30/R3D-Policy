@@ -38,6 +38,8 @@ trains on exactly the clouds evaluation will show it).
 `link_remover.fixed_removed` (round 3 SPECIALIST, default null): a fixed mask, nothing
 learned -- the listed regions removed, the rest kept whole. The theta pass always uses the
 deterministic mask (remover_mode is ignored), so training and evaluation see the same clouds.
+`link_remover.fixed_rho` (density specialist, 2026-11-19): the same with fixed per-region
+DENSITIES ({region: rho}, density-only remover) -- e.g. the final rho of a learned run.
 
 `link_remover.theta_rho: [lo, hi]` (DObal, round 4, default null): the density counterpart of
 `theta_keep` for a density-only remover. The theta pass draws every region's density from
@@ -81,7 +83,8 @@ class DP3LinkRemover(DP3):
             gate_max=cfg.get("gate_max", 5.0), snap_rho_below=cfg.get("snap_rho_below", None),
             learn_density=cfg.get("learn_density", True), learn_gates=cfg.get("learn_gates", True),
             scene_rho_min=cfg.get("scene_rho_min", 0.1), mix_eps=cfg.get("mix_eps", 0.0),
-            mix_masks=cfg.get("mix_masks", None), fixed_removed=cfg.get("fixed_removed", None))
+            mix_masks=cfg.get("mix_masks", None), fixed_removed=cfg.get("fixed_removed", None),
+            fixed_rho=cfg.get("fixed_rho", None))
         # theta pass gates drawn at this fixed keep probability instead of phi's (decoupled
         # exploration); the reward pass still samples from phi. None = phi's own draws.
         tk = cfg.get("theta_keep", None)
@@ -95,9 +98,9 @@ class DP3LinkRemover(DP3):
                 raise ValueError("theta_rho [lo, hi] needs 0 <= lo < hi <= 1 and a density-only remover")
             tr = (lo, hi)
         self.theta_rho = tr
-        self.fixed_mask = self.link_remover.fixed_removed is not None
-        if self.fixed_mask and self.theta_keep is not None:
-            raise ValueError("fixed_removed: theta_keep has no meaning (the mask is fixed)")
+        self.fixed_mask = self.link_remover.is_fixed      # fixed_removed or fixed_rho
+        if self.fixed_mask and (self.theta_keep is not None or self.theta_rho is not None):
+            raise ValueError("fixed specialist: theta_keep / theta_rho have no meaning (nothing is drawn)")
         self.fill_to_min_keep = bool(cfg.get("fill_to_min_keep", True))
         self.reward_t = [int(t) for t in cfg.get("reward_t", [20, 50, 80])]
         self.k_masks = int(cfg.get("k_masks", 2))

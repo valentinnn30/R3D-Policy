@@ -112,6 +112,10 @@ def run_scenes(args):
         cut_cells = override_mask(policy, a.remover_removed)
     zattrs = dict(zarr.open(str(ROOT / cfg.task.dataset.zarr_path), "r")["meta"].attrs)
     task, N = zattrs["task"], int(cfg.task.num_points)
+    if a.num_points:      # inference-only density override: the first N points of the FPS-ordered cloud
+        N = int(a.num_points)
+    if a.group_size:      # inference-only patch size override (points per token)
+        policy.obs_encoder.extractor.patch_embed.grouper.group_size = int(a.group_size)
     drop = cfg.task.get("drop_point_labels", None)
     drop_links = cfg.task.get("drop_point_links", None)
     if drop_links:   # the label cut keyed on the live link cell (as data/point_link in training)
@@ -120,6 +124,18 @@ def run_scenes(args):
         drop_links = [RP.CELL_NAMES.index(str(c)) for c in drop_links]
     n_obs = int(cfg.n_obs_steps)
     remover = getattr(policy, "link_remover", None) is not None
+    thin = cfg.task.get("thin_point_set", None)   # claim sweep R2 / R3: prefix thinning, as in training
+    if thin:
+        from r3d.common.prefix_thin import arm_cell_ids, check_spec, thin_cloud
+        thin_prefix = int(cfg.task.thin_prefix)
+        check_spec(thin, thin_prefix, N)
+        arm_ids = arm_cell_ids()
+        if drop or drop_links or remover:
+            raise ValueError("thin_point_set with drop_point_labels / drop_point_links / a link remover")
+    if a.cut_labels:   # claim sweep E1: a cut at INFERENCE only, on a checkpoint trained without one
+        if drop or drop_links or remover or thin or cfg.task.get("freeze_robot_labels", None):
+            raise ValueError("--cut-labels needs a checkpoint trained on the plain cloud (no cut / remover / thin / freeze)")
+        drop = [int(c) for c in a.cut_labels.split(",")]
     freeze = cfg.task.get("freeze_robot_labels", None)
     if freeze:
         freeze = [int(c) for c in freeze]
@@ -156,8 +172,18 @@ def run_scenes(args):
         if not np.allclose(bbox, zattrs["pcd_crop_bbox"]):
             raise RuntimeError(f"crop box {bbox} != training {zattrs['pcd_crop_bbox']}")
         lut = RP.geom_label_lut(env.sim, env_args["env_name"])
-        cb = RP.CloudBuilder(env.sim, cam, res, res, bbox, N, lut)
-        cells = RP.LinkCells(env.sim) if remover or drop_links else None
+        drop_classes = (RP.TABLE, RP.BACKGROUND)
+        if a.keep_table is not None:   # workspace crop only: floor below the table top, table not filtered
+            bbox = [[bbox[0][0], bbox[0][1], bbox[0][2] - 0.003 - a.keep_table], list(bbox[1])]
+            drop_classes = (RP.BACKGROUND,)
+        cb = RP.CloudBuilder(env.sim, cam, res, res, bbox, N, lut, drop_classes=drop_classes)
+        cells = RP.LinkCells(env.sim) if remover or drop_links or thin else None
+        if thin:   # the prefix property the 2 x 2 corners rest on: first thin_prefix points == the FPS-prefix cloud
+            pre, pre_lab, _ = RP.CloudBuilder(env.sim, cam, res, res, bbox, thin_prefix, lut,
+                                              drop_classes=drop_classes).build(obs)
+            full, full_lab, _ = cb.build(obs)
+            if not (np.array_equal(full[:thin_prefix], pre) and np.array_equal(full_lab[:thin_prefix], pre_lab)):
+                raise RuntimeError(f"scene {seed}: first {thin_prefix} of the {N}-point cloud != the FPS-{thin_prefix} cloud")
         layout = _layout(env, task)
         if freeze:   # the rollout's first frame, at FPS-M; its first N points are the N cloud
             ref, ref_lab, _ = RP.CloudBuilder(env.sim, cam, res, res, bbox, ref_m, lut).build(obs)
@@ -167,7 +193,7 @@ def run_scenes(args):
             ref_idx = reference_robot_index(ref_lab, freeze, N)
 
         def observe(o):
-            if remover or drop_links:
+            if remover or drop_links or thin:
                 pc, lab, _, cell = cb.build(o, cells=cells)
             else:
                 pc, lab, _ = cb.build(o)
@@ -177,6 +203,9 @@ def run_scenes(args):
                                                                   o["robot0_gripper_qpos"]))}
             if drop or drop_links:
                 pc, n = cut_points_by_label(pc, cell if drop_links else lab, list(drop_links or drop))
+                item["point_cloud_len"] = torch.tensor(n, dtype=torch.int64)
+            if thin:
+                pc, n = thin_cloud(pc, cell, thin, thin_prefix, arm_ids)
                 item["point_cloud_len"] = torch.tensor(n, dtype=torch.int64)
             item["point_cloud"] = torch.from_numpy(pc)
             if remover:
@@ -239,6 +268,18 @@ def main():
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--remover-removed", default=None,
                     help='override the learned mask: comma-separated regions to remove, or "none"')
+    ap.add_argument("--num-points", type=int, default=None,
+                    help="inference-only: build the cloud with this many points instead of the training count "
+                         "(output gets _np<N>)")
+    ap.add_argument("--group-size", type=int, default=None,
+                    help="inference-only: points per token (kNN group size) instead of the trained one (output gets _k<K>)")
+    ap.add_argument("--cut-labels", default=None,
+                    help="inference-only label cut on a checkpoint trained WITHOUT one (claim sweep E1), e.g. 5 = the "
+                         "arm; same cut_points_by_label + point_cloud_len as the trained cut (output gets _evalcut-<labels>)")
+    ap.add_argument("--keep-table", type=float, default=None, metavar="M",
+                    help="inference-only: keep the table in the cloud -- box floor M metres below the table top "
+                         "(training: 3 mm above it) and TABLE points not filtered; BACKGROUND still is. The "
+                         "normalizer stays the training box, so table z is clamped onto its floor (output gets _table)")
     ap.add_argument("--env-name", default=None,
                     help="evaluate in another env than the training one (e.g. Threading_D1 for a Threading_D1_Narrow "
                          "policy: out-of-window scenes); output gets _env-<name>, rows carry in_train_window")
@@ -250,6 +291,14 @@ def main():
         mask_tag = ""
     if a.env_name:
         mask_tag += f"_env-{a.env_name}"
+    if a.cut_labels:
+        mask_tag += "_evalcut-" + a.cut_labels.replace(",", "")
+    if a.keep_table is not None:
+        mask_tag += "_table"
+    if a.num_points:
+        mask_tag += f"_np{a.num_points}"
+    if a.group_size:
+        mask_tag += f"_k{a.group_size}"
 
     seeds = [100000 * a.block + k for k in range(a.episodes)]
     ctx = mp.get_context("spawn")

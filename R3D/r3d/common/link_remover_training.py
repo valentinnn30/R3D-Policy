@@ -21,7 +21,8 @@ after every step. theta's optimizer never sees them (`theta_parameters`). The EM
 the LIVE remover state after every EMA step: evaluation = EMA theta + the current
 deterministic gates and rho, not an average of phi.
 
-Fixed mask (`link_remover.fixed_removed`, the round-3 specialist): no phi optimizer and no
+Fixed mask (`link_remover.fixed_removed`, the round-3 specialist, or fixed densities
+`link_remover.fixed_rho`, the density specialist): no phi optimizer and no
 phi steps; the phase is "fixed" throughout and theta trains on the deterministic mask. The
 epoch records and the mechanism readout stay; the held-out check and diagnostic B compare
 masks and are skipped.
@@ -79,7 +80,7 @@ class RemoverController:
         self.lr = float(cfg.lr)
         self.phi_every = int(cfg.phi_every)
         self.num_epochs = int(num_epochs)
-        self.fixed = self.rem.fixed_removed is not None
+        self.fixed = self.rem.is_fixed          # fixed_removed or fixed_rho specialist
         self.warmup_end = int(round(float(cfg.warmup_frac) * num_epochs))
         self.finetune_start = num_epochs - int(round(float(cfg.finetune_frac) * num_epochs))
         if not self.fixed and not 0 <= self.warmup_end < self.finetune_start <= num_epochs:

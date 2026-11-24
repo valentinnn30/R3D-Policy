@@ -29,6 +29,13 @@ from all its frames with probability 1 - keep, independently, by the same `cut_p
 sample then carries `point_cloud_len` (N when nothing is removed). The validation set and evaluation see the FULL
 cloud. Exclusive with the other label options.
 
+`thin_point_set` ('arm' | 'non_arm', with `thin_prefix`, claim sweep R2 / R3; `r3d/common/prefix_thin.py`):
+the arm (link0..link7) or everything else is reduced to its points among the first `thin_prefix` stored
+points (the FPS-`thin_prefix` cloud). The removal flags are computed from `point_link` and the STORED index
+in `_sample_to_data`, before augmentation, and applied by the same `cut_points_by_label` after it, in
+training AND validation (evaluation applies the same function live). No random draws. Exclusive with the
+other label options. Null = off, nothing extra loaded.
+
 `load_point_link` adds `point_link` (T, N) int8 to the obs -- plus `point_label` (T, N) int8, read
 only by the remover's analytics (nut vs peg coverage) -- `point_link` being the per-point link cell
 (robosuite_pcd.CELL_NAMES, -1 = not robot) written by scripts/sim/add_link_labels_mimicgen.py,
@@ -55,6 +62,7 @@ import torch
 import zarr
 
 from r3d.common.label_cut import cut_points_by_label
+from r3d.common.prefix_thin import arm_cell_ids, check_spec, thin_drop_labels
 from r3d.common.replay_buffer import ReplayBuffer
 from r3d.common.robot_freeze import freeze_robot_points, reference_robot_index
 from r3d.common.sampler import SequenceSampler
@@ -66,7 +74,7 @@ class RobotwinSimDataset(RobotwinDataset):
 
     def __init__(self, zarr_path, drop_point_labels=None, num_points=None, load_point_link=False,
                  freeze_robot_labels=None, freeze_reference=None, drop_point_links=None,
-                 dropout_point_labels=None, dropout_keep=0.5, **kwargs):
+                 dropout_point_labels=None, dropout_keep=0.5, thin_point_set=None, thin_prefix=1024, **kwargs):
         super().__init__(zarr_path, **kwargs)
         attrs = zarr.open(zarr_path, mode="r")["meta"].attrs
         if "pcd_crop_bbox" not in attrs:
@@ -107,13 +115,29 @@ class RobotwinSimDataset(RobotwinDataset):
             if list(attrs.get("point_link_names", [])) != list(CELL_NAMES):
                 raise ValueError(f"{zarr_path}: point_link_names differ from robosuite_pcd.CELL_NAMES")
             self.drop_point_links = [CELL_NAMES.index(str(c)) for c in drop_point_links]  # unknown -> ValueError
+        self.thin_point_set = thin_point_set or None
+        if self.thin_point_set:
+            from r3d.common.robosuite_pcd import CELL_NAMES
+            if (self.drop_point_labels or self.drop_point_links or self.load_point_link or self.freeze_robot_labels
+                    or self.dropout_point_labels):
+                raise ValueError("thin_point_set with another label option")
+            if self.use_target_ee:
+                raise NotImplementedError("thin_point_set with use_target_ee")
+            if "point_link" not in zarr.open(zarr_path, mode="r")["data"]:
+                raise KeyError(f"{zarr_path} has no data/point_link -- run scripts/sim/add_link_labels_mimicgen.py")
+            if list(attrs.get("point_link_names", [])) != list(CELL_NAMES):
+                raise ValueError(f"{zarr_path}: point_link_names differ from robosuite_pcd.CELL_NAMES")
+            n_pts = int(num_points) if num_points is not None else int(attrs["pcd_down_sample_num"])
+            check_spec(self.thin_point_set, thin_prefix, n_pts)
+            self.thin_prefix = int(thin_prefix)
+            self._arm_ids = arm_cell_ids()
         if self.freeze_robot_labels and (self.drop_point_labels or self.load_point_link or self.use_target_ee):
             raise ValueError("freeze_robot_labels with drop_point_labels / load_point_link / use_target_ee")
         # the remover also gets point_label: its analytics tell nut from peg (never a model input)
         extra = (["point_label"] if self.drop_point_labels or self.load_point_link or self.freeze_robot_labels
                  or self.dropout_point_labels
                  else []) \
-            + (["point_link"] if self.load_point_link or self.drop_point_links else [])
+            + (["point_link"] if self.load_point_link or self.drop_point_links or self.thin_point_set else [])
         if extra:
             if self.drop_point_labels and self.use_target_ee:
                 raise NotImplementedError("drop_point_labels with use_target_ee")
@@ -169,6 +193,9 @@ class RobotwinSimDataset(RobotwinDataset):
             data["_point_label"] = sample["point_label"]
         if self.drop_point_links:
             data["_point_label"] = sample["point_link"]   # the same cut below, keyed on the link cell
+        if self.thin_point_set:   # flags from the STORED index, before augmentation; cut below keys on 1
+            data["_point_label"] = thin_drop_labels(sample["point_link"], self.thin_point_set,
+                                                    self.thin_prefix, self._arm_ids)
         if self.freeze_robot_labels:
             ep = int(sample["episode_idx"][0])
             if not (sample["episode_idx"] == ep).all():
@@ -184,7 +211,7 @@ class RobotwinSimDataset(RobotwinDataset):
 
     def __getitem__(self, idx):
         data = super().__getitem__(idx)  # sample + augmentation, as the baseline
-        drop = self.drop_point_labels or self.drop_point_links
+        drop = self.drop_point_labels or self.drop_point_links or ([1] if self.thin_point_set else None)
         if self.dropout_point_labels:
             if not self.dropout_active:          # validation: the full cloud, as at evaluation
                 data.pop("_point_label")

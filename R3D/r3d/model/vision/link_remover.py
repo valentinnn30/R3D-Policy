@@ -50,6 +50,12 @@ Variants (all default off; tuning round 2, docs/sim_token_allocation_learnings.m
                          -gate_max / +gate_max (so the deterministic mask is exactly that), no
                          density (needs learn_density=False), phi_parameters() empty, and every
                          draw IS the fixed mask.
+  fixed_rho              the DENSITY SPECIALIST (2026-11-19): fixed per-region densities, nothing
+                         learned -- {region: rho} for every region (density only: needs
+                         learn_gates=False). mu holds logit(rho) for the record only; density(),
+                         every draw and the deterministic rho return the table exactly (the snap
+                         below snap_rho_below still applies, as for a learned remover).
+                         phi_parameters() empty, no log P.
 """
 
 import math
@@ -252,7 +258,8 @@ class LinkRemover(nn.Module):
 
     def __init__(self, cell_names, region_groups, init_rho=0.8, init_keep=0.8, sigma=1.0,
                  mu_min=-9.0, mu_max=6.0, gate_max=5.0, snap_rho_below=None, learn_density=True,
-                 learn_gates=True, scene_rho_min=0.1, mix_eps=0.0, mix_masks=None, fixed_removed=None):
+                 learn_gates=True, scene_rho_min=0.1, mix_eps=0.0, mix_masks=None, fixed_removed=None,
+                 fixed_rho=None):
         super().__init__()
         self.learn_gates = bool(learn_gates)
         if not self.learn_gates and not learn_density:
@@ -329,7 +336,39 @@ class LinkRemover(nn.Module):
                 self.gate.copy_(torch.tensor([-self.gate_max if r in removed else self.gate_max
                                               for r in self.region_names]))
             self.gate.requires_grad_(False)
+        # fixed densities (density specialist): the table is the remover, nothing is learned
+        self._fixed_rho = None
+        if fixed_rho is not None:
+            if self.learn_gates or not self.learn_density:
+                raise ValueError("fixed_rho is density only: learn_gates=False, learn_density=True")
+            if self.mix_eps > 0 or self.fixed_removed is not None:
+                raise ValueError("fixed_rho excludes mix_eps and fixed_removed")
+            if isinstance(fixed_rho, dict):
+                bad = [r for r in fixed_rho if r not in self.region_names]
+                missing = [r for r in self.region_names if r not in fixed_rho]
+                if bad or missing:
+                    raise KeyError(f"fixed_rho: unknown regions {bad}, missing regions {missing} "
+                                   f"(known: {self.region_names})")
+                vals = [float(fixed_rho[r]) for r in self.region_names]
+            else:
+                vals = [float(v) for v in fixed_rho]
+                if len(vals) != L:
+                    raise ValueError(f"fixed_rho has {len(vals)} values for {L} regions")
+            if not all(0.0 <= v <= 1.0 for v in vals):
+                raise ValueError(f"fixed_rho values must lie in [0, 1]: {vals}")
+            if self.scene_region is not None and vals[self.scene_region] < self.scene_rho_min:
+                raise ValueError(f"fixed_rho: scene {vals[self.scene_region]} below scene_rho_min {self.scene_rho_min}")
+            self._fixed_rho = torch.tensor(vals, dtype=torch.float32)
+            eps = 1e-6
+            with torch.no_grad():
+                self.mu.copy_(torch.tensor([logit(min(max(v, eps), 1 - eps)) for v in vals]))
+            self.mu.requires_grad_(False)
         self.clamp_()
+
+    @property
+    def is_fixed(self):
+        """a specialist: fixed gate mask (fixed_removed) or fixed densities (fixed_rho)."""
+        return self.fixed_removed is not None or self._fixed_rho is not None
 
     @property
     def n_regions(self):
@@ -348,7 +387,7 @@ class LinkRemover(nn.Module):
         self.sigma.fill_(float(sigma))
 
     def phi_parameters(self):
-        if self.fixed_removed is not None:
+        if self.is_fixed:
             return []
         return [p for p, on in ((self.gate, self.learn_gates), (self.mu, self.learn_density)) if on]
 
@@ -364,7 +403,10 @@ class LinkRemover(nn.Module):
         return None if self._mix is None else self._mix.to(device)
 
     def density(self):
-        """deterministic density of a kept region, unsnapped: sigmoid(mu), or 1 gates-only."""
+        """deterministic density of a kept region, unsnapped: sigmoid(mu), or 1 gates-only
+        (the fixed table for a density specialist)."""
+        if self._fixed_rho is not None:
+            return self._fixed_rho.to(self.mu.device).clone()
         return torch.sigmoid(self.mu.detach()) if self.learn_density else torch.ones_like(self.mu.detach())
 
     def keep_prob(self):
@@ -376,6 +418,8 @@ class LinkRemover(nn.Module):
         """-> draws (n, 2L) = [z | g], detached."""
         with torch.no_grad():
             L, dev = self.n_regions, self.mu.device
+            if self._fixed_rho is not None:     # no noise: every draw IS the table (see rho)
+                return torch.cat([self.mu.detach()[None].expand(n, -1), torch.ones(n, L, device=dev)], -1)
             z = self.mu[None] + self.sigma * torch.randn(n, L, device=dev) if self.learn_density \
                 else torch.zeros(n, L, device=dev)
             if not self.learn_gates:
@@ -398,8 +442,8 @@ class LinkRemover(nn.Module):
     def log_prob(self, draw):
         """sum_l [log Bern(g_l; sigmoid(a_l)) + g_l log N(z_l; mu_l, sigma^2)] -> (...,);
         the gradient reaches a and mu only. Gates only: the Bernoulli term alone."""
-        if self.fixed_removed is not None:
-            raise RuntimeError("fixed-mask remover: nothing to learn, no log P")
+        if self.is_fixed:
+            raise RuntimeError("fixed (specialist) remover: nothing to learn, no log P")
         z, g = self.split(draw.detach())
         if not self.learn_gates:
             if bool((g != 1).any()):
@@ -431,6 +475,8 @@ class LinkRemover(nn.Module):
         to 0 below `snap_rho_below`."""
         if draw is not None:
             z, g = self.split(draw)
+            if self._fixed_rho is not None:
+                return self._fixed_rho.to(z.device).expand_as(z).clone()
             rho = g * torch.sigmoid(z) if self.learn_density else g
             if self.scene_region is not None:
                 rho = rho.clone()

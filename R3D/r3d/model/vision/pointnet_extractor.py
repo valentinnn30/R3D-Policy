@@ -499,12 +499,24 @@ class PatchDropout(nn.Module):
     """
     Patch dropout for Uni3D
     https://arxiv.org/abs/2212.00794
+
+    Standard token dropout: in training, every sample independently keeps a uniformly random
+    floor((1 - prob) * L) of its L tokens (no structure, no information used); evaluation keeps all.
+    `keep_indices` is the pointsam path: it also returns the kept indices so the token centres
+    (the head's pc_pe) can be gathered with the SAME indices -- `forward` alone drops tokens from x
+    but not from the centres, which would misalign pc_pe against the tokens.
     """
     def __init__(self, prob, exclude_first_token=True):
         super().__init__()
         assert 0 <= prob < 1.
         self.prob = prob
         self.exclude_first_token = exclude_first_token  # exclude CLS token
+
+    def keep_indices(self, batch, num_tokens, device):
+        """(B, K) sorted indices of the kept tokens, K = max(1, int(L * (1 - prob)))."""
+        num_keep = max(1, int(num_tokens * (1 - self.prob)))
+        idx = torch.rand(batch, num_tokens, device=device).topk(num_keep, dim=-1).indices
+        return idx.sort(dim=-1).values
 
     def forward(self, x):
         if self.exclude_first_token:
@@ -1134,7 +1146,14 @@ class Uni3DPointcloudEncoder(nn.Module):
         x = patch_embed + pos_embed
         # patch dropout
         if not eval:
-            x = self.patch_dropout(x)
+            if isinstance(self.patch_dropout, PatchDropout) and not self.extract_global_feature:
+                # pointsam: the tokens go to the head WITH their centres (pc_pe below), so both
+                # are gathered with one index set (token-dropout control, 2026-11-12)
+                keep = self.patch_dropout.keep_indices(x.shape[0], x.shape[1], x.device)
+                x = torch.gather(x, 1, keep.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+                centers = torch.gather(centers, 1, keep.unsqueeze(-1).expand(-1, -1, centers.shape[-1]))
+            else:
+                x = self.patch_dropout(x)
             x = self.transformer.pos_drop(x)
 
         for block in self.transformer.blocks:

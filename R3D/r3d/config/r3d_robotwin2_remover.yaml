@@ -28,6 +28,7 @@ policy:
     mix_eps: 0.0                # > 0: with this prob a draw is one of mix_masks (structured exploration)
     mix_masks: null             # lists of removed regions, or "all"
     fixed_removed: null         # e.g. [link5, link6]: SPECIALIST, fixed mask, nothing learned (needs learn_density: false)
+    fixed_rho: null             # e.g. {link5: 0.6, ..., scene: 0.2}: DENSITY SPECIALIST, fixed densities for every region (needs learn_gates: false)
     sigma: 1.0                  # overwritten every batch by the training schedule below
     mu_min: -9.0                # -8 still kept 1 point of link6 on the largest frames at N = 4096
     mu_max: 6.0

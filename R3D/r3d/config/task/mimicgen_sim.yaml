@@ -22,6 +22,12 @@ drop_point_labels: null
 # link7. Training: data/point_link; evaluation: robosuite_pcd.LinkCells, live. null = off.
 drop_point_links: null
 
+# Claim sweep R2 / R3 (r3d/common/prefix_thin.py): 'arm' (armsparse) or 'non_arm' (scenesparse) is reduced to
+# its points among the first thin_prefix stored points (= the FPS-thin_prefix cloud), training and evaluation.
+# null = off.
+thin_point_set: null
+thin_prefix: 1024
+
 # Round 7 shortcut test: every frame's robot points replaced by the episode's FIRST frame's
 # (r3d/common/robot_freeze.py), training and evaluation; [5, 7] = arm + gripper. The reference is
 # the frame-0 FPS-8192 sidecar (scripts/sim/make_frame0_reference.py). null = off.
@@ -65,3 +71,5 @@ dataset:
   freeze_robot_labels: ${task.freeze_robot_labels}
   freeze_reference: ${task.freeze_reference}
   num_points: ${task.num_points}
+  thin_point_set: ${task.thin_point_set}
+  thin_prefix: ${task.thin_prefix}
